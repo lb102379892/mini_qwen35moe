@@ -294,16 +294,17 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // RoPE
     struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ((int32_t*)pos_t->data)[0] = pos;
-
+    printf("---begin ggml_rope_ext q---\n");
     q = ggml_rope_ext(ctx, q, pos_t, nullptr,
                       rope_dim, 0,
                       max_ctx_,
                       freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    printf("---begin ggml_rope_ext k---\n");
     k = ggml_rope_ext(ctx, k, pos_t, nullptr,
                       rope_dim, 0,
                       max_ctx_,
                       freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
+    printf("---end ggml_rope_ext k---\n");
     // ------------------------------------------------------------------
     // Update KV cache at position `pos`
     // ------------------------------------------------------------------

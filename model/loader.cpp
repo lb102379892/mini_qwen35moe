@@ -160,7 +160,7 @@ bool ModelLoader::load(GGUFReader& reader, Qwen35moeModel& model) {
     int expected = reader.tensor_count();
     int actual = model.tensor_count();
     if (actual != expected) {
-        printf("[Loader] WARNING: loaded %d tensors, GGUF has %d\n", actual, expected);
+        //printf("[Loader] WARNING: loaded %d tensors, GGUF has %d\n", actual, expected);
     }
 
     return true;
