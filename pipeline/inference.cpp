@@ -18,6 +18,53 @@ static constexpr size_t SZF32 = sizeof(float);
 
 static inline bool is_attn_layer(int L) { return (L % 4) == 3; }
 
+static void dump_t(const char * name, ggml_tensor * t) {
+    printf("[%s] type=%d ne=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld] name=%s\n",
+        name,
+        (int)t->type,
+        t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+        (long long)t->nb[0], (long long)t->nb[1], (long long)t->nb[2], (long long)t->nb[3],
+        t->name
+    );
+}
+
+static ggml_tensor* mul_dbg(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, const char* tag) {
+    if (a->type != b->type) {
+        printf("\n[MUL TYPE MISMATCH] %s\n", tag);
+        dump_t("A", a);
+        dump_t("B", b);
+        printf("\n");
+    }
+    return ggml_mul(ctx, a, b);
+}
+
+ggml_tensor* ops_rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, float eps) {
+    ggml_tensor* cur = ggml_rms_norm(ctx, x, eps);
+    if (weight) {
+        cur = mul_dbg(ctx, cur, weight, "ops_rms_norm: cur * weight");
+    }
+    return cur;
+}
+
+ggml_tensor* ops_layer_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias, float eps) {
+    ggml_tensor* cur = ggml_norm(ctx, x, eps);
+    if (weight) {
+        cur = mul_dbg(ctx, cur, weight, "ops_layer_norm: cur * weight");
+    }
+    if (bias) {
+        cur = ggml_add(ctx, cur, bias);
+    }
+    return cur;
+}
+
+ggml_tensor* ops_swiglu_ffn(ggml_context* ctx, ggml_tensor* x,
+                              ggml_tensor* w_gate, ggml_tensor* w_up, ggml_tensor* w_down) {
+    ggml_tensor* gate   = ggml_mul_mat(ctx, w_gate, x);
+    ggml_tensor* up     = ggml_mul_mat(ctx, w_up,   x);
+    ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    return ggml_mul_mat(ctx, w_down, hidden);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -81,7 +128,7 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
     ggml_build_forward_expand(gf, logits);
     printf("---end build forward expand---\n");
 
-    ggml_graph_print(gf);
+    //ggml_graph_print(gf);
 
     // Execute on CPU
     ggml_graph_compute_with_ctx(ctx, gf, n_threads_);
@@ -297,11 +344,11 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // q: [head_dim, 1, n_q_heads] — rms_norm normalises each row of head_dim
     if (lw.attn_q_norm) {
         q = ggml_rms_norm(ctx, q, eps);
-        q = ggml_mul(ctx, q, lw.attn_q_norm);  // weight [head_dim] broadcasts
+        q = mul_dbg(ctx, q, lw.attn_q_norm, "attn: q * attn_q_norm");  // weight [head_dim] broadcasts
     }
     if (lw.attn_k_norm) {
         k = ggml_rms_norm(ctx, k, eps);
-        k = ggml_mul(ctx, k, lw.attn_k_norm);
+        k = mul_dbg(ctx, k, lw.attn_k_norm, "attn: q * attn_k_norm");
     }
 
     // RoPE: ggml 要求 b 是 int32 向量，长度必须等于 a->ne[2]（head 维）
@@ -519,7 +566,7 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
         ggml_mul_mat_id(ctx, lw.ffn_up_exps,   cur_tiled, ids_2d);
 
     // SwiGLU activation: [ff_dim, k]
-    struct ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate_out), up_out);
+    struct ggml_tensor* hidden = mul_dbg(ctx, ggml_silu(ctx, gate_out), up_out, "silu:gete_out * up_out");
 
     // Down projection: [embed_dim, k]
     // ffn_down_exps: [ff_dim, embed_dim, n_experts]
@@ -530,7 +577,7 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     // top_k_probs [k] → broadcast to [embed_dim, k]
     struct ggml_tensor* probs_2d = ggml_reshape_2d(ctx, top_k_probs, 1, expert_k);
     struct ggml_tensor* probs_bc = ggml_repeat(ctx, probs_2d, down_out); // [embed_dim, k]
-    struct ggml_tensor* scaled   = ggml_mul(ctx, down_out, probs_bc);    // [embed_dim, k]
+    struct ggml_tensor* scaled   = mul_dbg(ctx, down_out, probs_bc, "down_out * probs_bc");    // [embed_dim, k]
 
     // Accumulate the k expert outputs column by column
     struct ggml_tensor* expert_out =
@@ -555,7 +602,7 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     // Shared expert SwiGLU
     struct ggml_tensor* sh_gate   = ggml_mul_mat(ctx, lw.ffn_gate_shexp, cur); // [ff_dim_sh]
     struct ggml_tensor* sh_up     = ggml_mul_mat(ctx, lw.ffn_up_shexp,   cur); // [ff_dim_sh]
-    struct ggml_tensor* sh_hidden = ggml_mul(ctx, ggml_silu(ctx, sh_gate), sh_up);
+    struct ggml_tensor* sh_hidden = mul_dbg(ctx, ggml_silu(ctx, sh_gate), sh_up, "silu:sh_gate * sh_up");
     struct ggml_tensor* sh_out    = ggml_mul_mat(ctx, lw.ffn_down_shexp, sh_hidden);
     sh_out = ggml_reshape_1d(ctx, sh_out, embed_dim);
 
@@ -563,7 +610,7 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     struct ggml_tensor* sh_scale_bc =
         ggml_repeat(ctx, sh_scale,
                     ggml_new_tensor_1d(ctx, GGML_TYPE_F32, embed_dim));
-    sh_out = ggml_mul(ctx, sh_out, sh_scale_bc);
+    sh_out = mul_dbg(ctx, sh_out, sh_scale_bc, "sh_out * sh_scale_bc");
 
     // ------------------------------------------------------------------
     // Combine
