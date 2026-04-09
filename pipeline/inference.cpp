@@ -294,6 +294,20 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // RoPE
     struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ((int32_t*)pos_t->data)[0] = pos;
+
+    auto dump = [](const char *name, ggml_tensor *t) {
+    printf("[%s] ne = [%lld %lld %lld %lld] nb = [%lld %lld %lld %lld] type=%d\n",
+        name,
+        t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+        (long long)t->nb[0], (long long)t->nb[1], (long long)t->nb[2], (long long)t->nb[3],
+        (int)t->type);
+    };
+
+    dump("q", q);
+    dump("k", k);
+    dump("pos_t", pos_t);
+    printf("rope_dim=%d max_ctx=%d pos=%d\n", rope_dim, max_ctx_, pos);
+
     printf("---begin ggml_rope_ext q---\n");
     q = ggml_rope_ext(ctx, q, pos_t, nullptr,
                       rope_dim, 0,
