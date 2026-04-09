@@ -16,9 +16,9 @@
 void ModelLoader::load_qwen35moe_layer(GGUFReader& reader, Qwen35moeLayer& layer, int layer_idx) {
     std::string prefix = "blk." + std::to_string(layer_idx);
 
-    layer.attn_gate       = reader.require_tensor(prefix + ".attn_gate.weight");
+    layer.attn_gate       = reader.get_tensor(prefix + ".attn_gate.weight");
     layer.attn_norm       = reader.require_tensor(prefix + ".attn_norm.weight");
-    layer.attn_qkv        = reader.require_tensor(prefix + ".attn_qkv.weight");
+    layer.attn_qkv        = reader.get_tensor(prefix + ".attn_qkv.weight");
     layer.ffn_down_exps   = reader.require_tensor(prefix + ".ffn_down_exps.weight");
     layer.ffn_down_shexp  = reader.require_tensor(prefix + ".ffn_down_shexp.weight");
     layer.ffn_gate_exps   = reader.require_tensor(prefix + ".ffn_gate_exps.weight");
@@ -28,20 +28,20 @@ void ModelLoader::load_qwen35moe_layer(GGUFReader& reader, Qwen35moeLayer& layer
     layer.ffn_up_exps     = reader.require_tensor(prefix + ".ffn_up_exps.weight");
     layer.ffn_up_shexp    = reader.require_tensor(prefix + ".ffn_up_shexp.weight");
     layer.post_attention_norm = reader.require_tensor(prefix + ".post_attention_norm.weight");
-    layer.ssm_a           = reader.require_tensor(prefix + ".ssm_a.weight");
-    layer.ssm_alpha       = reader.require_tensor(prefix + ".ssm_alpha.weight");
-    layer.ssm_beta        = reader.require_tensor(prefix + ".ssm_beta.weight");
-    layer.ssm_conv1d      = reader.require_tensor(prefix + ".ssm_conv1d.weight");
-    layer.ssm_dt_b          = reader.require_tensor(prefix + ".ssm_dt.bias");
-    layer.ssm_norm        = reader.require_tensor(prefix + ".ssm_norm.weight");
-    layer.ssm_out         = reader.require_tensor(prefix + ".ssm_out.weight");
+    layer.ssm_a           = reader.get_tensor(prefix + ".ssm_a.weight");
+    layer.ssm_alpha       = reader.get_tensor(prefix + ".ssm_alpha.weight");
+    layer.ssm_beta        = reader.get_tensor(prefix + ".ssm_beta.weight");
+    layer.ssm_conv1d      = reader.get_tensor(prefix + ".ssm_conv1d.weight");
+    layer.ssm_dt_b          = reader.get_tensor(prefix + ".ssm_dt.bias");
+    layer.ssm_norm        = reader.get_tensor(prefix + ".ssm_norm.weight");
+    layer.ssm_out         = reader.get_tensor(prefix + ".ssm_out.weight");
 
-    layer.attn_k         = reader.require_tensor(prefix + ".attn_k.weight");
-    layer.attn_k_norm    = reader.require_tensor(prefix + ".attn_k_norm.weight");
-    layer.attn_q         = reader.require_tensor(prefix + ".attn_q.weight");
-    layer.attn_q_norm    = reader.require_tensor(prefix + ".attn_q_norm.weight");
-    layer.attn_v         = reader.require_tensor(prefix + ".attn_v.weight");
-    layer.attn_output    = reader.require_tensor(prefix + ".attn_output.weight");
+    layer.attn_k         = reader.get_tensor(prefix + ".attn_k.weight");
+    layer.attn_k_norm    = reader.get_tensor(prefix + ".attn_k_norm.weight");
+    layer.attn_q         = reader.get_tensor(prefix + ".attn_q.weight");
+    layer.attn_q_norm    = reader.get_tensor(prefix + ".attn_q_norm.weight");
+    layer.attn_v         = reader.get_tensor(prefix + ".attn_v.weight");
+    layer.attn_output    = reader.get_tensor(prefix + ".attn_output.weight");
 }
 
 // ============================================================
@@ -109,6 +109,7 @@ bool ModelLoader::load(GGUFReader& reader, Qwen35moeModel& model) {
 
     // Step 2: modle
     if (!load_qwen35moe(reader, model.weights)) {
+        printf("[Loader] Tensor loading failed\n");
         return false;
     }
 

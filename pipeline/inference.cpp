@@ -273,10 +273,12 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ((int32_t*)pos_t->data)[0] = pos;
 
+    printf("--------------\n");
     q = ggml_rope_ext(ctx, q, pos_t, nullptr,
                       rope_dim, 0,
                       (int)cfg_->context_length,
                       freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    printf("--------------1\n");
     k = ggml_rope_ext(ctx, k, pos_t, nullptr,
                       rope_dim, 0,
                       (int)cfg_->context_length,
