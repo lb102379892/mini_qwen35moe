@@ -126,13 +126,11 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
         return {};
     }
     ggml_build_forward_expand(gf, logits);
-    printf("---end build forward expand---\n");
 
     //ggml_graph_print(gf);
 
     // Execute on CPU
     ggml_graph_compute_with_ctx(ctx, gf, n_threads_);
-    printf("---end compute graph---\n");
 
     // Copy logits out
     // logits tensor is F32 by construction
@@ -218,7 +216,6 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
     int attn_ord = 0;
 
     for (int L = 0; L < n_layers_; L++) {
-        printf("---begin layer %d---\n", L);
         const Qwen35moeLayer& layer = w.layers[L];
 
         // 2a. Pre-attn/SSM RMSNorm
@@ -236,37 +233,29 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
         } else {
             sublayer_out = build_ssm_layer(ctx, normed, L);
         }
-        printf("---end build layer %d---\n", L);
 
         // Residual
         cur = ggml_add(ctx, cur, sublayer_out);
-        printf("---end residual layer %d---\n", L);
 
         // 2c. Post-attn RMSNorm
         struct ggml_tensor* normed2 = ops_rms_norm(ctx, cur, layer.post_attention_norm, eps);
-        printf("---end post attn layer %d---\n", L);
 
         // 2d. MoE FFN
         struct ggml_tensor* ffn_out = build_moe_ffn(ctx, gf, normed2, L);
-        printf("---end ffn layer %d---\n", L);
 
         // Residual
         cur = ggml_add(ctx, cur, ffn_out);
-        printf("---end residual ffn_out layer %d---\n", L);
     }
 
     // 3. Final RMSNorm
     cur = ops_rms_norm(ctx, cur, w.output_norm, eps);
-    printf("---end Final RMSNorm---\n");
 
     // 4. LM head → [vocab_size]
     // output.weight: [embed_dim, vocab_size]
     struct ggml_tensor* logits = ggml_mul_mat(ctx, w.output, cur);
-    printf("---end ggml_mul_mat---\n");
     // logits is [vocab_size, 1] from mul_mat; reshape to 1D
     int64_t vsz = logits->ne[0] * logits->ne[1];
     logits = ggml_reshape_1d(ctx, logits, vsz);
-    printf("---end ggml_reshape_1d---\n");
 
     return logits;
 }
@@ -362,28 +351,12 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
         ((int32_t*)pos_k->data)[i] = pos;
     }
 
-    auto dump = [](const char *name, ggml_tensor *t) {
-    printf("[%s] ne = [%lld %lld %lld %lld] nb = [%lld %lld %lld %lld] type=%d\n",
-        name,
-        t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-        (long long)t->nb[0], (long long)t->nb[1], (long long)t->nb[2], (long long)t->nb[3],
-        (int)t->type);
-    };
-
-    dump("q", q);
-    dump("k", k);
-    printf("rope_dim=%d max_ctx=%d pos=%d\n", rope_dim, max_ctx_, pos);
-
-    printf("---begin ggml_rope_ext q---\n");
     q = ggml_rope_ext(ctx, q, pos_q, nullptr,
                     rope_dim, 0, max_ctx_,
                     freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-    printf("---begin ggml_rope_ext k---\n");
     k = ggml_rope_ext(ctx, k, pos_k, nullptr,
                     rope_dim, 0, max_ctx_,
                     freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    printf("---end ggml_rope_ext k---\n");
     // ------------------------------------------------------------------
     // Update KV cache at position `pos`
     // ------------------------------------------------------------------
@@ -546,7 +519,9 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     // Top-k indices [k] and weights [k]
     struct ggml_tensor* top_k_ids   = ggml_argsort_top_k(ctx, router_probs, expert_k);
     struct ggml_tensor* top_k_probs = ggml_top_k(ctx, router_probs, expert_k);
-
+    if (top_k_probs->type != GGML_TYPE_F32) {
+        top_k_probs = ggml_cast(ctx, top_k_probs, GGML_TYPE_F32);
+    }
     // ------------------------------------------------------------------
     // Sparse expert path (batched via mul_mat_id)
     // ------------------------------------------------------------------

@@ -95,22 +95,22 @@ bool ModelLoader::load_qwen35moe(GGUFReader& reader, Qwen35moeWeights& weights, 
         const Qwen35moeLayer& lyr = weights.layers[i];
         if (is_attn_layer(i)) {
             bool ok = lyr.attn_q && lyr.attn_k && lyr.attn_v && lyr.attn_output;
-            printf("[Loader] layer %2d: ATTENTION  attn_q=%s attn_k=%s attn_v=%s attn_output=%s%s\n",
-                   i,
-                   lyr.attn_q      ? "OK" : "MISSING",
-                   lyr.attn_k      ? "OK" : "MISSING",
-                   lyr.attn_v      ? "OK" : "MISSING",
-                   lyr.attn_output ? "OK" : "MISSING",
-                   ok ? "" : "  <-- ERROR");
+            // printf("[Loader] layer %2d: ATTENTION  attn_q=%s attn_k=%s attn_v=%s attn_output=%s%s\n",
+            //        i,
+            //        lyr.attn_q      ? "OK" : "MISSING",
+            //        lyr.attn_k      ? "OK" : "MISSING",
+            //        lyr.attn_v      ? "OK" : "MISSING",
+            //        lyr.attn_output ? "OK" : "MISSING",
+            //        ok ? "" : "  <-- ERROR");
             if (!ok) layer_ok = false;
         } else {
             bool ok = lyr.attn_qkv && lyr.attn_gate && lyr.ssm_out;
-            printf("[Loader] layer %2d: SSM        attn_qkv=%s attn_gate=%s ssm_out=%s%s\n",
-                   i,
-                   lyr.attn_qkv  ? "OK" : "MISSING",
-                   lyr.attn_gate ? "OK" : "MISSING",
-                   lyr.ssm_out   ? "OK" : "MISSING",
-                   ok ? "" : "  <-- ERROR");
+            // printf("[Loader] layer %2d: SSM        attn_qkv=%s attn_gate=%s ssm_out=%s%s\n",
+            //        i,
+            //        lyr.attn_qkv  ? "OK" : "MISSING",
+            //        lyr.attn_gate ? "OK" : "MISSING",
+            //        lyr.ssm_out   ? "OK" : "MISSING",
+            //        ok ? "" : "  <-- ERROR");
             if (!ok) layer_ok = false;
         }
     }
