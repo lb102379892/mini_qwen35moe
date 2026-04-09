@@ -73,6 +73,11 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
     // Build compute graph
     struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 16384, /*grads=*/false);
     struct ggml_tensor* logits = build_graph(ctx, gf, inp, pos);
+    if (!logits) {
+        printf("[Inference] ERROR: build_graph failed (returned nullptr)\n");
+        ggml_free(ctx);
+        return {};
+    }
     ggml_build_forward_expand(gf, logits);
 
     // Execute on CPU
@@ -171,6 +176,10 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
         struct ggml_tensor* sublayer_out;
         if (is_attn_layer(L)) {
             sublayer_out = build_attn_layer(ctx, gf, normed, L, attn_ord, pos);
+            if (!sublayer_out) {
+                printf("[Inference] ERROR: build_attn_layer returned nullptr for layer %d\n", L);
+                return nullptr;
+            }
             attn_ord++;
         } else {
             sublayer_out = build_ssm_layer(ctx, normed, L);
@@ -226,6 +235,19 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
 
     const Qwen35moeLayer& lw = model_->weights.layers[layer_idx];
     float eps = cfg_->layer_norm_rms_epsilon;
+
+    // Guard: all four tensors are required for an attention layer.
+    // If any is missing, report an error and return nullptr to the caller.
+    if (!lw.attn_q || !lw.attn_k || !lw.attn_v || !lw.attn_output) {
+        printf("[Inference] ERROR: layer %d is an attention layer but is missing required "
+               "tensors: attn_q=%s attn_k=%s attn_v=%s attn_output=%s\n",
+               layer_idx,
+               lw.attn_q      ? "OK" : "nullptr",
+               lw.attn_k      ? "OK" : "nullptr",
+               lw.attn_v      ? "OK" : "nullptr",
+               lw.attn_output ? "OK" : "nullptr");
+        return nullptr;
+    }
 
     int embed_dim  = (int)cfg_->embedding_length;
     int n_q_heads  = (int)cfg_->head_count;          // 16
