@@ -10,6 +10,10 @@
 #include <cstdio>
 #include <string>
 
+// 判断某层是否为 Attention 层（每 4 层一个，index % 4 == 3）
+// 与 pipeline/inference.cpp 中的 is_attn_layer 保持一致
+static inline bool is_attn_layer(int idx) { return (idx % 4) == 3; }
+
 // ============================================================
 // 加载单层
 // ============================================================
@@ -28,7 +32,11 @@ void ModelLoader::load_qwen35moe_layer(GGUFReader& reader, Qwen35moeLayer& layer
     layer.ffn_up_exps     = reader.require_tensor(prefix + ".ffn_up_exps.weight");
     layer.ffn_up_shexp    = reader.require_tensor(prefix + ".ffn_up_shexp.weight");
     layer.post_attention_norm = reader.require_tensor(prefix + ".post_attention_norm.weight");
-    layer.ssm_a           = reader.get_tensor(prefix + ".ssm_a.weight");
+    // ssm_a: 有的 GGUF 写的是 "blk.N.ssm_a"（无 .weight），有的是 "blk.N.ssm_a.weight"
+    // 优先尝试无 .weight 的形式，兼容两种命名
+    layer.ssm_a = reader.get_tensor(prefix + ".ssm_a");
+    if (!layer.ssm_a)
+        layer.ssm_a = reader.get_tensor(prefix + ".ssm_a.weight");
     layer.ssm_alpha       = reader.get_tensor(prefix + ".ssm_alpha.weight");
     layer.ssm_beta        = reader.get_tensor(prefix + ".ssm_beta.weight");
     layer.ssm_conv1d      = reader.get_tensor(prefix + ".ssm_conv1d.weight");
@@ -78,6 +86,36 @@ bool ModelLoader::load_qwen35moe(GGUFReader& reader, Qwen35moeWeights& weights, 
     if (reader.has_errors()) {
         printf("[Loader] LLM: %zu tensor(s) missing\n", reader.missing_tensors().size());
         reader.print_errors();
+        return false;
+    }
+
+    // Per-layer validation: print type and check required tensors
+    bool layer_ok = true;
+    for (int i = 0; i < layer_count; i++) {
+        const Qwen35moeLayer& lyr = weights.layers[i];
+        if (is_attn_layer(i)) {
+            bool ok = lyr.attn_q && lyr.attn_k && lyr.attn_v && lyr.attn_output;
+            printf("[Loader] layer %2d: ATTENTION  attn_q=%s attn_k=%s attn_v=%s attn_output=%s%s\n",
+                   i,
+                   lyr.attn_q      ? "OK" : "MISSING",
+                   lyr.attn_k      ? "OK" : "MISSING",
+                   lyr.attn_v      ? "OK" : "MISSING",
+                   lyr.attn_output ? "OK" : "MISSING",
+                   ok ? "" : "  <-- ERROR");
+            if (!ok) layer_ok = false;
+        } else {
+            bool ok = lyr.attn_qkv && lyr.attn_gate && lyr.ssm_out;
+            printf("[Loader] layer %2d: SSM        attn_qkv=%s attn_gate=%s ssm_out=%s%s\n",
+                   i,
+                   lyr.attn_qkv  ? "OK" : "MISSING",
+                   lyr.attn_gate ? "OK" : "MISSING",
+                   lyr.ssm_out   ? "OK" : "MISSING",
+                   ok ? "" : "  <-- ERROR");
+            if (!ok) layer_ok = false;
+        }
+    }
+    if (!layer_ok) {
+        printf("[Loader] ERROR: one or more layers are missing required tensors\n");
         return false;
     }
 
