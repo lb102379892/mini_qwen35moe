@@ -40,7 +40,10 @@ public:
         params_ = p;
         rng_.seed(p.seed);
 
-        if (!recognizer_.init(model_path)) return false;
+        if (!recognizer_.init(model_path)) {
+            printf("[Generator] ERROR: tokenizer failed to init\n");
+            return false;
+        }
 
         tokenizer_.load(recognizer_.config().tokenizer);
         if (!tokenizer_.is_loaded()) {
