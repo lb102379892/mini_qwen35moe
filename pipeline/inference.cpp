@@ -81,6 +81,8 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
     ggml_build_forward_expand(gf, logits);
     printf("---end build forward expand---\n");
 
+    ggml_graph_print(gf);
+
     // Execute on CPU
     ggml_graph_compute_with_ctx(ctx, gf, n_threads_);
     printf("---end compute graph---\n");
