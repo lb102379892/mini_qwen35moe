@@ -246,13 +246,13 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     struct ggml_tensor* q_full = ggml_mul_mat(ctx, lw.attn_q, normed);
     struct ggml_tensor* q = ggml_view_1d(ctx, q_full,
                                           (int64_t)n_q_heads * head_dim, 0);
-    // Reshape: [head_dim, 1, n_q_heads]  (flash_attn layout)
-    q = ggml_reshape_3d(ctx, q, head_dim, 1, n_q_heads);
+    // Reshape: [head_dim, n_q_heads, 1]  (flash_attn layout)
+    q = ggml_reshape_3d(ctx, q, head_dim, n_q_heads, 1);
 
     // K projection: [2048] → [512]
     struct ggml_tensor* k = ggml_mul_mat(ctx, lw.attn_k, normed);
-    // Reshape: [head_dim, 1, n_kv_heads]
-    k = ggml_reshape_3d(ctx, k, head_dim, 1, n_kv_heads);
+    // Reshape: [head_dim, n_kv_heads, 1]
+    k = ggml_reshape_3d(ctx, k, head_dim, n_kv_heads, 1);
 
     // V projection: [2048] → [512]
     struct ggml_tensor* v = ggml_mul_mat(ctx, lw.attn_v, normed);
@@ -273,7 +273,11 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ((int32_t*)pos_t->data)[0] = pos;
 
-    printf("--------------\n");
+    printf("[DEBUG L=%d] q shape: [%lld, %lld, %lld]\n",
+       layer_idx, q->ne[0], q->ne[1], q->ne[2]);
+    printf("[DEBUG L=%d] k shape: [%lld, %lld, %lld]\n",
+        layer_idx, k->ne[0], k->ne[1], k->ne[2]);
+    printf("[DEBUG L=%d] pos_t->ne[0]: %lld\n", layer_idx, pos_t->ne[0]);
     q = ggml_rope_ext(ctx, q, pos_t, nullptr,
                       rope_dim, 0,
                       max_ctx_,
