@@ -52,6 +52,7 @@
 
 #include <gguf.h>
 #include <string>
+#include <vector>
 #include <cstdio>
 
 // ============================================================
@@ -255,7 +256,7 @@ struct Qwen35moeConfig {
         printf(" qwen35moe.layer_norm_rms_epsilon:%f\n", layer_norm_rms_epsilon);
         printf(" qwen35moe.dimension_count:%d\n", dimension_count);
         for (size_t i = 0; i < dimension_sections.size(); ++i) {
-            printf(" qwen35moe.dimension_sections[%d]:%d\n", i, dimension_sections[i]);
+            printf(" qwen35moe.dimension_sections[%zu]:%d\n", i, dimension_sections[i]);
         }
         printf(" qwen35moe.freq_base:%f\n", freq_base);
         printf(" qwen35moe.conv_kernel:%d\n", conv_kernel);
@@ -297,15 +298,15 @@ struct TokenizerConfig {
         printf("\n--- tokenizer ---\n");
         printf(" tokenizer.ggml.model:%s\n", ggml_model.c_str());
         printf(" tokenizer.ggml.pre:%s\n", ggml_pre.c_str());
-        printf(" tokenizer.ggml.tokens[size:%d]\n", ggml_tokens.size());
+        printf(" tokenizer.ggml.tokens[size:%zu]\n", ggml_tokens.size());
         // for (size_t i = 0; i < ggml_tokens.size(); ++i) {
         //     printf(" tokenizer.ggml.tokens[%d]:%d\n", i, ggml_tokens[i]);
         // }
-        printf(" tokenizer.ggml.token_type[size:%d]\n", ggml_token_type.size());
+        printf(" tokenizer.ggml.token_type[size:%zu]\n", ggml_token_type.size());
         // for (size_t i = 0; i < ggml_token_type.size(); ++i) {
         //     printf(" tokenizer.ggml.token_type[%d]:%d\n", i, ggml_token_type[i]);
         // }
-        printf(" tokenizer.ggml.merges[size:%d]\n", ggml_merges.size());
+        printf(" tokenizer.ggml.merges[size:%zu]\n", ggml_merges.size());
         // for (size_t i = 0; i < ggml_merges.size(); ++i) {
         //     printf(" tokenizer.ggml.merges[%d]:%s\n", i, ggml_merges[i].c_str());
         // }
