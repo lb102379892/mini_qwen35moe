@@ -79,9 +79,11 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
         return {};
     }
     ggml_build_forward_expand(gf, logits);
+    printf("---end build forward expand---\n");
 
     // Execute on CPU
     ggml_graph_compute_with_ctx(ctx, gf, n_threads_);
+    printf("---end compute graph---\n");
 
     // Copy logits out
     // logits tensor is F32 by construction
@@ -167,6 +169,7 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
     int attn_ord = 0;
 
     for (int L = 0; L < n_layers_; L++) {
+        printf("---begin layer %d---\n", L);
         const Qwen35moeLayer& layer = w.layers[L];
 
         // 2a. Pre-attn/SSM RMSNorm
@@ -184,29 +187,37 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
         } else {
             sublayer_out = build_ssm_layer(ctx, normed, L);
         }
+        printf("---end build layer %d---\n", L);
 
         // Residual
         cur = ggml_add(ctx, cur, sublayer_out);
+        printf("---end residual layer %d---\n", L);
 
         // 2c. Post-attn RMSNorm
         struct ggml_tensor* normed2 = ops_rms_norm(ctx, cur, layer.post_attention_norm, eps);
+        printf("---end post attn layer %d---\n", L);
 
         // 2d. MoE FFN
         struct ggml_tensor* ffn_out = build_moe_ffn(ctx, gf, normed2, L);
+        printf("---end ffn layer %d---\n", L);
 
         // Residual
         cur = ggml_add(ctx, cur, ffn_out);
+        printf("---end residual ffn_out layer %d---\n", L);
     }
 
     // 3. Final RMSNorm
     cur = ops_rms_norm(ctx, cur, w.output_norm, eps);
+    printf("---end Final RMSNorm---\n");
 
     // 4. LM head → [vocab_size]
     // output.weight: [embed_dim, vocab_size]
     struct ggml_tensor* logits = ggml_mul_mat(ctx, w.output, cur);
+    printf("---end ggml_mul_mat---\n");
     // logits is [vocab_size, 1] from mul_mat; reshape to 1D
     int64_t vsz = logits->ne[0] * logits->ne[1];
     logits = ggml_reshape_1d(ctx, logits, vsz);
+    printf("---end ggml_reshape_1d---\n");
 
     return logits;
 }
@@ -291,9 +302,16 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
         k = ggml_mul(ctx, k, lw.attn_k_norm);
     }
 
-    // RoPE
-    struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ((int32_t*)pos_t->data)[0] = pos;
+    // RoPE: ggml 要求 b 是 int32 向量，长度必须等于 a->ne[2]（head 维）
+    struct ggml_tensor* pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q_heads);
+    for (int i = 0; i < n_q_heads; ++i) {
+        ((int32_t*)pos_q->data)[i] = pos;
+    }
+
+    struct ggml_tensor* pos_k = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv_heads);
+    for (int i = 0; i < n_kv_heads; ++i) {
+        ((int32_t*)pos_k->data)[i] = pos;
+    }
 
     auto dump = [](const char *name, ggml_tensor *t) {
     printf("[%s] ne = [%lld %lld %lld %lld] nb = [%lld %lld %lld %lld] type=%d\n",
@@ -305,19 +323,17 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
 
     dump("q", q);
     dump("k", k);
-    dump("pos_t", pos_t);
     printf("rope_dim=%d max_ctx=%d pos=%d\n", rope_dim, max_ctx_, pos);
 
     printf("---begin ggml_rope_ext q---\n");
-    q = ggml_rope_ext(ctx, q, pos_t, nullptr,
-                      rope_dim, 0,
-                      max_ctx_,
-                      freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    q = ggml_rope_ext(ctx, q, pos_q, nullptr,
+                    rope_dim, 0, max_ctx_,
+                    freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
     printf("---begin ggml_rope_ext k---\n");
-    k = ggml_rope_ext(ctx, k, pos_t, nullptr,
-                      rope_dim, 0,
-                      max_ctx_,
-                      freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    k = ggml_rope_ext(ctx, k, pos_k, nullptr,
+                    rope_dim, 0, max_ctx_,
+                    freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     printf("---end ggml_rope_ext k---\n");
     // ------------------------------------------------------------------
     // Update KV cache at position `pos`
@@ -337,7 +353,7 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
             nb1_kv,
             nb2_kv,
             (size_t)pos * nb1_kv);  // offset to position pos
-
+        
         struct ggml_tensor* v_slot = ggml_view_3d(ctx, kv_[attn_ord].v,
             head_dim, 1, n_kv_heads,
             nb1_kv,
