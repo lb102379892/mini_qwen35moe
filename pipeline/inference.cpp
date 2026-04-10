@@ -417,14 +417,65 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // ------------------------------------------------------------------
     // Flash Attention (GQA: n_q_heads / n_kv_heads handled internally)
     // ------------------------------------------------------------------
+    // float scale = 1.0f / sqrtf((float)head_dim);
+    // struct ggml_tensor* attn_out =
+    //     ggml_flash_attn_ext(ctx, q, k_cache_view, v_cache_view,
+    //                         nullptr, scale, 0.0f, 0.0f);
+    // // Result: [head_dim, 1, n_q_heads, 1] → flatten
+    // attn_out = ggml_cont(ctx, attn_out);
+    // int64_t flat_sz = attn_out->ne[0] * attn_out->ne[1] * attn_out->ne[2];
+    // attn_out = ggml_reshape_1d(ctx, attn_out, flat_sz);
+
+    // -------- Naive attention (debug correctness, single-token) --------
+    // Make contiguous views
+    ggml_tensor * q_c = ggml_cont(ctx, q);
+    ggml_tensor * k_c = ggml_cont(ctx, k_cache_view);
+    ggml_tensor * v_c = ggml_cont(ctx, v_cache_view);
+
+    // q_c: [head_dim, 1, n_q_heads]
+    // k_c: [head_dim, pos+1, n_kv_heads]
+    // v_c: [head_dim, pos+1, n_kv_heads]
+
+    // 1) Repeat kv heads to q heads (GQA)
+    // We'll build k_rep/v_rep: [head_dim, pos+1, n_q_heads]
+    GGML_ASSERT(n_q_heads % n_kv_heads == 0);
+    ggml_tensor * k_rep = ggml_repeat(ctx, k_c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, pos + 1, n_q_heads));
+    ggml_tensor * v_rep = ggml_repeat(ctx, v_c, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, pos + 1, n_q_heads));
+
+    // 2) Reshape to treat heads as "batch" for mul_mat
+    // For scores we want: for each head h: (K_h^T [pos+1, head_dim]) @ (Q_h [head_dim, 1]) -> [pos+1, 1]
+    // ggml_mul_mat expects A:[K, M], B:[K, N] -> [M, N].
+    // So set A = K_h  with shape [head_dim, pos+1], B = Q_h with shape [head_dim, 1].
+
+    ggml_tensor * q2 = ggml_reshape_3d(ctx, q_c, head_dim, 1, n_q_heads);              // [head_dim, 1, heads]
+    ggml_tensor * k2 = ggml_reshape_3d(ctx, k_rep, head_dim, pos + 1, n_q_heads);       // [head_dim, pos+1, heads]
+
+    // permute K to [head_dim, pos+1, heads] stays same for mul_mat (A's ne[0]=head_dim, ne[1]=pos+1)
+    ggml_tensor * scores = ggml_mul_mat(ctx, k2, q2);  // -> [pos+1, 1, heads]
+
+    // scale
     float scale = 1.0f / sqrtf((float)head_dim);
-    struct ggml_tensor* attn_out =
-        ggml_flash_attn_ext(ctx, q, k_cache_view, v_cache_view,
-                            nullptr, scale, 0.0f, 0.0f);
-    // Result: [head_dim, 1, n_q_heads, 1] → flatten
-    attn_out = ggml_cont(ctx, attn_out);
-    int64_t flat_sz = attn_out->ne[0] * attn_out->ne[1] * attn_out->ne[2];
-    attn_out = ggml_reshape_1d(ctx, attn_out, flat_sz);
+    scores = ggml_scale(ctx, scores, scale);
+
+    // softmax over seq dimension (ne[0] = pos+1)
+    ggml_tensor * probs = ggml_soft_max(ctx, scores);  // [pos+1, 1, heads]
+
+    // 3) Compute weighted sum: V_h [head_dim, pos+1] @ probs_h [pos+1, 1] -> [head_dim, 1]
+    //
+    // We need A:[K, M] = probs_h with K=pos+1, M=1 ? No: mul_mat uses shared K at ne[0].
+    // So we transpose V to make ne[0]=pos+1, then mul_mat with probs (ne[0]=pos+1).
+
+    ggml_tensor * v2 = ggml_reshape_3d(ctx, v_rep, head_dim, pos + 1, n_q_heads);       // [head_dim, pos+1, heads]
+    ggml_tensor * v_t = ggml_permute(ctx, v2, 1, 0, 2, 3);                               // [pos+1, head_dim, heads, 1] (but ggml treats missing dims as 1)
+    v_t = ggml_cont(ctx, v_t);
+    v_t = ggml_reshape_3d(ctx, v_t, pos + 1, head_dim, n_q_heads);                       // [pos+1, head_dim, heads]
+
+    ggml_tensor * attn_t = ggml_mul_mat(ctx, v_t, probs);                                // [head_dim, 1, heads]
+
+    // Now attn_t is [head_dim, 1, heads] which matches earlier flash output (except the extra dim)
+    ggml_tensor * attn = ggml_cont(ctx, attn_t);
+    int64_t flat_sz = attn->ne[0] * attn->ne[1] * attn->ne[2];
+    ggml_tensor * attn_out = ggml_reshape_1d(ctx, attn, flat_sz);
 
     // Output projection: [n_q_heads * head_dim, embed_dim] @ [flat_sz] → [embed_dim]
     struct ggml_tensor* out = ggml_mul_mat(ctx, lw.attn_output, attn_out);
