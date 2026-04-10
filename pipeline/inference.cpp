@@ -125,12 +125,18 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
         ggml_free(ctx);
         return {};
     }
+    // 关键：确保 logits 连续
+    logits = ggml_cont(ctx, logits);
     ggml_build_forward_expand(gf, logits);
 
     //ggml_graph_print(gf);
 
     // Execute on CPU
     ggml_graph_compute_with_ctx(ctx, gf, n_threads_);
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(logits) == vocab_size_);
+    GGML_ASSERT(logits->nb[0] == sizeof(float));
 
     // Copy logits out
     // logits tensor is F32 by construction
@@ -337,7 +343,7 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     }
     if (lw.attn_k_norm) {
         k = ggml_rms_norm(ctx, k, eps);
-        k = mul_dbg(ctx, k, lw.attn_k_norm, "attn: q * attn_k_norm");
+        k = mul_dbg(ctx, k, lw.attn_k_norm, "attn: k * attn_k_norm");
     }
 
     // RoPE: ggml 要求 b 是 int32 向量，长度必须等于 a->ne[2]（head 维）
