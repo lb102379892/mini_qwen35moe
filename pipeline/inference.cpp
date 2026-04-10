@@ -85,8 +85,8 @@ bool Qwen35moeInference::init(const Qwen35moeModel& model,
 
     if (!alloc_kv_cache()) return false;
 
-    // Pre-allocate scratch buffer: generous 256 MB for all intermediate tensors
-    compute_buf_.resize(256ull * 1024 * 1024);
+    // Pre-allocate scratch buffer: generous 512 MB for all intermediate tensors
+    compute_buf_.resize(512ull * 1024 * 1024);
 
     printf("[Inference] Initialised: layers=%d, max_ctx=%d, threads=%d, "
            "embed=%u, heads=%u/%u, head_dim=%u\n",
@@ -566,14 +566,21 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
 
     // 3. Stateless conv1d approximation: multiply by the last kernel column (most-recent
     //    timestep weight), then apply SiLU.
-    //    ssm_conv1d: ne[0]=8192, ne[1]=4 (F32) — row-major: last row at offset 3*8192*SZF32
+    //    ssm_conv1d shape: ne[0]=4 (kernel_size), ne[1]=8192 (channels), type=F32
+    //    Memory layout: [k0_ch0, k1_ch0, k2_ch0, k3_ch0, k0_ch1, k1_ch1, ...]
+    //    We want the last kernel coeff (k3) for each channel → strided extraction
     if (lw.ssm_conv1d) {
-        int64_t qkv_total   = lw.ssm_conv1d->ne[0];       // 8192
-        int64_t kernel_size = lw.ssm_conv1d->ne[1];        // 4
-        struct ggml_tensor* conv_w = ggml_view_1d(ctx, lw.ssm_conv1d,
-                                                   qkv_total,
-                                                   (size_t)(kernel_size - 1) * qkv_total * SZF32);
-        conv_w = ggml_cont(ctx, conv_w);
+        int64_t kernel_size = lw.ssm_conv1d->ne[0];        // 4
+        int64_t n_channels  = lw.ssm_conv1d->ne[1];        // 8192
+        // Strided view: extract element [kernel_size-1] from each channel
+        // ne0=1, ne1=n_channels, nb1=kernel_size*SZF32 (stride between channels)
+        // offset=(kernel_size-1)*SZF32 (start at last kernel element of channel 0)
+        struct ggml_tensor* conv_w = ggml_view_2d(ctx, lw.ssm_conv1d,
+                                                   1, n_channels,
+                                                   kernel_size * (int64_t)SZF32,
+                                                   (size_t)(kernel_size - 1) * SZF32);
+        conv_w = ggml_cont(ctx, conv_w);                    // [1, 8192] contiguous
+        conv_w = ggml_reshape_1d(ctx, conv_w, n_channels);  // [8192]
         qkv = ggml_mul(ctx, qkv, conv_w);
     }
     struct ggml_tensor* qkv_act = ggml_silu(ctx, qkv);
