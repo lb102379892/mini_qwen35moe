@@ -62,7 +62,7 @@ ggml_tensor* ops_swiglu_ffn(ggml_context* ctx, ggml_tensor* x,
                               ggml_tensor* w_gate, ggml_tensor* w_up, ggml_tensor* w_down) {
     ggml_tensor* gate   = ggml_mul_mat(ctx, w_gate, x);
     ggml_tensor* up     = ggml_mul_mat(ctx, w_up,   x);
-    ggml_tensor* hidden = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor* hidden = mul_dbg(ctx, ggml_silu(ctx, gate), up, "ops_swiglu_ffn: gate * up");
     return ggml_mul_mat(ctx, w_down, hidden);
 }
 
@@ -603,7 +603,7 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // The Q projection produced both Q and a gate tensor; the gate controls
     // the final attention contribution (like in Qwen3.5's gated attention).
     struct ggml_tensor* gate_sigmoid = ggml_sigmoid(ctx, attn_gate);
-    attn_out = ggml_mul(ctx, attn_out, gate_sigmoid);
+    attn_out = mul_dbg(ctx, attn_out, gate_sigmoid, "attn_out * gate_sigmoid");
 
     // Output projection: [n_q_heads * head_dim, embed_dim] @ [flat_sz] → [embed_dim]
     struct ggml_tensor* out = ggml_mul_mat(ctx, lw.attn_output, attn_out);
@@ -699,7 +699,7 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
 
     // gate_a = -abs(alpha_softplus * ssm_a)
     // ssm_a: [num_v_heads=32] F32  (negative values: -A_log.exp())
-    struct ggml_tensor* gate_a = ggml_mul(ctx, alpha_sp, lw.ssm_a);
+    struct ggml_tensor* gate_a = mul_dbg(ctx, alpha_sp, lw.ssm_a, "alpha_sp * ssm_a");
     gate_a = ggml_neg(ctx, ggml_abs(ctx, gate_a));  // [32], negative
 
     // -----------------------------------------------------------------------
@@ -845,11 +845,11 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     struct ggml_tensor* exp_gate = ggml_exp(ctx, gate_a);            // [32]
     struct ggml_tensor* eg_3d    = ggml_reshape_3d(ctx, exp_gate, 1, 1, num_v_heads); // [1,1,32]
     // ggml_mul(S=[128,128,32], eg_3d=[1,1,32]) broadcasts eg_3d (ggml_can_repeat is true)
-    struct ggml_tensor* S_decayed = ggml_mul(ctx, S, eg_3d);         // [128, 128, 32]
+    struct ggml_tensor* S_decayed = mul_dbg(ctx, S, eg_3d, "S * eg_3d");         // [128, 128, 32]
 
     struct ggml_tensor* beta_3d = ggml_reshape_3d(ctx, beta, 1, 1, num_v_heads); // [1,1,32]
     // ggml_mul(outer=[128,128,32], beta_3d=[1,1,32]) broadcasts beta_3d
-    struct ggml_tensor* outer_sc = ggml_mul(ctx, outer, beta_3d);   // [128, 128, 32]
+    struct ggml_tensor* outer_sc = mul_dbg(ctx, outer, beta_3d, "outer * beta_3d");   // [128, 128, 32]
 
     struct ggml_tensor* S_new = ggml_add(ctx, S_decayed, outer_sc);  // [128, 128, 32]
 
@@ -882,7 +882,7 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     // z: [inner_size=4096] → reshape to [head_v_dim, num_v_heads] = [128, 32]
     struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
     // Gated output: out_normed * silu(z)
-    struct ggml_tensor* output = ggml_mul(ctx, out_normed, ggml_silu(ctx, z_2d));
+    struct ggml_tensor* output = mul_dbg(ctx, out_normed, ggml_silu(ctx, z_2d), "out_normed * silu(z)");
 
     // -----------------------------------------------------------------------
     // Step 11: Flatten and output projection
