@@ -100,7 +100,7 @@ public:
 
             // Print decoded piece incrementally
             std::string piece = tokenizer_.decode({next_id});
-            printf("[DBG_POS] step=%d pos=%d token_in=%d piece=%s\n", step, pos, next_id, piece.c_str());
+            printf("[DBG_POS] step=%d pos=%d next_id=%d piece=%s\n", step, pos, next_id, piece.c_str());
             fflush(stdout);
 
             logits = inference_.forward(next_id, pos++);
