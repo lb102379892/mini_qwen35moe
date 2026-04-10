@@ -86,9 +86,11 @@ bool Qwen35moeInference::init(const Qwen35moeModel& model,
     }
 
     if (!alloc_kv_cache()) return false;
+    if (!alloc_ssm_states()) return false;
 
-    // Pre-allocate scratch buffer: generous 256 MB for all intermediate tensors
-    compute_buf_.resize(256ull * 1024 * 1024);
+    // Pre-allocate scratch buffer: 512 MB for all intermediate tensors
+    // (increased from 256 MB to accommodate larger SSM intermediate tensors)
+    compute_buf_.resize(512ull * 1024 * 1024);
 
     printf("[Inference] Initialised: layers=%d, max_ctx=%d, threads=%d, "
            "embed=%u, heads=%u/%u, head_dim=%u\n",
@@ -218,6 +220,73 @@ void Qwen35moeInference::free_kv_cache() {
 }
 
 // ---------------------------------------------------------------------------
+// SSM state management (DeltaNet recurrent state + conv1d sliding window)
+// ---------------------------------------------------------------------------
+
+bool Qwen35moeInference::alloc_ssm_states() {
+    free_ssm_states();
+
+    int n_ssm = 0;
+    for (int L = 0; L < n_layers_; L++) {
+        if (!is_attn_layer(L)) n_ssm++;
+    }
+
+    // SSM dimensions from config:
+    int num_v_heads    = (int)cfg_->time_step_rank;   // 32
+    int inner_size     = (int)cfg_->inner_size;        // 4096
+    int head_v_dim     = inner_size / num_v_heads;     // 128
+    int num_k_heads    = (int)cfg_->group_count;       // 16
+    int head_k_dim     = (int)cfg_->state_size;        // 128
+    int conv_kernel    = (int)cfg_->conv_kernel;       // 4
+    int conv_channels  = inner_size + 2 * num_k_heads * head_k_dim; // 4096 + 2*16*128 = 8192
+
+    // Per-layer sizes:
+    //   state:    [head_v_dim*head_v_dim, num_v_heads] = [16384, 32]  F32
+    //   conv_buf: [conv_kernel-1, conv_channels]        = [3,    8192] F32
+    size_t state_bytes    = (size_t)head_v_dim * head_v_dim * num_v_heads * SZF32;
+    size_t conv_buf_bytes = (size_t)(conv_kernel - 1) * conv_channels * SZF32;
+    size_t buf_per_layer  = state_bytes + conv_buf_bytes + 8 * ggml_tensor_overhead();
+
+    ssm_states_.resize(n_ssm);
+    for (int i = 0; i < n_ssm; i++) {
+        struct ggml_init_params p = {
+            /* .mem_size   = */ buf_per_layer,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ false,
+        };
+        ssm_states_[i].ctx = ggml_init(p);
+        if (!ssm_states_[i].ctx) {
+            printf("[Inference] ERROR: SSM state alloc failed for SSM layer %d\n", i);
+            return false;
+        }
+        // state: [head_v_dim*head_v_dim, num_v_heads] F32
+        ssm_states_[i].state = ggml_new_tensor_2d(ssm_states_[i].ctx, GGML_TYPE_F32,
+                                                    (int64_t)head_v_dim * head_v_dim,
+                                                    num_v_heads);
+        // conv_buf: [conv_kernel-1, conv_channels] F32
+        // ne[0] = conv_kernel-1 (fastest-varying: conv position k)
+        // ne[1] = conv_channels (slower-varying: channel index)
+        ssm_states_[i].conv_buf = ggml_new_tensor_2d(ssm_states_[i].ctx, GGML_TYPE_F32,
+                                                       conv_kernel - 1,
+                                                       conv_channels);
+        memset(ssm_states_[i].state->data,    0, ggml_nbytes(ssm_states_[i].state));
+        memset(ssm_states_[i].conv_buf->data, 0, ggml_nbytes(ssm_states_[i].conv_buf));
+    }
+    printf("[Inference] SSM states: %d SSM layers × (state=%.1f MB + conv_buf=%.1f KB)\n",
+           n_ssm,
+           (float)state_bytes / (1024*1024),
+           (float)conv_buf_bytes / 1024);
+    return true;
+}
+
+void Qwen35moeInference::free_ssm_states() {
+    for (auto& s : ssm_states_) {
+        if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
+    }
+    ssm_states_.clear();
+}
+
+// ---------------------------------------------------------------------------
 // build_graph: full forward pass
 // ---------------------------------------------------------------------------
 
@@ -239,6 +308,7 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
     printf("[DBG_GRAPH] pos=%d token_id=%d\n", pos, ((int32_t*)inp->data)[0]);
 
     int attn_ord = 0;
+    int ssm_ord  = 0;
 
     for (int L = 0; L < n_layers_; L++) {
         const Qwen35moeLayer& layer = w.layers[L];
@@ -260,7 +330,8 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
             }
             attn_ord++;
         } else {
-            sublayer_out = build_ssm_layer(ctx, normed, L);
+            sublayer_out = build_ssm_layer(ctx, gf, normed, L, ssm_ord);
+            ssm_ord++;
         }
 
         // Residual
@@ -395,21 +466,14 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
         k = mul_dbg(ctx, k, lw.attn_k_norm, "attn: k * attn_k_norm");
     }
 
-    // RoPE: ggml 要求 b 是 int32 向量，长度必须等于 a->ne[2]（head 维）
-    struct ggml_tensor* pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_q_heads);
-    for (int i = 0; i < n_q_heads; ++i) {
-        ((int32_t*)pos_q->data)[i] = pos;
-    }
+    // RoPE: position tensor must be [n_tokens] = [1] for single-token inference
+    struct ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ((int32_t*)pos_t->data)[0] = pos;
 
-    struct ggml_tensor* pos_k = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv_heads);
-    for (int i = 0; i < n_kv_heads; ++i) {
-        ((int32_t*)pos_k->data)[i] = pos;
-    }
-
-    q = ggml_rope_ext(ctx, q, pos_q, nullptr,
+    q = ggml_rope_ext(ctx, q, pos_t, nullptr,
                     rope_dim, 0, max_ctx_,
                     freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(ctx, k, pos_k, nullptr,
+    k = ggml_rope_ext(ctx, k, pos_t, nullptr,
                     rope_dim, 0, max_ctx_,
                     freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     // ------------------------------------------------------------------
@@ -540,78 +604,276 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
 }
 
 // ---------------------------------------------------------------------------
-// build_ssm_layer: Gated DeltaNet (simplified approximation)
+// build_ssm_layer: Gated DeltaNet (recurrent SSM with persistent state)
 //
-// Reference (llama.cpp qwen35moe.cpp):
-//   qkv = attn_qkv @ normed    →  [8192]   (QKV mixed projection)
-//   z   = attn_gate @ normed   →  [4096]   (gate for normalization)
-//   qkv_act = conv1d(qkv) + silu   (conv1d with state, then silu)
-//   q, k, v = split(qkv_act)   →  [2048], [2048], [4096]
-//   output = delta_net(q, k, v, ...)  (recurrent SSM computation)
-//   output = rms_norm(output, ssm_norm) * silu(z)
-//   out = ssm_out @ output      →  [embed_dim]
+// Reference: llama.cpp qwen35moe.cpp build_layer_attn_linear
 //
-// Simplified: without conv1d state and delta net, we approximate by
-// applying silu to the QKV projection and using V directly.
+// Algorithm (single token):
+//  1. qkv_mixed = attn_qkv  @ normed          → [conv_channels=8192]
+//  2. z         = attn_gate @ normed          → [inner_size=4096]
+//  3. beta      = sigmoid(ssm_beta @ normed)  → [num_v_heads=32]
+//  4. gate_a    = -abs(softplus(ssm_alpha @ normed + ssm_dt_b) * ssm_a)
+//                                              → [num_v_heads=32]  (negative)
+//  5. Conv1d with sliding window state (persistent conv_buf):
+//     sx        = concat(conv_buf, qkv_mixed_row, dim=0) → [4, 8192]
+//     conv_out  = ggml_ssm_conv(sx_3d, ssm_conv1d)       → [8192]
+//     conv_silu = silu(conv_out)
+//     Update conv_buf ← last 3 rows of sx
+//  6. Split conv_silu: q_conv[2048], k_conv[2048], v_conv[4096]
+//  7. L2-normalize q_conv, k_conv per head
+//  8. Expand q_conv, k_conv from num_k_heads=16 to num_v_heads=32
+//  9. DeltaNet recurrent update (persistent state):
+//     S: [head_v_dim, head_v_dim, num_v_heads]
+//     o = S @ k; corr = v - o; outer = k ⊗ corr
+//     S_new = exp(gate_a) * S + beta * outer
+//     output = S_new @ q   → [head_v_dim, num_v_heads]
+//     Update state ← S_new
+// 10. Gated RMS norm: rms_norm(output, ssm_norm) * silu(z)
+// 11. Output projection: ssm_out @ flat → [embed_dim]
 // ---------------------------------------------------------------------------
 
 struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
         struct ggml_context* ctx,
+        struct ggml_cgraph*  gf,
         struct ggml_tensor*  normed,
-        int                  layer_idx) {
+        int                  layer_idx,
+        int                  ssm_ord) {
 
     const Qwen35moeLayer& lw = model_->weights.layers[layer_idx];
     float eps = cfg_->layer_norm_rms_epsilon;
 
-    int embed_dim   = (int)cfg_->embedding_length;   // 2048
-    int inner_size  = (int)cfg_->inner_size;          // 4096
-    int num_v_heads = (int)cfg_->time_step_rank;      // 32
-    int head_v_dim  = inner_size / num_v_heads;        // 128
+    // SSM dimensions
+    int embed_dim      = (int)cfg_->embedding_length;   // 2048
+    int inner_size     = (int)cfg_->inner_size;          // 4096
+    int num_v_heads    = (int)cfg_->time_step_rank;      // 32
+    int head_v_dim     = inner_size / num_v_heads;       // 128
+    int num_k_heads    = (int)cfg_->group_count;         // 16
+    int head_k_dim     = (int)cfg_->state_size;          // 128
+    int conv_kernel    = (int)cfg_->conv_kernel;         // 4
+    int conv_channels  = inner_size + 2 * num_k_heads * head_k_dim; // 8192
 
-    printf("[DBG_SSM] layer=%d embed=%d inner=%d num_v_heads=%d head_v_dim=%d\n",
-           layer_idx, embed_dim, inner_size, num_v_heads, head_v_dim);
-    if (lw.attn_qkv) printf("[DBG_SSM] attn_qkv ne=[%lld %lld]\n",
-                             lw.attn_qkv->ne[0], lw.attn_qkv->ne[1]);
-    if (lw.attn_gate) printf("[DBG_SSM] attn_gate ne=[%lld %lld]\n",
-                              lw.attn_gate->ne[0], lw.attn_gate->ne[1]);
-    if (lw.ssm_out)  printf("[DBG_SSM] ssm_out ne=[%lld %lld]\n",
-                             lw.ssm_out->ne[0], lw.ssm_out->ne[1]);
-    if (lw.ssm_conv1d) printf("[DBG_SSM] ssm_conv1d ne=[%lld %lld]\n",
-                               lw.ssm_conv1d->ne[0], lw.ssm_conv1d->ne[1]);
+    // -----------------------------------------------------------------------
+    // Step 1: Projections
+    // -----------------------------------------------------------------------
 
-    // QKV mixed projection → [8192]
-    struct ggml_tensor* qkv = ggml_mul_mat(ctx, lw.attn_qkv, normed);
+    // qkv_mixed = attn_qkv @ normed → [conv_channels=8192]
+    // attn_qkv: [embed_dim=2048, conv_channels=8192]
+    struct ggml_tensor* qkv_mixed = ggml_mul_mat(ctx, lw.attn_qkv, normed);
+    qkv_mixed = ggml_reshape_1d(ctx, qkv_mixed, conv_channels);
 
-    // Z (gate for normalization) → [4096]
+    // z = attn_gate @ normed → [inner_size=4096]
+    // attn_gate: [embed_dim=2048, inner_size=4096]
     struct ggml_tensor* z = ggml_mul_mat(ctx, lw.attn_gate, normed);
+    z = ggml_reshape_1d(ctx, z, inner_size);
 
-    // Apply SiLU activation (approximates conv1d + silu in the full implementation)
-    struct ggml_tensor* qkv_act = ggml_silu(ctx, qkv);
+    // -----------------------------------------------------------------------
+    // Step 3-4: Compute beta and gate_a
+    // -----------------------------------------------------------------------
 
-    // Extract V portion: the last inner_size elements
-    // Full split would be: Q[0:2048], K[2048:4096], V[4096:8192]
-    // Without delta net, we use V directly as the approximate output
-    struct ggml_tensor* v = ggml_view_1d(ctx, qkv_act, inner_size,
-                                          (size_t)inner_size * SZF32);
+    // beta = sigmoid(ssm_beta @ normed) → [num_v_heads=32]
+    // ssm_beta: [embed_dim=2048, num_v_heads=32]
+    struct ggml_tensor* beta_raw = ggml_mul_mat(ctx, lw.ssm_beta, normed);
+    beta_raw = ggml_reshape_1d(ctx, beta_raw, num_v_heads);
+    struct ggml_tensor* beta = ggml_sigmoid(ctx, beta_raw);  // [32]
 
-    // Gated normalization: rms_norm(v, ssm_norm) * silu(z)
-    // Reshape for per-head normalization: [head_v_dim, num_v_heads]
-    struct ggml_tensor* v_2d = ggml_reshape_2d(ctx, v, head_v_dim, num_v_heads);
-    struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
+    // alpha = ssm_alpha @ normed → [num_v_heads=32]
+    // ssm_alpha: [embed_dim=2048, num_v_heads=32]
+    struct ggml_tensor* alpha = ggml_mul_mat(ctx, lw.ssm_alpha, normed);
+    alpha = ggml_reshape_1d(ctx, alpha, num_v_heads);
 
-    // RMS norm on each head_v_dim-sized vector, then scale by ssm_norm weight
-    struct ggml_tensor* v_normed = ggml_rms_norm(ctx, v_2d, eps);
+    // alpha_biased = alpha + ssm_dt_b
+    // ssm_dt_b: [num_v_heads=32] F32
+    struct ggml_tensor* alpha_biased = ggml_add(ctx, alpha, lw.ssm_dt_b);
+
+    // alpha_softplus = softplus(alpha_biased) → [32]
+    struct ggml_tensor* alpha_sp = ggml_softplus(ctx, alpha_biased);
+
+    // gate_a = -abs(alpha_softplus * ssm_a)
+    // ssm_a: [num_v_heads=32] F32  (negative values: -A_log.exp())
+    struct ggml_tensor* gate_a = ggml_mul(ctx, alpha_sp, lw.ssm_a);
+    gate_a = ggml_neg(ctx, ggml_abs(ctx, gate_a));  // [32], negative
+
+    // -----------------------------------------------------------------------
+    // Step 5: Conv1d with persistent sliding-window state
+    // -----------------------------------------------------------------------
+
+    // Access persistent conv_buf: [conv_kernel-1, conv_channels] = [3, 8192]
+    // ne[0]=3 (k position, fastest), ne[1]=8192 (channel)
+    struct ggml_tensor* conv_buf = ssm_states_[ssm_ord].conv_buf;
+
+    // qkv_row: reshape qkv_mixed [8192] → [1, 8192] to concat along dim=0
+    struct ggml_tensor* qkv_row = ggml_reshape_2d(ctx, qkv_mixed, 1, conv_channels);  // [1, 8192]
+
+    // sx = concat(conv_buf [3,8192], qkv_row [1,8192], dim=0) → [4, 8192]
+    struct ggml_tensor* sx = ggml_concat(ctx, conv_buf, qkv_row, 0);
+
+    // Make sx contiguous before ggml_ssm_conv (required by assertions)
+    struct ggml_tensor* sx_cont = ggml_cont(ctx, sx);  // [4, 8192] contiguous
+
+    // Reshape to 3D for ggml_ssm_conv: [d_conv-1+n_t, d_inner, n_s] = [4, 8192, 1]
+    struct ggml_tensor* sx_3d = ggml_reshape_3d(ctx, sx_cont,
+                                                  conv_kernel,          // ne[0] = 4
+                                                  conv_channels,        // ne[1] = 8192
+                                                  1);                    // ne[2] = 1 (single seq)
+
+    // conv_out = ggml_ssm_conv(sx_3d, ssm_conv1d) → [conv_channels, 1, 1] = [8192, 1, 1]
+    // ssm_conv1d: [conv_kernel=4, conv_channels=8192] F32
+    struct ggml_tensor* conv_out_3d = ggml_ssm_conv(ctx, sx_3d, lw.ssm_conv1d);
+    // Reshape to [8192]
+    struct ggml_tensor* conv_out = ggml_reshape_1d(ctx, conv_out_3d, conv_channels);
+    // Apply SiLU
+    struct ggml_tensor* conv_silu = ggml_silu(ctx, conv_out);  // [8192]
+
+    // Update persistent conv_buf with last (conv_kernel-1) rows of sx_cont
+    // sx_cont is [4, 8192] with ne[0]=4. We want rows k=1,2,3 → new conv_buf [3, 8192].
+    // View: ne=[3, 8192], nb[0]=sizeof(float), nb[1]=4*sizeof(float), offset=1*sizeof(float)
+    // This gives: view[k', c] = sx_cont[1+k', c] for k'=0..2 ✓
+    struct ggml_tensor* new_conv_buf_view = ggml_view_2d(ctx, sx_cont,
+                                                           conv_kernel - 1,      // ne[0] = 3
+                                                           conv_channels,         // ne[1] = 8192
+                                                           (size_t)conv_kernel * SZF32,  // nb[1]: stride in bytes
+                                                           SZF32);                // offset: skip k=0
+    struct ggml_tensor* new_conv_buf = ggml_cont(ctx, new_conv_buf_view);  // [3, 8192] contiguous
+    // Schedule write-back to persistent conv_buf
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_conv_buf, conv_buf));
+
+    // -----------------------------------------------------------------------
+    // Step 6: Split conv_silu into q_conv, k_conv, v_conv
+    // -----------------------------------------------------------------------
+    // Layout: [q(2048) | k(2048) | v(4096)]
+    int qk_size = head_k_dim * num_k_heads;  // 128 * 16 = 2048
+    int v_size  = head_v_dim * num_v_heads;  // 128 * 32 = 4096
+
+    struct ggml_tensor* q_conv_raw = ggml_view_1d(ctx, conv_silu, qk_size,
+                                                    0);
+    struct ggml_tensor* k_conv_raw = ggml_view_1d(ctx, conv_silu, qk_size,
+                                                    (size_t)qk_size * SZF32);
+    struct ggml_tensor* v_conv     = ggml_view_1d(ctx, conv_silu, v_size,
+                                                    (size_t)2 * qk_size * SZF32);
+
+    // Reshape to [head_k_dim, num_k_heads] = [128, 16]
+    struct ggml_tensor* q_conv = ggml_reshape_2d(ctx, q_conv_raw, head_k_dim, num_k_heads);
+    struct ggml_tensor* k_conv = ggml_reshape_2d(ctx, k_conv_raw, head_k_dim, num_k_heads);
+    // Reshape v to [head_v_dim, num_v_heads] = [128, 32]
+    struct ggml_tensor* v_2d   = ggml_reshape_2d(ctx, v_conv, head_v_dim, num_v_heads);
+
+    // -----------------------------------------------------------------------
+    // Step 7: L2-normalize q_conv and k_conv per head (along ne[0] = head_k_dim)
+    // -----------------------------------------------------------------------
+    static constexpr float L2_EPS = 1e-12f;
+    struct ggml_tensor* q_norm = ggml_l2_norm(ctx, q_conv, L2_EPS);  // [128, 16]
+    struct ggml_tensor* k_norm = ggml_l2_norm(ctx, k_conv, L2_EPS);  // [128, 16]
+
+    // -----------------------------------------------------------------------
+    // Step 8: Expand q/k from num_k_heads=16 to num_v_heads=32
+    // -----------------------------------------------------------------------
+    struct ggml_tensor* q_tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim, num_v_heads);
+    struct ggml_tensor* k_tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_k_dim, num_v_heads);
+    struct ggml_tensor* q_exp  = ggml_repeat(ctx, q_norm, q_tmpl);  // [128, 32]
+    struct ggml_tensor* k_exp  = ggml_repeat(ctx, k_norm, k_tmpl);  // [128, 32]
+
+    // -----------------------------------------------------------------------
+    // Step 9: DeltaNet recurrent update (persistent state)
+    //
+    // State S: [head_v_dim, head_v_dim, num_v_heads] = [128, 128, 32]
+    //   S[j, i, h] = element at head h, row i, col j  (j = ne[0], fastest)
+    //
+    // For each head h:
+    //   o_h    = S_h @ k_h                         (S_h=[128,128], k_h=[128])
+    //   corr_h = v_h - o_h
+    //   S_new_h = exp(gate_a[h]) * S_h + beta[h] * outer(corr_h, k_h)
+    //   out_h   = S_new_h @ q_h
+    //
+    // Batched via ggml ops (all 32 heads in parallel).
+    // ggml_mul supports broadcasting: b is repeated if ggml_can_repeat(b, a).
+    // -----------------------------------------------------------------------
+
+    // Access persistent state: [head_v_dim*head_v_dim, num_v_heads] = [16384, 32]
+    struct ggml_tensor* state_persistent = ssm_states_[ssm_ord].state;
+
+    // View as 3D: [head_v_dim, head_v_dim, num_v_heads] = [128, 128, 32]
+    // This view IS contiguous (strides match the natural layout).
+    // nb[0]=4, nb[1]=head_v_dim*4=512, nb[2]=head_v_dim^2*4=65536
+    struct ggml_tensor* S = ggml_view_3d(ctx, state_persistent,
+                                          head_v_dim,                              // ne[0] = col
+                                          head_v_dim,                              // ne[1] = row
+                                          num_v_heads,                             // ne[2] = head
+                                          (size_t)head_v_dim * SZF32,              // nb[1]
+                                          (size_t)head_v_dim * head_v_dim * SZF32, // nb[2]
+                                          0);
+
+    // Reshape k_exp, v_2d, q_exp to 3D: [head_v_dim, 1, num_v_heads]
+    struct ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_exp,  head_v_dim, 1, num_v_heads);
+    struct ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_2d,   head_v_dim, 1, num_v_heads);
+    struct ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_exp,  head_v_dim, 1, num_v_heads);
+
+    // --- o = S @ k → [128, 1, 32] ---
+    // ggml_mul_mat(A=[128,128,32], B=[128,1,32]) → [128,1,32]
+    // result[m,n,h] = sum_j A[j,m,h] * B[j,n,h] = (S_mat @ k)[m,h]
+    struct ggml_tensor* o = ggml_mul_mat(ctx, S, k_3d);  // [128, 1, 32]
+
+    // --- corr = v - o: [128, 1, 32] ---
+    struct ggml_tensor* corr = ggml_sub(ctx, v_3d, o);
+
+    // --- outer = k ⊗ corr: [128, 128, 32] ---
+    // outer[col=m, row=n, h] = k[m, h] * corr[n, h]
+    // Reshape k to [1, head_v_dim, num_v_heads] and corr to [1, head_v_dim, num_v_heads]
+    struct ggml_tensor* k_col   = ggml_reshape_3d(ctx, k_exp,  1, head_v_dim, num_v_heads);
+    struct ggml_tensor* corr_2d = ggml_reshape_2d(ctx, corr,   head_v_dim, num_v_heads);
+    struct ggml_tensor* corr_col = ggml_reshape_3d(ctx, corr_2d, 1, head_v_dim, num_v_heads);
+    // ggml_mul_mat(A=[1,128,32], B=[1,128,32]) → [128,128,32]
+    // result[m,n,h] = A[0,m,h]*B[0,n,h] = k[m,h]*corr[n,h]
+    struct ggml_tensor* outer = ggml_mul_mat(ctx, k_col, corr_col);  // [128, 128, 32]
+
+    // --- S_new = exp(gate_a) * S + beta * outer ---
+    // Use ggml_mul broadcasting: [1,1,32] broadcasts to [128,128,32]
+    struct ggml_tensor* exp_gate = ggml_exp(ctx, gate_a);            // [32]
+    struct ggml_tensor* eg_3d    = ggml_reshape_3d(ctx, exp_gate, 1, 1, num_v_heads); // [1,1,32]
+    // ggml_mul(S=[128,128,32], eg_3d=[1,1,32]) broadcasts eg_3d (ggml_can_repeat is true)
+    struct ggml_tensor* S_decayed = ggml_mul(ctx, S, eg_3d);         // [128, 128, 32]
+
+    struct ggml_tensor* beta_3d = ggml_reshape_3d(ctx, beta, 1, 1, num_v_heads); // [1,1,32]
+    // ggml_mul(outer=[128,128,32], beta_3d=[1,1,32]) broadcasts beta_3d
+    struct ggml_tensor* outer_sc = ggml_mul(ctx, outer, beta_3d);   // [128, 128, 32]
+
+    struct ggml_tensor* S_new = ggml_add(ctx, S_decayed, outer_sc);  // [128, 128, 32]
+
+    // --- output = S_new @ q → [128, 1, 32] ---
+    struct ggml_tensor* deltanet_out = ggml_mul_mat(ctx, S_new, q_3d);  // [128, 1, 32]
+
+    // Write S_new back to persistent state via 3D target view (same shape as S_new)
+    struct ggml_tensor* state_3d_target = ggml_view_3d(ctx, state_persistent,
+                                                         head_v_dim,
+                                                         head_v_dim,
+                                                         num_v_heads,
+                                                         (size_t)head_v_dim * SZF32,
+                                                         (size_t)head_v_dim * head_v_dim * SZF32,
+                                                         0);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, S_new, state_3d_target));
+
+    // -----------------------------------------------------------------------
+    // Step 10: Gated RMS norm
+    // -----------------------------------------------------------------------
+    // Reshape output to [head_v_dim, num_v_heads] = [128, 32]
+    struct ggml_tensor* out_2d = ggml_reshape_2d(ctx, deltanet_out, head_v_dim, num_v_heads);
+
+    // RMS norm per head (over head_v_dim=128 dimension)
+    struct ggml_tensor* out_normed = ggml_rms_norm(ctx, out_2d, eps);
+    // Scale by ssm_norm weights: ssm_norm is [128] — broadcast over num_v_heads
     if (lw.ssm_norm) {
-        v_normed = mul_dbg(ctx, v_normed, lw.ssm_norm, "ssm: v_normed * ssm_norm");
+        out_normed = mul_dbg(ctx, out_normed, lw.ssm_norm, "ssm: out_normed * ssm_norm");
     }
 
-    // Gated output: normed_v * silu(z)
-    struct ggml_tensor* output = ggml_mul(ctx, v_normed, ggml_silu(ctx, z_2d));
+    // z: [inner_size=4096] → reshape to [head_v_dim, num_v_heads] = [128, 32]
+    struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
+    // Gated output: out_normed * silu(z)
+    struct ggml_tensor* output = ggml_mul(ctx, out_normed, ggml_silu(ctx, z_2d));
 
-    // Flatten back to [inner_size]
+    // -----------------------------------------------------------------------
+    // Step 11: Flatten and output projection
+    // -----------------------------------------------------------------------
     output = ggml_reshape_1d(ctx, output, inner_size);
-
-    // Output projection → [embed_dim]
+    // ssm_out: [inner_size=4096, embed_dim=2048]
     struct ggml_tensor* out = ggml_mul_mat(ctx, lw.ssm_out, output);
     out = ggml_reshape_1d(ctx, out, embed_dim);
 
@@ -670,14 +932,7 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     if (top_k_probs->type != GGML_TYPE_F32) {
         top_k_probs = ggml_cast(ctx, top_k_probs, GGML_TYPE_F32);
     }
-    // Normalize top-k weights so they sum to 1.0
-    // (softmax was over all 256 experts; after selecting top-8, renormalize)
-    {
-        struct ggml_tensor* wsum = ggml_sum(ctx, top_k_probs); // [1]
-        struct ggml_tensor* wsum_bc = ggml_repeat(ctx, wsum,
-            ggml_new_tensor_1d(ctx, GGML_TYPE_F32, expert_k));
-        top_k_probs = ggml_div(ctx, top_k_probs, wsum_bc);
-    }
+    // Use softmax probabilities directly as expert weights (no renormalization).
     // ------------------------------------------------------------------
     // Sparse expert path (batched via mul_mat_id)
     // ------------------------------------------------------------------
