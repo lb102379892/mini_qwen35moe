@@ -62,7 +62,13 @@ public:
     // generate: tokenize prompt, run forward loop, return decoded text
     // ============================================================
     std::string generate(const std::string& prompt) {
-        std::vector<int> ids = tokenizer_.encode(prompt);
+        // Apply Qwen chat template for instruction-tuned models
+        std::string full_prompt =
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\n" + prompt + "<|im_end|>\n"
+            "<|im_start|>assistant\n";
+
+        std::vector<int> ids = tokenizer_.encode(full_prompt);
         if (ids.empty()) {
             printf("[Generator] WARNING: prompt produced no tokens\n");
             return "";

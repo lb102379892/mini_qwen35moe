@@ -291,6 +291,11 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     const Qwen35moeLayer& lw = model_->weights.layers[layer_idx];
     float eps = cfg_->layer_norm_rms_epsilon;
 
+    if (layer_idx == 3 && lw.attn_q) {
+        printf("[DBG_ATTN] layer=%d attn_q ne=[%lld %lld] (expected [2048,8192])\n",
+               layer_idx, (long long)lw.attn_q->ne[0], (long long)lw.attn_q->ne[1]);
+    }
+
     // Guard: all four tensors are required for an attention layer.
     // If any is missing, report an error and return nullptr to the caller.
     if (!lw.attn_q || !lw.attn_k || !lw.attn_v || !lw.attn_output) {
@@ -510,19 +515,19 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
 }
 
 // ---------------------------------------------------------------------------
-// build_ssm_layer: Gated DeltaNet (simplified approximation)
+// build_ssm_layer: Gated DeltaNet (stateless approximation)
 //
-// Reference (llama.cpp qwen35moe.cpp):
-//   qkv = attn_qkv @ normed    →  [8192]   (QKV mixed projection)
-//   z   = attn_gate @ normed   →  [4096]   (gate for normalization)
-//   qkv_act = conv1d(qkv) + silu   (conv1d with state, then silu)
-//   q, k, v = split(qkv_act)   →  [2048], [2048], [4096]
-//   output = delta_net(q, k, v, ...)  (recurrent SSM computation)
+// Reference (llama.cpp qwen35moe.cpp build_layer_attn_linear):
+//   qkv  = attn_qkv @ normed    →  [8192]   (QKV mixed projection)
+//   z    = attn_gate @ normed   →  [4096]   (gate for output norm)
+//   conv_out = silu(ssm_conv1d[-1] * qkv)   (stateless conv1d approximation)
+//   q, k, v = split(conv_out)   →  [2048], [2048], [4096]
+//   q = l2_norm(reshape(q, [head_k_dim, num_k_heads]))
+//   k = l2_norm(reshape(k, [head_k_dim, num_k_heads]))
+//   v = reshape(v, [head_v_dim, num_v_heads])
+//   output ≈ v  (stateless: initial state = 0, delta net output = 0)
 //   output = rms_norm(output, ssm_norm) * silu(z)
-//   out = ssm_out @ output      →  [embed_dim]
-//
-// Simplified: without conv1d state and delta net, we approximate by
-// applying silu to the QKV projection and using V directly.
+//   out  = ssm_out @ flatten(output)   →  [embed_dim]
 // ---------------------------------------------------------------------------
 
 struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
@@ -534,44 +539,93 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     float eps = cfg_->layer_norm_rms_epsilon;
 
     int embed_dim   = (int)cfg_->embedding_length;   // 2048
-    int inner_size  = (int)cfg_->inner_size;          // 4096
+    int d_inner     = (int)cfg_->inner_size;          // 4096
+    int d_state     = (int)cfg_->state_size;          // 128
+    int n_group     = (int)cfg_->group_count;         // 16  (num_k_heads)
     int num_v_heads = (int)cfg_->time_step_rank;      // 32
-    int head_v_dim  = inner_size / num_v_heads;        // 128
+    int head_v_dim  = d_inner / num_v_heads;           // 128
+    int head_k_dim  = d_state;                         // 128
+    int num_k_heads = n_group;                         // 16
 
-    // QKV mixed projection → [8192]
-    struct ggml_tensor* qkv = ggml_mul_mat(ctx, lw.attn_qkv, normed);
+    if (layer_idx == 0) {
+        printf("[DBG_SSM] d_inner=%d d_state=%d n_group=%d num_v_heads=%d head_v_dim=%d head_k_dim=%d\n",
+               d_inner, d_state, n_group, num_v_heads, head_v_dim, head_k_dim);
+        if (lw.attn_qkv) printf("[DBG_SSM] attn_qkv ne=[%lld %lld]\n",
+                                 (long long)lw.attn_qkv->ne[0], (long long)lw.attn_qkv->ne[1]);
+        if (lw.ssm_conv1d) printf("[DBG_SSM] ssm_conv1d ne=[%lld %lld]\n",
+                                   (long long)lw.ssm_conv1d->ne[0], (long long)lw.ssm_conv1d->ne[1]);
+    }
 
-    // Z (gate for normalization) → [4096]
-    struct ggml_tensor* z = ggml_mul_mat(ctx, lw.attn_gate, normed);
+    // 1. QKV mixed projection → [8192]
+    //    8192 = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+    //         = 128*16*2 + 128*32 = 4096 + 4096
+    struct ggml_tensor* qkv = ggml_mul_mat(ctx, lw.attn_qkv, normed);  // [8192]
 
-    // Apply SiLU activation (approximates conv1d + silu in the full implementation)
+    // 2. Z gate → [d_inner=4096]
+    struct ggml_tensor* z = ggml_mul_mat(ctx, lw.attn_gate, normed);   // [4096]
+
+    // 3. Stateless conv1d approximation: multiply by the last kernel column (most-recent
+    //    timestep weight), then apply SiLU.
+    //    ssm_conv1d: ne[0]=8192, ne[1]=4 (F32) — row-major: last row at offset 3*8192*SZF32
+    if (lw.ssm_conv1d) {
+        int64_t qkv_total   = lw.ssm_conv1d->ne[0];       // 8192
+        int64_t kernel_size = lw.ssm_conv1d->ne[1];        // 4
+        struct ggml_tensor* conv_w = ggml_view_1d(ctx, lw.ssm_conv1d,
+                                                   qkv_total,
+                                                   (size_t)(kernel_size - 1) * qkv_total * SZF32);
+        conv_w = ggml_cont(ctx, conv_w);
+        qkv = ggml_mul(ctx, qkv, conv_w);
+    }
     struct ggml_tensor* qkv_act = ggml_silu(ctx, qkv);
 
-    // Extract V portion: the last inner_size elements
-    // Full split would be: Q[0:2048], K[2048:4096], V[4096:8192]
-    // Without delta net, we use V directly as the approximate output
-    struct ggml_tensor* v = ggml_view_1d(ctx, qkv_act, inner_size,
-                                          (size_t)inner_size * SZF32);
+    // 4. Split qkv_act: Q[0:2048], K[2048:4096], V[4096:8192]
+    int64_t qk_size = (int64_t)head_k_dim * num_k_heads;  // 2048
+    int64_t v_size  = (int64_t)head_v_dim * num_v_heads;  // 4096
 
-    // Gated normalization: rms_norm(v, ssm_norm) * silu(z)
-    // Reshape for per-head normalization: [head_v_dim, num_v_heads]
-    struct ggml_tensor* v_2d = ggml_reshape_2d(ctx, v, head_v_dim, num_v_heads);
-    struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
+    struct ggml_tensor* q_1d = ggml_view_1d(ctx, qkv_act, qk_size, 0);
+    struct ggml_tensor* k_1d = ggml_view_1d(ctx, qkv_act, qk_size,
+                                              (size_t)qk_size * SZF32);
+    struct ggml_tensor* v_1d = ggml_view_1d(ctx, qkv_act, v_size,
+                                              (size_t)2 * qk_size * SZF32);
 
-    // RMS norm on each head_v_dim-sized vector, then scale by ssm_norm weight
-    struct ggml_tensor* v_normed = ggml_rms_norm(ctx, v_2d, eps);
+    // 5. Reshape to 2D and L2-normalize Q and K per-head
+    struct ggml_tensor* q_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, q_1d),
+                                                head_k_dim, num_k_heads);  // [128, 16]
+    struct ggml_tensor* k_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, k_1d),
+                                                head_k_dim, num_k_heads);  // [128, 16]
+    struct ggml_tensor* v_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, v_1d),
+                                                head_v_dim, num_v_heads);  // [128, 32]
+
+    q_2d = ggml_l2_norm(ctx, q_2d, eps);
+    k_2d = ggml_l2_norm(ctx, k_2d, eps);
+
+    // 6. Repeat Q/K heads to match V heads (num_k_heads=16 → num_v_heads=32)
+    if (num_v_heads != num_k_heads) {
+        struct ggml_tensor* tmpl_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                         head_k_dim, num_v_heads);
+        q_2d = ggml_repeat(ctx, q_2d, tmpl_v);  // [128, 32]
+        k_2d = ggml_repeat(ctx, k_2d, tmpl_v);  // [128, 32]
+    }
+
+    // 7. Delta Net stateless approximation: with initial state = 0,
+    //    the delta net output reduces to zero.  Use V as the approximation
+    //    (captures the value projection signal without the recurrent state).
+    struct ggml_tensor* output = v_2d;  // [head_v_dim=128, num_v_heads=32]
+
+    // 8. Gated normalization: rms_norm(output, ssm_norm) * silu(z)
+    struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);  // [128, 32]
+
+    struct ggml_tensor* v_normed = ggml_rms_norm(ctx, output, eps);
     if (lw.ssm_norm) {
         v_normed = mul_dbg(ctx, v_normed, lw.ssm_norm, "ssm: v_normed * ssm_norm");
     }
+    struct ggml_tensor* gated = ggml_mul(ctx, v_normed, ggml_silu(ctx, z_2d));  // [128, 32]
 
-    // Gated output: normed_v * silu(z)
-    struct ggml_tensor* output = ggml_mul(ctx, v_normed, ggml_silu(ctx, z_2d));
+    // 9. Flatten → [d_inner=4096]
+    struct ggml_tensor* flat = ggml_reshape_1d(ctx, gated, (int64_t)head_v_dim * num_v_heads);
 
-    // Flatten back to [inner_size]
-    output = ggml_reshape_1d(ctx, output, inner_size);
-
-    // Output projection → [embed_dim]
-    struct ggml_tensor* out = ggml_mul_mat(ctx, lw.ssm_out, output);
+    // 10. Output projection → [embed_dim=2048]
+    struct ggml_tensor* out = ggml_mul_mat(ctx, lw.ssm_out, flat);
     out = ggml_reshape_1d(ctx, out, embed_dim);
 
     return out;
