@@ -33,6 +33,7 @@ target_link_libraries(ggml_core INTERFACE ggml)
 # ============================================================
 add_executable(test_qwen35moe
     model/loader.cpp
+    pipeline/inference.cpp
     main.cpp
 )
 target_link_libraries(test_qwen35moe PRIVATE ggml_core pthread dl m)
