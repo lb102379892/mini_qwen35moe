@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cassert>
 #include <algorithm>
+#include <numeric>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -143,6 +145,20 @@ std::vector<float> Qwen35moeInference::forward(int token_id, int pos) {
     std::vector<float> result(vocab_size_);
     memcpy(result.data(), logits->data, (size_t)vocab_size_ * SZF32);
 
+    // Debug: print top-5 logits for the first few positions
+    if (pos < 5) {
+        const float* data = result.data();
+        int top_n = std::min(5, vocab_size_);
+        std::vector<int> idx(vocab_size_);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + top_n, idx.end(),
+                          [&](int a, int b){ return data[a] > data[b]; });
+        printf("[DBG_LOGITS] pos=%d top5: ", pos);
+        for (int i = 0; i < top_n; i++) printf("[id=%d val=%.3f] ", idx[i], data[idx[i]]);
+        printf("\n");
+        fflush(stdout);
+    }
+
     ggml_free(ctx);
     return result;
 }
@@ -219,10 +235,17 @@ struct ggml_tensor* Qwen35moeInference::build_graph(
     // Squeeze to 1D [embed_dim]
     cur = ggml_reshape_1d(ctx, cur, cur->ne[0]);
 
+    // Debug: log input token id and position
+    printf("[DBG_GRAPH] pos=%d token_id=%d\n", pos, ((int32_t*)inp->data)[0]);
+
     int attn_ord = 0;
 
     for (int L = 0; L < n_layers_; L++) {
         const Qwen35moeLayer& layer = w.layers[L];
+
+        if (pos == 0) {
+            printf("[DBG_LAYER] L=%d type=%s\n", L, is_attn_layer(L) ? "ATTN" : "SSM");
+        }
 
         // 2a. Pre-attn/SSM RMSNorm
         struct ggml_tensor* normed = ops_rms_norm(ctx, cur, layer.attn_norm, eps);
@@ -309,6 +332,13 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     int n_kv_heads = (int)cfg_->head_count_kv;        // 2
     int head_dim   = (int)cfg_->key_length;            // 256
     int rope_dim   = (int)cfg_->dimension_count;       // 64
+
+    printf("[DBG_ATTN] layer=%d embed_dim=%d n_q_heads=%d n_kv_heads=%d head_dim=%d\n",
+           layer_idx, embed_dim, n_q_heads, n_kv_heads, head_dim);
+    if (lw.attn_q) {
+        printf("[DBG_ATTN] attn_q shape: ne=[%lld %lld %lld]\n",
+               lw.attn_q->ne[0], lw.attn_q->ne[1], lw.attn_q->ne[2]);
+    }
     // RoPE frequency base: Qwen3.5 MoE uses 10 000 000 (10M) per the model card
     float freq_base = (cfg_->freq_base > 0.0f) ? cfg_->freq_base : 10000000.0f;
 
@@ -537,6 +567,17 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     int inner_size  = (int)cfg_->inner_size;          // 4096
     int num_v_heads = (int)cfg_->time_step_rank;      // 32
     int head_v_dim  = inner_size / num_v_heads;        // 128
+
+    printf("[DBG_SSM] layer=%d embed=%d inner=%d num_v_heads=%d head_v_dim=%d\n",
+           layer_idx, embed_dim, inner_size, num_v_heads, head_v_dim);
+    if (lw.attn_qkv) printf("[DBG_SSM] attn_qkv ne=[%lld %lld]\n",
+                             lw.attn_qkv->ne[0], lw.attn_qkv->ne[1]);
+    if (lw.attn_gate) printf("[DBG_SSM] attn_gate ne=[%lld %lld]\n",
+                              lw.attn_gate->ne[0], lw.attn_gate->ne[1]);
+    if (lw.ssm_out)  printf("[DBG_SSM] ssm_out ne=[%lld %lld]\n",
+                             lw.ssm_out->ne[0], lw.ssm_out->ne[1]);
+    if (lw.ssm_conv1d) printf("[DBG_SSM] ssm_conv1d ne=[%lld %lld]\n",
+                               lw.ssm_conv1d->ne[0], lw.ssm_conv1d->ne[1]);
 
     // QKV mixed projection → [8192]
     struct ggml_tensor* qkv = ggml_mul_mat(ctx, lw.attn_qkv, normed);
