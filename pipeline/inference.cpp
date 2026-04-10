@@ -1,6 +1,5 @@
 // pipeline/inference.cpp
 // Qwen3.5 MoE forward-pass implementation using ggml.
-//
 #include "pipeline/inference.hpp"
 #include "compute/ops_cpu.hpp"
 #include <ggml.h>
@@ -92,8 +91,8 @@ bool Qwen35moeInference::init(const Qwen35moeModel& model,
     // (increased from 256 MB to accommodate larger SSM intermediate tensors)
     compute_buf_.resize(512ull * 1024 * 1024);
 
-    printf("[Inference] Initialised: layers=%d, max_ctx=%d, threads=%d, "
-           "embed=%u, heads=%u/%u, head_dim=%u\n",
+    printf("[Inference] Initialised: layers=%d, max_ctx=%d, threads=%d, \
+           embed=%u, heads=%u/%u, head_dim=%u\n",
            n_layers_, max_ctx_, n_threads_,
            cfg_->embedding_length, cfg_->head_count, cfg_->head_count_kv,
            cfg_->key_length);
@@ -394,8 +393,8 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     // Guard: all four tensors are required for an attention layer.
     // If any is missing, report an error and return nullptr to the caller.
     if (!lw.attn_q || !lw.attn_k || !lw.attn_v || !lw.attn_output) {
-        printf("[Inference] ERROR: layer %d is an attention layer but is missing required "
-               "tensors: attn_q=%s attn_k=%s attn_v=%s attn_output=%s\n",
+        printf("[Inference] ERROR: layer %d is an attention layer but is missing required \
+               tensors: attn_q=%s attn_k=%s attn_v=%s attn_output=%s\n",
                layer_idx,
                lw.attn_q      ? "OK" : "nullptr",
                lw.attn_k      ? "OK" : "nullptr",
@@ -462,14 +461,18 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     struct ggml_tensor* v = ggml_mul_mat(ctx, lw.attn_v, normed);
     v = ggml_reshape_3d(ctx, v, head_dim, 1, n_kv_heads);
 
-    // Per-head RMSNorm for Q and K (weight broadcasts over heads)
+    // Per-head RMSNorm for Q and K (weight shape [head_dim] must broadcast over heads).
+    // q: [head_dim, 1, n_q_heads]  — norm weight is [head_dim], reshape to [head_dim, 1, 1]
+    // so ggml_mul broadcasts it correctly across all heads.
     if (lw.attn_q_norm) {
         q = ggml_rms_norm(ctx, q, eps);
-        q = mul_dbg(ctx, q, lw.attn_q_norm, "attn: q * attn_q_norm");
+        struct ggml_tensor* q_norm_w = ggml_reshape_3d(ctx, lw.attn_q_norm, head_dim, 1, 1);
+        q = mul_dbg(ctx, q, q_norm_w, "attn: q * attn_q_norm");
     }
     if (lw.attn_k_norm) {
         k = ggml_rms_norm(ctx, k, eps);
-        k = mul_dbg(ctx, k, lw.attn_k_norm, "attn: k * attn_k_norm");
+        struct ggml_tensor* k_norm_w = ggml_reshape_3d(ctx, lw.attn_k_norm, head_dim, 1, 1);
+        k = mul_dbg(ctx, k, k_norm_w, "attn: k * attn_k_norm");
     }
 
     // RoPE: position tensor must be [n_tokens] = [1] for single-token inference
@@ -800,7 +803,7 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     // ggml_mul supports broadcasting: b is repeated if ggml_can_repeat(b, a).
     // -----------------------------------------------------------------------
 
-    // Access persistent state: [head_v_dim*head_v_dim, num_v_heads] = [16384, 32]
+    // Access persistent state: [head_v_dim*head_v_dim, num_v_heads] = [128, 128, 32]
     struct ggml_tensor* state_persistent = ssm_states_[ssm_ord].state;
 
     // View as 3D: [head_v_dim, head_v_dim, num_v_heads] = [128, 128, 32]
@@ -891,129 +894,3 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
 
     return out;
 }
-
-// ---------------------------------------------------------------------------
-// build_moe_ffn: Mixture-of-Experts FFN
-//
-// Sparse:
-//   logits = ffn_gate_inp   @ cur                → [n_experts]
-//   probs  = softmax(logits)
-//   ids    = argsort_top_k(probs, k)              → [k] int32
-//   weights= top_k(probs, k)                      → [k] float
-//   input_tiled: repeat cur → [embed_dim, k]
-//   gate_out = mul_mat_id(ffn_gate_exps, tiled, ids) → [ff_dim, k]
-//   up_out   = mul_mat_id(ffn_up_exps,   tiled, ids) → [ff_dim, k]
-//   hidden   = silu(gate_out) * up_out
-//   down_out = mul_mat_id(ffn_down_exps, hidden, ids) → [embed_dim, k]
-//   expert_out = sum_j( down_out[:, j] * weights[j] )
-//
-// Shared:
-//   sh_scale = sigmoid( ffn_gate_inp_shexp ⋅ cur )   (scalar)
-//   sh_out   = down_shexp( silu(gate_shexp @ cur) * up_shexp @ cur )
-//   sh_out  *= sh_scale
-//
-// FFN = expert_out + sh_out
-// ---------------------------------------------------------------------------
-
-struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
-        struct ggml_context* ctx,
-        struct ggml_cgraph*  gf,
-        struct ggml_tensor*  cur,
-        int                  layer_idx) {
-
-    const Qwen35moeLayer& lw = model_->weights.layers[layer_idx];
-
-    int embed_dim = (int)cfg_->embedding_length;
-    int ff_dim    = (int)cfg_->expert_feed_forward_length;   // 512
-    int n_experts = (int)cfg_->expert_count;                  // 256
-    int expert_k  = (int)cfg_->expert_used_count;             // 8
-    int ff_dim_sh = (int)cfg_->expert_shared_feed_forward_length; // 512
-
-    // ------------------------------------------------------------------
-    // Router
-    // ------------------------------------------------------------------
-    // ffn_gate_inp: [embed_dim, n_experts] (F32)
-    struct ggml_tensor* router_logits = ggml_mul_mat(ctx, lw.ffn_gate_inp, cur);
-    router_logits = ggml_reshape_1d(ctx, router_logits, n_experts);
-
-    struct ggml_tensor* router_probs = ggml_soft_max(ctx, router_logits);
-
-    // Top-k indices [k] and weights [k]
-    struct ggml_tensor* top_k_ids   = ggml_argsort_top_k(ctx, router_probs, expert_k);
-    struct ggml_tensor* top_k_probs = ggml_top_k(ctx, router_probs, expert_k);
-    if (top_k_probs->type != GGML_TYPE_F32) {
-        top_k_probs = ggml_cast(ctx, top_k_probs, GGML_TYPE_F32);
-    }
-    // Use softmax probabilities directly as expert weights (no renormalization).
-    // ------------------------------------------------------------------
-    // Sparse expert path (batched via mul_mat_id)
-    // ------------------------------------------------------------------
-    // Tile input so each of the k experts gets a copy: [embed_dim, k]
-    struct ggml_tensor* cur_2d = ggml_reshape_2d(ctx, cur, embed_dim, 1);
-    struct ggml_tensor* tmpl   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embed_dim, expert_k);
-    struct ggml_tensor* cur_tiled = ggml_repeat(ctx, cur_2d, tmpl);   // [embed_dim, k]
-
-    // ids must be [k, 1] for mul_mat_id
-    struct ggml_tensor* ids_2d = ggml_reshape_2d(ctx, top_k_ids, expert_k, 1);
-
-    // Gate / up projections: [ff_dim, k]
-    // ffn_gate_exps: [embed_dim, ff_dim, n_experts]
-    struct ggml_tensor* gate_out =
-        ggml_mul_mat_id(ctx, lw.ffn_gate_exps, cur_tiled, ids_2d);
-    struct ggml_tensor* up_out =
-        ggml_mul_mat_id(ctx, lw.ffn_up_exps,   cur_tiled, ids_2d);
-
-    // SwiGLU activation: [ff_dim, k]
-    struct ggml_tensor* hidden = mul_dbg(ctx, ggml_silu(ctx, gate_out), up_out, "silu:gete_out * up_out");
-
-    // Down projection: [embed_dim, k]
-    // ffn_down_exps: [ff_dim, embed_dim, n_experts]
-    struct ggml_tensor* down_out =
-        ggml_mul_mat_id(ctx, lw.ffn_down_exps, hidden, ids_2d);
-
-    // Weighted sum: multiply each expert column by its router probability
-    // top_k_probs [k] → broadcast to [embed_dim, k]
-    struct ggml_tensor* probs_2d = ggml_reshape_2d(ctx, top_k_probs, 1, expert_k);
-    struct ggml_tensor* probs_bc = ggml_repeat(ctx, probs_2d, down_out); // [embed_dim, k]
-    struct ggml_tensor* scaled   = mul_dbg(ctx, down_out, probs_bc, "down_out * probs_bc");    // [embed_dim, k]
-
-    // Accumulate the k expert outputs column by column
-    struct ggml_tensor* expert_out =
-        ggml_view_1d(ctx, scaled, embed_dim, 0);
-    for (int j = 1; j < expert_k; j++) {
-        struct ggml_tensor* col =
-            ggml_view_1d(ctx, scaled, embed_dim, (size_t)j * embed_dim * SZF32);
-        expert_out = ggml_add(ctx, expert_out, col);
-    }
-
-    // ------------------------------------------------------------------
-    // Shared expert
-    // ------------------------------------------------------------------
-    // ffn_gate_inp_shexp: [embed_dim] F32 → scalar gate for shared expert
-    // Reshape to a [1, embed_dim] "row" matrix so mul_mat gives a scalar
-    struct ggml_tensor* shexp_row = ggml_reshape_2d(ctx, lw.ffn_gate_inp_shexp,
-                                                     embed_dim, 1);
-    struct ggml_tensor* sh_scale_raw = ggml_mul_mat(ctx, shexp_row, cur); // [1]
-    sh_scale_raw = ggml_reshape_1d(ctx, sh_scale_raw, 1);
-    struct ggml_tensor* sh_scale = ggml_sigmoid(ctx, sh_scale_raw);        // [1]
-
-    // Shared expert SwiGLU
-    struct ggml_tensor* sh_gate   = ggml_mul_mat(ctx, lw.ffn_gate_shexp, cur); // [ff_dim_sh]
-    struct ggml_tensor* sh_up     = ggml_mul_mat(ctx, lw.ffn_up_shexp,   cur); // [ff_dim_sh]
-    struct ggml_tensor* sh_hidden = mul_dbg(ctx, ggml_silu(ctx, sh_gate), sh_up, "silu:sh_gate * sh_up");
-    struct ggml_tensor* sh_out    = ggml_mul_mat(ctx, lw.ffn_down_shexp, sh_hidden);
-    sh_out = ggml_reshape_1d(ctx, sh_out, embed_dim);
-
-    // Scale by shared-expert gate scalar (broadcast scalar over embed_dim)
-    struct ggml_tensor* sh_scale_bc =
-        ggml_repeat(ctx, sh_scale,
-                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, embed_dim));
-    sh_out = mul_dbg(ctx, sh_out, sh_scale_bc, "sh_out * sh_scale_bc");
-
-    // ------------------------------------------------------------------
-    // Combine
-    // ------------------------------------------------------------------
-    expert_out = ggml_reshape_1d(ctx, expert_out, embed_dim);
-    return ggml_add(ctx, expert_out, sh_out);
-}
-
