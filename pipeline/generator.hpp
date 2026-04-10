@@ -74,6 +74,8 @@ public:
         // Prefill: run forward pass for each prompt token to populate KV cache
         std::vector<float> logits;
         for (int i = 0; i < (int)ids.size(); i++) {
+            std::string tok_str = tokenizer_.decode({ids[i]});
+            printf("[DBG_PREFILL] token[%d] id=%d str='%s'\n", i, ids[i], tok_str.c_str());
             logits = inference_.forward(ids[i], i);
         }
 

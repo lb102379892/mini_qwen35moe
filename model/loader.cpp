@@ -50,6 +50,27 @@ void ModelLoader::load_qwen35moe_layer(GGUFReader& reader, Qwen35moeLayer& layer
     layer.attn_q_norm    = reader.get_tensor(prefix + ".attn_q_norm.weight");
     layer.attn_v         = reader.get_tensor(prefix + ".attn_v.weight");
     layer.attn_output    = reader.get_tensor(prefix + ".attn_output.weight");
+
+    // Debug: print all tensors loaded for this layer
+    printf("[Loader] layer %2d tensors:\n", layer_idx);
+    auto print_t = [&](const char* name, ggml_tensor* t) {
+        if (t) printf("  %-40s ne=[%lld %lld %lld] type=%d\n", name,
+                      t->ne[0], t->ne[1], t->ne[2], (int)t->type);
+        else   printf("  %-40s NULL\n", name);
+    };
+    print_t("attn_norm",            layer.attn_norm);
+    print_t("attn_q",               layer.attn_q);
+    print_t("attn_k",               layer.attn_k);
+    print_t("attn_v",               layer.attn_v);
+    print_t("attn_output",          layer.attn_output);
+    print_t("attn_qkv",             layer.attn_qkv);
+    print_t("attn_gate",            layer.attn_gate);
+    print_t("ssm_out",              layer.ssm_out);
+    print_t("ssm_norm",             layer.ssm_norm);
+    print_t("ssm_a",                layer.ssm_a);
+    print_t("ssm_conv1d",           layer.ssm_conv1d);
+    print_t("post_attention_norm",  layer.post_attention_norm);
+    print_t("ffn_gate_inp",         layer.ffn_gate_inp);
 }
 
 // ============================================================
@@ -95,22 +116,22 @@ bool ModelLoader::load_qwen35moe(GGUFReader& reader, Qwen35moeWeights& weights, 
         const Qwen35moeLayer& lyr = weights.layers[i];
         if (is_attn_layer(i)) {
             bool ok = lyr.attn_q && lyr.attn_k && lyr.attn_v && lyr.attn_output;
-            // printf("[Loader] layer %2d: ATTENTION  attn_q=%s attn_k=%s attn_v=%s attn_output=%s%s\n",
-            //        i,
-            //        lyr.attn_q      ? "OK" : "MISSING",
-            //        lyr.attn_k      ? "OK" : "MISSING",
-            //        lyr.attn_v      ? "OK" : "MISSING",
-            //        lyr.attn_output ? "OK" : "MISSING",
-            //        ok ? "" : "  <-- ERROR");
+            printf("[Loader] layer %2d: ATTENTION  attn_q=%s attn_k=%s attn_v=%s attn_output=%s%s\n",
+                   i,
+                   lyr.attn_q      ? "OK" : "MISSING",
+                   lyr.attn_k      ? "OK" : "MISSING",
+                   lyr.attn_v      ? "OK" : "MISSING",
+                   lyr.attn_output ? "OK" : "MISSING",
+                   ok ? "" : "  <-- ERROR");
             if (!ok) layer_ok = false;
         } else {
             bool ok = lyr.attn_qkv && lyr.attn_gate && lyr.ssm_out;
-            // printf("[Loader] layer %2d: SSM        attn_qkv=%s attn_gate=%s ssm_out=%s%s\n",
-            //        i,
-            //        lyr.attn_qkv  ? "OK" : "MISSING",
-            //        lyr.attn_gate ? "OK" : "MISSING",
-            //        lyr.ssm_out   ? "OK" : "MISSING",
-            //        ok ? "" : "  <-- ERROR");
+            printf("[Loader] layer %2d: SSM        attn_qkv=%s attn_gate=%s ssm_out=%s%s\n",
+                   i,
+                   lyr.attn_qkv  ? "OK" : "MISSING",
+                   lyr.attn_gate ? "OK" : "MISSING",
+                   lyr.ssm_out   ? "OK" : "MISSING",
+                   ok ? "" : "  <-- ERROR");
             if (!ok) layer_ok = false;
         }
     }
