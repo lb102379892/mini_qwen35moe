@@ -74,7 +74,8 @@ private:
         // reshaped to [head_v_dim, head_v_dim, num_v_heads] during compute
         struct ggml_tensor*  state    = nullptr;
         // Conv1d sliding-window buffer: [conv_kernel-1, conv_channels] F32
-        // ne[0] = conv_kernel-1 = 3, ne[1] = conv_channels = 8192
+        // ne[0] = conv_kernel-1 = 3 (conv position, fastest-varying)
+        // ne[1] = conv_channels = 8192 (channel axis)
         struct ggml_tensor*  conv_buf = nullptr;
     };
     std::vector<SSMState> ssm_states_;  // indexed by SSM layer ordinal

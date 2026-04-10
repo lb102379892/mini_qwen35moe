@@ -198,7 +198,8 @@ bool Qwen35moeInference::alloc_kv_cache() {
             printf("[Inference] ERROR: KV cache alloc failed for attn layer %d\n", i);
             return false;
         }
-        // [head_dim, max_ctx, n_kv_heads]
+        // [head_dim, max_ctx, n_kv_heads] F32
+        // ne[0]=head_dim (fastest), ne[1]=max_ctx, ne[2]=n_kv_heads
         kv_[i].k = ggml_new_tensor_3d(kv_[i].ctx, GGML_TYPE_F32,
                                        head_dim, max_ctx_, n_kv_heads);
         kv_[i].v = ggml_new_tensor_3d(kv_[i].ctx, GGML_TYPE_F32,
@@ -232,7 +233,12 @@ bool Qwen35moeInference::alloc_ssm_states() {
     }
 
     // SSM dimensions from config:
-    int num_v_heads    = (int)cfg_->time_step_rank;   // 32
+    // In the DeltaNet architecture:
+    //   time_step_rank = number of value heads (num_v_heads = 32)
+    //   group_count    = number of key heads (num_k_heads = 16)
+    //   state_size     = key/value head dimension (head_k_dim = head_v_dim = 128)
+    //   inner_size     = total hidden dimension = num_v_heads * head_v_dim = 4096
+    int num_v_heads    = (int)cfg_->time_step_rank;   // 32  (= ssm.time_step_rank in GGUF)
     int inner_size     = (int)cfg_->inner_size;        // 4096
     int head_v_dim     = inner_size / num_v_heads;     // 128
     int num_k_heads    = (int)cfg_->group_count;       // 16
@@ -701,10 +707,16 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
     // ne[0]=3 (k position, fastest), ne[1]=8192 (channel)
     struct ggml_tensor* conv_buf = ssm_states_[ssm_ord].conv_buf;
 
-    // qkv_row: reshape qkv_mixed [8192] → [1, 8192] to concat along dim=0
-    struct ggml_tensor* qkv_row = ggml_reshape_2d(ctx, qkv_mixed, 1, conv_channels);  // [1, 8192]
+    // qkv_row: reshape qkv_mixed [8192] → [ne0=1, ne1=8192]
+    // ne[0]=1 = conv position (fastest-varying), ne[1]=8192 = channel axis.
+    // This allows ggml_concat with conv_buf [ne0=3, ne1=8192] along dim=0
+    // to produce sx [ne0=4, ne1=8192] where each channel gets 4 time-steps:
+    //   sx[k=0..2, c] = conv_buf[k, c]  (history)
+    //   sx[k=3,    c] = qkv_mixed[c]    (current token)
+    struct ggml_tensor* qkv_row = ggml_reshape_2d(ctx, qkv_mixed, 1, conv_channels);  // ne=[1, 8192]
 
-    // sx = concat(conv_buf [3,8192], qkv_row [1,8192], dim=0) → [4, 8192]
+    // sx = concat(conv_buf [ne0=3,ne1=8192], qkv_row [ne0=1,ne1=8192], dim=0)
+    // → [ne0=4, ne1=8192]: all 4 time-steps for each channel
     struct ggml_tensor* sx = ggml_concat(ctx, conv_buf, qkv_row, 0);
 
     // Make sx contiguous before ggml_ssm_conv (required by assertions)
