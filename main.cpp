@@ -112,6 +112,7 @@ static void print_usage(const char* prog) {
         "  --top-p      <f>      Top-p sampling threshold (default: 0.95)\n"
         "  --top-k      <N>      Top-k sampling (default: 40; 0=off)\n"
         "  --threads    <N>      CPU threads (default: 4)\n"
+        "  --seed       <N>      RNG seed (default: random)\n"
         "  --no-chat            Pass prompt verbatim (no chat template)\n"
         "  --verbose            Show tokenization and timing info\n"
         "\n"
@@ -221,6 +222,7 @@ int main(int argc, char* argv[]) {
     bool        use_chat     = true;
     bool        verbose      = false;
     bool        repl_mode    = false;
+    uint64_t    rng_seed     = std::random_device{}(); // random by default
 
     // ---- Parse args ----
     for (int i = 1; i < argc; i++) {
@@ -241,6 +243,7 @@ int main(int argc, char* argv[]) {
         else if (arg("--top-p"))     top_p       = (float)atof(next("--top-p"));
         else if (arg("--top-k"))     top_k       = atoi(next("--top-k"));
         else if (arg("--threads"))   n_threads   = atoi(next("--threads"));
+        else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
         else if (arg("-h") || arg("--help")) {
@@ -286,7 +289,8 @@ int main(int argc, char* argv[]) {
     InferenceEngine engine(*model, n_threads);
 
     // ---- Sampling RNG ----
-    std::mt19937 rng(42);
+    std::mt19937 rng(rng_seed);
+    if (verbose) fprintf(stderr, "[main] RNG seed: %llu\n", (unsigned long long)rng_seed);
 
     // ---- Single prompt or REPL ----
     if (!repl_mode) {

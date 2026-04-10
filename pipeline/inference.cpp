@@ -356,14 +356,14 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
     // RoPE on Q and K (multi-section rope)
     // rope_type=8 is for MRoPE; use standard RoPE (type=0) for simplicity
     // --------------------------------------------------
-    const int rope_mode = GGML_ROPE_TYPE_MROPE; // multi-section rotary for Qwen3.5
+    const int rope_type = GGML_ROPE_TYPE_MROPE; // multi-section rotary for Qwen3.5
     Qcur = ggml_rope_multi(ctx, Qcur, inp_pos, nullptr,
-                           (int)rope_dim, sections, rope_mode,
+                           (int)rope_dim, sections, rope_type,
                            (int)cfg.context_length, freq_base, 1.0f,
                            0.0f, 1.0f, 0.0f, 0.0f);
 
     Kcur = ggml_rope_multi(ctx, Kcur, inp_pos, nullptr,
-                           (int)rope_dim, sections, rope_mode,
+                           (int)rope_dim, sections, rope_type,
                            (int)cfg.context_length, freq_base, 1.0f,
                            0.0f, 1.0f, 0.0f, 0.0f);
 

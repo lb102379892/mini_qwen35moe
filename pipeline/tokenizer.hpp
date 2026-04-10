@@ -439,7 +439,9 @@ private:
         size_t operator()(const std::pair<std::string,std::string>& p) const {
             size_t h1 = std::hash<std::string>{}(p.first);
             size_t h2 = std::hash<std::string>{}(p.second);
-            return h1 ^ (h2 << 32) ^ (h2 >> 32);
+            // Combine using boost-style hash_combine (avoids UB from large shifts)
+            h1 ^= h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+            return h1;
         }
     };
     std::unordered_map<std::pair<std::string,std::string>, int, PairHash> merge_rank_;
