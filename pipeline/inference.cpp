@@ -319,11 +319,31 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     //   beta_fast=32.0  (YaRN high-frequency boundary)
     //   beta_slow=1.0   (YaRN low-frequency boundary)
 
-    // Q projection: [2048] → [8192]; we use first 4096 = n_q_heads * head_dim
+    // Q projection: [2048] → [8192] = (n_embd_head * 2) * n_head
+    // The output contains [Q_head0, Gate_head0, Q_head1, Gate_head1, ...]
+    // interleaved per head: each head contributes head_dim Q dims + head_dim gate dims.
     struct ggml_tensor* q_full = ggml_mul_mat(ctx, lw.attn_q, normed);
-    struct ggml_tensor* q = ggml_view_1d(ctx, q_full,
-                                          (int64_t)n_q_heads * head_dim, 0);
-    // Reshape: [head_dim, 1, n_q_heads] — flash_attn_ext requires ne[2]=n_q_heads
+
+    // Extract Q with stride: pick first head_dim of every (2*head_dim) block
+    // Shape: [head_dim, n_q_heads, 1] with nb1 = 2 * head_dim * sizeof(float)
+    struct ggml_tensor* q = ggml_view_3d(ctx, q_full,
+        head_dim, n_q_heads, 1,
+        SZF32 * head_dim * 2,                          // stride between heads (skip Q+Gate)
+        SZF32 * head_dim * 2 * (int64_t)n_q_heads,     // stride between tokens
+        0);                                              // Q starts at offset 0
+    q = ggml_cont(ctx, q);  // make contiguous
+
+    // Extract Gate with stride: pick second head_dim of every (2*head_dim) block
+    struct ggml_tensor* attn_gate = ggml_view_3d(ctx, q_full,
+        head_dim, n_q_heads, 1,
+        SZF32 * head_dim * 2,
+        SZF32 * head_dim * 2 * (int64_t)n_q_heads,
+        SZF32 * head_dim);                              // Gate starts at head_dim offset
+    attn_gate = ggml_cont(ctx, attn_gate);
+    // Flatten gate: [head_dim * n_q_heads]
+    attn_gate = ggml_reshape_1d(ctx, attn_gate, (int64_t)head_dim * n_q_heads);
+
+    // Reshape Q: [head_dim, 1, n_q_heads] for RoPE
     q = ggml_reshape_3d(ctx, q, head_dim, 1, n_q_heads);
 
     // K projection: [2048] → [512]
@@ -336,10 +356,9 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     v = ggml_reshape_3d(ctx, v, head_dim, 1, n_kv_heads);
 
     // Per-head RMSNorm for Q and K (weight broadcasts over heads)
-    // q: [head_dim, 1, n_q_heads] — rms_norm normalises each row of head_dim
     if (lw.attn_q_norm) {
         q = ggml_rms_norm(ctx, q, eps);
-        q = mul_dbg(ctx, q, lw.attn_q_norm, "attn: q * attn_q_norm");  // weight [head_dim] broadcasts
+        q = mul_dbg(ctx, q, lw.attn_q_norm, "attn: q * attn_q_norm");
     }
     if (lw.attn_k_norm) {
         k = ggml_rms_norm(ctx, k, eps);
@@ -477,6 +496,12 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
     int64_t flat_sz = attn->ne[0] * attn->ne[1] * attn->ne[2];
     ggml_tensor * attn_out = ggml_reshape_1d(ctx, attn, flat_sz);
 
+    // Gate the attention output: attn_out = attn_out * sigmoid(gate)
+    // The Q projection produced both Q and a gate tensor; the gate controls
+    // the final attention contribution (like in Qwen3.5's gated attention).
+    struct ggml_tensor* gate_sigmoid = ggml_sigmoid(ctx, attn_gate);
+    attn_out = ggml_mul(ctx, attn_out, gate_sigmoid);
+
     // Output projection: [n_q_heads * head_dim, embed_dim] @ [flat_sz] → [embed_dim]
     struct ggml_tensor* out = ggml_mul_mat(ctx, lw.attn_output, attn_out);
     out = ggml_reshape_1d(ctx, out, embed_dim);
@@ -485,14 +510,19 @@ struct ggml_tensor* Qwen35moeInference::build_attn_layer(
 }
 
 // ---------------------------------------------------------------------------
-// build_ssm_layer: simplified gated-linear transform (Mamba2 approximation)
+// build_ssm_layer: Gated DeltaNet (simplified approximation)
 //
-//   xz  = attn_qkv   @ normed  →  [2 * inner_size]
-//   x,z = split(xz)            →  [inner_size] each
-//   g   = attn_gate  @ normed  →  [inner_size]
-//   act = silu(x) * silu(z)
-//   act = act * sigmoid(g)
-//   out = ssm_out    @ act     →  [embed_dim]
+// Reference (llama.cpp qwen35moe.cpp):
+//   qkv = attn_qkv @ normed    →  [8192]   (QKV mixed projection)
+//   z   = attn_gate @ normed   →  [4096]   (gate for normalization)
+//   qkv_act = conv1d(qkv) + silu   (conv1d with state, then silu)
+//   q, k, v = split(qkv_act)   →  [2048], [2048], [4096]
+//   output = delta_net(q, k, v, ...)  (recurrent SSM computation)
+//   output = rms_norm(output, ssm_norm) * silu(z)
+//   out = ssm_out @ output      →  [embed_dim]
+//
+// Simplified: without conv1d state and delta net, we approximate by
+// applying silu to the QKV projection and using V directly.
 // ---------------------------------------------------------------------------
 
 struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
@@ -501,27 +531,47 @@ struct ggml_tensor* Qwen35moeInference::build_ssm_layer(
         int                  layer_idx) {
 
     const Qwen35moeLayer& lw = model_->weights.layers[layer_idx];
+    float eps = cfg_->layer_norm_rms_epsilon;
 
-    int embed_dim  = (int)cfg_->embedding_length;
-    int inner_size = (int)cfg_->inner_size;         // 4096
+    int embed_dim   = (int)cfg_->embedding_length;   // 2048
+    int inner_size  = (int)cfg_->inner_size;          // 4096
+    int num_v_heads = (int)cfg_->time_step_rank;      // 32
+    int head_v_dim  = inner_size / num_v_heads;        // 128
 
-    // Input projection → [2 * inner_size]
-    struct ggml_tensor* xz = ggml_mul_mat(ctx, lw.attn_qkv, normed);
+    // QKV mixed projection → [8192]
+    struct ggml_tensor* qkv = ggml_mul_mat(ctx, lw.attn_qkv, normed);
 
-    // Split
-    struct ggml_tensor* x = ggml_view_1d(ctx, xz, inner_size, 0);
-    struct ggml_tensor* z = ggml_view_1d(ctx, xz, inner_size,
+    // Z (gate for normalization) → [4096]
+    struct ggml_tensor* z = ggml_mul_mat(ctx, lw.attn_gate, normed);
+
+    // Apply SiLU activation (approximates conv1d + silu in the full implementation)
+    struct ggml_tensor* qkv_act = ggml_silu(ctx, qkv);
+
+    // Extract V portion: the last inner_size elements
+    // Full split would be: Q[0:2048], K[2048:4096], V[4096:8192]
+    // Without delta net, we use V directly as the approximate output
+    struct ggml_tensor* v = ggml_view_1d(ctx, qkv_act, inner_size,
                                           (size_t)inner_size * SZF32);
 
-    // Gate path
-    struct ggml_tensor* g = ggml_mul_mat(ctx, lw.attn_gate, normed);
+    // Gated normalization: rms_norm(v, ssm_norm) * silu(z)
+    // Reshape for per-head normalization: [head_v_dim, num_v_heads]
+    struct ggml_tensor* v_2d = ggml_reshape_2d(ctx, v, head_v_dim, num_v_heads);
+    struct ggml_tensor* z_2d = ggml_reshape_2d(ctx, z, head_v_dim, num_v_heads);
 
-    // Gated activation: silu(x) * silu(z) * sigmoid(g)
-    struct ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, x), ggml_silu(ctx, z));
-    act = ggml_mul(ctx, act, ggml_sigmoid(ctx, g));
+    // RMS norm on each head_v_dim-sized vector, then scale by ssm_norm weight
+    struct ggml_tensor* v_normed = ggml_rms_norm(ctx, v_2d, eps);
+    if (lw.ssm_norm) {
+        v_normed = mul_dbg(ctx, v_normed, lw.ssm_norm, "ssm: v_normed * ssm_norm");
+    }
+
+    // Gated output: normed_v * silu(z)
+    struct ggml_tensor* output = ggml_mul(ctx, v_normed, ggml_silu(ctx, z_2d));
+
+    // Flatten back to [inner_size]
+    output = ggml_reshape_1d(ctx, output, inner_size);
 
     // Output projection → [embed_dim]
-    struct ggml_tensor* out = ggml_mul_mat(ctx, lw.ssm_out, act);
+    struct ggml_tensor* out = ggml_mul_mat(ctx, lw.ssm_out, output);
     out = ggml_reshape_1d(ctx, out, embed_dim);
 
     return out;
@@ -578,6 +628,14 @@ struct ggml_tensor* Qwen35moeInference::build_moe_ffn(
     struct ggml_tensor* top_k_probs = ggml_top_k(ctx, router_probs, expert_k);
     if (top_k_probs->type != GGML_TYPE_F32) {
         top_k_probs = ggml_cast(ctx, top_k_probs, GGML_TYPE_F32);
+    }
+    // Normalize top-k weights so they sum to 1.0
+    // (softmax was over all 256 experts; after selecting top-8, renormalize)
+    {
+        struct ggml_tensor* wsum = ggml_sum(ctx, top_k_probs); // [1]
+        struct ggml_tensor* wsum_bc = ggml_repeat(ctx, wsum,
+            ggml_new_tensor_1d(ctx, GGML_TYPE_F32, expert_k));
+        top_k_probs = ggml_div(ctx, top_k_probs, wsum_bc);
     }
     // ------------------------------------------------------------------
     // Sparse expert path (batched via mul_mat_id)
