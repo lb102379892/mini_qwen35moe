@@ -88,12 +88,19 @@ public:
                 printf("[EOS]\n");
                 break;
             }
+            // printf("\n[DBG] next_id=%d\n", next_id);
+            // std::string s = tokenizer_.decode({ next_id });   // 你项目里怎么 decode 就怎么调用
+            // printf("[DBG] token_str_len=%zu\n", s.size());
+            // for (size_t i = 0; i < std::min<size_t>(s.size(), 16); ++i) {
+            //     printf("%02X ", (unsigned char)s[i]);
+            // }
+            // printf("\n[DBG] token_str='%s'\n", s.c_str());
 
             generated.push_back(next_id);
 
             // Print decoded piece incrementally
             std::string piece = tokenizer_.decode({next_id});
-            printf("%s", piece.c_str());
+            printf("[DBG_POS] step=%d pos=%d token_in=%d piece=%s\n", step, pos, next_id, piece.c_str());
             fflush(stdout);
 
             logits = inference_.forward(next_id, pos++);
