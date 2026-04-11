@@ -155,31 +155,40 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         fprintf(stderr, "\n");
     }
 
-    // Generation
+    // -------------------------------------------------------
+    // Reset all SSM/KV state for this new conversation turn.
+    // -------------------------------------------------------
+    engine.reset_state();
+
     auto t_start = std::chrono::high_resolution_clock::now();
     int n_generated = 0;
-    bool first_token = true;
 
     printf("\n");
 
+    // -------------------------------------------------------
+    // Step 1: prefill — process the full prompt in one shot.
+    // -------------------------------------------------------
+    auto t_prefill_start = std::chrono::high_resolution_clock::now();
+    std::vector<float> logits = engine.forward(tokens);
+    auto t_prefill_end = std::chrono::high_resolution_clock::now();
+
+    if (logits.empty()) {
+        fprintf(stderr, "[main] ERROR: forward() returned empty logits during prefill\n");
+        return;
+    }
+
+    if (verbose) {
+        double ms = std::chrono::duration<double, std::milli>(
+            t_prefill_end - t_prefill_start).count();
+        fprintf(stderr, "[main] Prefill: %zu tokens in %.1f ms (%.1f ms/tok)\n",
+                tokens.size(), ms, ms / (double)tokens.size());
+    }
+
+    // -------------------------------------------------------
+    // Step 2: decode — one new token per forward call.
+    // -------------------------------------------------------
     while (n_generated < n_predict) {
-        auto t_fwd_start = std::chrono::high_resolution_clock::now();
-        std::vector<float> logits = engine.forward(tokens);
-        auto t_fwd_end = std::chrono::high_resolution_clock::now();
-
-        if (logits.empty()) {
-            fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
-            break;
-        }
-
         int next_token = sample(logits, temperature, top_p, top_k, rng);
-
-        if (verbose && first_token) {
-            double ms = std::chrono::duration<double, std::milli>(t_fwd_end - t_fwd_start).count();
-            fprintf(stderr, "[main] First token forward: %.1f ms (seq_len=%zu)\n",
-                    ms, tokens.size());
-            first_token = false;
-        }
 
         if (tokenizer.is_stop_token(next_token)) {
             if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
@@ -190,7 +199,22 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         printf("%s", piece.c_str());
         fflush(stdout);
 
-        tokens.push_back(next_token);
+        // Forward on the single new token — uses cached SSM/KV state
+        auto t_tok_start = std::chrono::high_resolution_clock::now();
+        logits = engine.forward({next_token});
+        auto t_tok_end = std::chrono::high_resolution_clock::now();
+
+        if (logits.empty()) {
+            fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
+            break;
+        }
+
+        if (verbose && n_generated == 0) {
+            double ms = std::chrono::duration<double, std::milli>(
+                t_tok_end - t_tok_start).count();
+            fprintf(stderr, "[main] First decode token: %.1f ms\n", ms);
+        }
+
         n_generated++;
     }
 
