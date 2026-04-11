@@ -1,5 +1,5 @@
 // pipeline/inference.cpp
-// Qwen3.5 MoE forward pass — CPU, no KV cache
+// Qwen3.5 MoE forward pass — CPU, with SSM state and KV cache persistence.
 //
 // Architecture recap (from GGUF metadata + llama.cpp reference):
 //   40 blocks total
@@ -46,11 +46,12 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 }
 
 // ============================================================
-// InferenceEngine
+// InferenceEngine — constructor / destructor
 // ============================================================
 
-InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads)
-    : model_(model), n_threads_(n_threads) {
+InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads,
+                                 int max_seq_len)
+    : model_(model), n_threads_(n_threads), max_seq_len_(max_seq_len) {
     backend_ = ggml_backend_cpu_init();
     if (!backend_) {
         fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
@@ -59,11 +60,69 @@ InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads)
     ggml_backend_cpu_set_n_threads(backend_, n_threads_);
     galloc_ = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
     fprintf(stderr, "[Inference] CPU backend ready (%d threads)\n", n_threads_);
+    init_state();
 }
 
 InferenceEngine::~InferenceEngine() {
     if (galloc_)  ggml_gallocr_free(galloc_);
     if (backend_) ggml_backend_free(backend_);
+}
+
+// ============================================================
+// State management
+// ============================================================
+
+void InferenceEngine::init_state() {
+    const auto& cfg = model_.config.qwen35moe;
+    const int n_layer      = (int)cfg.block_count;          // 40
+    const int64_t d_inner  = cfg.inner_size;                // 4096
+    const int64_t d_state  = cfg.state_size;                // 128  (head_k_dim)
+    const int64_t n_group  = cfg.group_count;               // 16
+    const int64_t dt_rank  = cfg.time_step_rank;            // 32  (num_v_heads = H)
+    const int64_t head_v   = d_inner / dt_rank;             // 128 (S_v)
+    const int64_t conv_k   = cfg.conv_kernel;               // 4
+    const int64_t qkv_ch   = d_inner + 2 * n_group * d_state; // 8192
+    const int64_t head_dim = cfg.key_length;                // 256
+    const int64_t n_kv_h   = cfg.head_count_kv;            // 2
+
+    // Count layer types
+    int n_ssm = 0, n_attn = 0;
+    for (int il = 0; il < n_layer; il++) {
+        if (is_attn_layer(il)) n_attn++; else n_ssm++;
+    }
+
+    // SSM conv state: [conv_k-1, qkv_ch] per layer
+    ssm_conv_states_.assign(n_ssm,
+        std::vector<float>((conv_k - 1) * qkv_ch, 0.0f));
+
+    // SSM recurrent state: [head_v, head_v, dt_rank] per layer  (= S_v * S_v * H)
+    ssm_recurrent_states_.assign(n_ssm,
+        std::vector<float>(head_v * head_v * dt_rank, 0.0f));
+
+    // KV cache: [head_dim * max_seq_len * n_kv_h] per attention layer
+    kv_caches_.resize(n_attn);
+    for (auto& c : kv_caches_) {
+        c.k.assign(head_dim * max_seq_len_ * n_kv_h, 0.0f);
+        c.v.assign(head_dim * max_seq_len_ * n_kv_h, 0.0f);
+        c.len = 0;
+    }
+
+    // Temporary pointer vectors
+    tmp_ssm_outs_.resize(n_ssm);
+    tmp_kv_outs_.resize(n_attn);
+
+    pos_ = 0;
+}
+
+void InferenceEngine::reset_state() {
+    for (auto& s : ssm_conv_states_)       std::fill(s.begin(), s.end(), 0.0f);
+    for (auto& s : ssm_recurrent_states_)  std::fill(s.begin(), s.end(), 0.0f);
+    for (auto& c : kv_caches_) {
+        std::fill(c.k.begin(), c.k.end(), 0.0f);
+        std::fill(c.v.begin(), c.v.end(), 0.0f);
+        c.len = 0;
+    }
+    pos_ = 0;
 }
 
 // ============================================================
@@ -74,19 +133,36 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
     if (!backend_ || !galloc_) return {};
 
     const auto& cfg = model_.config.qwen35moe;
-    const int n_tokens = (int)tokens.size();
+    const int n_tokens   = (int)tokens.size();
     const int vocab_size = (int)model_.weights.token_embd->ne[1];
+    const int pos        = pos_;  // absolute position of the first token in this batch
+
+    // Safecheck: don't exceed the KV cache capacity
+    if (pos + n_tokens > max_seq_len_) {
+        fprintf(stderr, "[Inference] ERROR: sequence length %d exceeds max_seq_len %d\n",
+                pos + n_tokens, max_seq_len_);
+        return {};
+    }
+
+    // Validate single-token constraint for incremental steps
+    if (pos_ > 0 && n_tokens != 1) {
+        fprintf(stderr, "[Inference] ERROR: incremental mode requires exactly 1 token "
+                "(got %d; call reset_state() before a new prompt)\n", n_tokens);
+        return {};
+    }
+
+    // Clear temporary output-pointer vectors from previous call
+    for (auto& s : tmp_ssm_outs_) { s.gdn_out = nullptr; s.conv_state_out = nullptr; s.n_tokens = 0; }
+    for (auto& k : tmp_kv_outs_)  { k.k_new = nullptr;   k.v_new = nullptr; }
 
     // --------------------------------------------------
     // 1. Create compute context for graph nodes
-    //    (weights live in the reader's ggml_context; we only
-    //     need space for intermediate op descriptors here)
     // --------------------------------------------------
-    const size_t ctx_size = 256 * 1024 * 1024; // 256 MB for node descriptors
+    const size_t ctx_size = 512 * 1024 * 1024; // 512 MB for node descriptors
     struct ggml_init_params init_params = {
         /* .mem_size   = */ ctx_size,
         /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,  // gallocr will allocate actual buffers
+        /* .no_alloc   = */ true,
     };
     struct ggml_context* ctx = ggml_init(init_params);
     if (!ctx) {
@@ -97,14 +173,13 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
     // --------------------------------------------------
     // 2. Build the compute graph
     // --------------------------------------------------
-    const int graph_size = 32768;
+    const int graph_size = 65536;
     struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, graph_size, false);
 
-    // Input tensor: token IDs
-    struct ggml_tensor* inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_name(inp_tokens, "inp_tokens");
+    struct ggml_tensor* inp_tokens_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_tokens_t, "inp_tokens");
 
-    struct ggml_tensor* logits = build_graph(ctx, gf, inp_tokens, n_tokens);
+    struct ggml_tensor* logits = build_graph(ctx, gf, inp_tokens_t, n_tokens, pos);
     if (!logits) {
         fprintf(stderr, "[Inference] ERROR: build_graph failed\n");
         ggml_free(ctx);
@@ -122,45 +197,102 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
     }
 
     // --------------------------------------------------
-    // 4. Set input data: iterate all leaf tensors in the graph
+    // 4. Fill inputs: iterate leaf tensors in the graph
     // --------------------------------------------------
+    const int64_t d_inner  = cfg.inner_size;
+    const int64_t d_state  = cfg.state_size;
+    const int64_t n_group  = cfg.group_count;
+    const int64_t dt_rank  = cfg.time_step_rank;
+    const int64_t head_v   = d_inner / dt_rank;
+    const int64_t qkv_ch   = d_inner + 2 * n_group * d_state;
+    const int64_t conv_k   = cfg.conv_kernel;
+    const int64_t head_dim = cfg.key_length;
+    const int64_t n_kv_h   = cfg.head_count_kv;
+
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         struct ggml_tensor* t = ggml_graph_node(gf, i);
         if (!t || !t->data || t->op != GGML_OP_NONE) continue;
-
         const char* nm = t->name;
         if (!nm) continue;
 
         if (strcmp(nm, "inp_tokens") == 0) {
             memcpy(t->data, tokens.data(), n_tokens * sizeof(int32_t));
+
         } else if (strcmp(nm, "inp_pos") == 0) {
-            // Fill 4 sections for mrope: all use the same token positions
+            // mrope: 4 sections, each containing the absolute token positions
             int32_t* pd = (int32_t*)t->data;
             for (int s = 0; s < 4; s++) {
                 for (int p = 0; p < n_tokens; p++) {
-                    pd[s * n_tokens + p] = p;
+                    pd[s * n_tokens + p] = pos + p;
                 }
             }
         } else if (strcmp(nm, "kq_mask") == 0) {
-            // Causal mask: [n_tokens, n_tokens] F16
-            // mask[k, q] = 0.0 if k <= q, -INF otherwise
+            // For full-prompt (pos==0): standard causal mask [n_tokens, n_tokens]
+            // For single-token (pos>0): all-zero mask [kv_len, 1]
             ggml_fp16_t* md = (ggml_fp16_t*)t->data;
-            for (int q = 0; q < n_tokens; q++) {
-                for (int k = 0; k < n_tokens; k++) {
-                    float val = (k <= q) ? 0.0f : -INFINITY;
-                    md[q * n_tokens + k] = ggml_fp32_to_fp16(val);
+            if (pos == 0) {
+                // Causal: mask[k, q] = 0 if k <= q, else -inf
+                for (int q = 0; q < n_tokens; q++) {
+                    for (int k = 0; k < n_tokens; k++) {
+                        float val = (k <= q) ? 0.0f : -INFINITY;
+                        md[q * n_tokens + k] = ggml_fp32_to_fp16(val);
+                    }
+                }
+            } else {
+                // Single new token can attend to all kv_len = pos+1 positions
+                int kv_len = pos + 1;
+                for (int k = 0; k < kv_len; k++) {
+                    md[k] = ggml_fp32_to_fp16(0.0f);
                 }
             }
-        } else if (strncmp(nm, "ssm_conv_pad", 12) == 0 ||
-                   strncmp(nm, "ssm_state_zero", 14) == 0 ||
-                   strncmp(nm, "gate_zero", 9) == 0) {
-            // Zero-initialize padding and initial states
+        } else if (strncmp(nm, "ssm_conv_pad_", 13) == 0) {
+            // Fill with persistent conv state (zeros on first call)
+            int il = atoi(nm + 13);
+            int si = ssm_state_idx(il);
+            size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
+            memcpy(t->data, ssm_conv_states_[si].data(), sz);
+
+        } else if (strncmp(nm, "ssm_state_in_", 13) == 0) {
+            // Fill with persistent recurrent state (zeros on first call)
+            int il = atoi(nm + 13);
+            int si = ssm_state_idx(il);
+            size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
+            memcpy(t->data, ssm_recurrent_states_[si].data(), sz);
+
+        } else if (strncmp(nm, "gate_zero", 9) == 0) {
             memset(t->data, 0, ggml_nbytes(t));
+
         } else if (strncmp(nm, "beta_ones", 9) == 0) {
-            // Initialize to ones
             float* fd = (float*)t->data;
             int64_t n = ggml_nelements(t);
             for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
+
+        } else if (strncmp(nm, "kv_k_cache_", 11) == 0) {
+            // Fill KV-K cache tensor for incremental attention.
+            // K_cache tensor shape: [head_dim, pos, n_kv_heads, 1]
+            // Buffer layout:        [head_dim, max_seq_len, n_kv_heads]
+            // (h's stride: head_dim * max_seq_len in buffer, head_dim * pos in tensor)
+            int il = atoi(nm + 11);
+            int ai = attn_cache_idx(il);
+            float* dst = (float*)t->data;
+            const float* buf = kv_caches_[ai].k.data();
+            for (int64_t h = 0; h < n_kv_h; h++) {
+                memcpy(dst + h * head_dim * pos,
+                       buf + h * head_dim * max_seq_len_,
+                       (size_t)head_dim * pos * sizeof(float));
+            }
+
+        } else if (strncmp(nm, "kv_v_cache_", 11) == 0) {
+            // Fill KV-V cache tensor for incremental attention.
+            int il = atoi(nm + 11);
+            int ai = attn_cache_idx(il);
+            float* dst = (float*)t->data;
+            const float* buf = kv_caches_[ai].v.data();
+            for (int64_t h = 0; h < n_kv_h; h++) {
+                memcpy(dst + h * head_dim * pos,
+                       buf + h * head_dim * max_seq_len_,
+                       (size_t)head_dim * pos * sizeof(float));
+            }
         }
     }
 
@@ -170,10 +302,77 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
     ggml_backend_graph_compute(backend_, gf);
 
     // --------------------------------------------------
-    // 6. Read logits
+    // 6. Save SSM states back to persistent buffers
+    // --------------------------------------------------
+    {
+        const int64_t sv_h = head_v * dt_rank;  // S_v * H = 128*32 = 4096
+        for (int il = 0; il < (int)cfg.block_count; il++) {
+            if (is_attn_layer(il)) continue;
+            int si = ssm_state_idx(il);
+            auto& sout = tmp_ssm_outs_[si];
+
+            // Conv state: sout.conv_state_out is a cont tensor of shape
+            // [conv_k-1, qkv_ch, 1]
+            if (sout.conv_state_out && sout.conv_state_out->data) {
+                size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
+                memcpy(ssm_conv_states_[si].data(), sout.conv_state_out->data, sz);
+            }
+
+            // Recurrent state: raw bytes from gdn_out starting at
+            // offset n_tokens * sv_h * sizeof(float).
+            // The GDN writes state in the same layout as the input expects:
+            // flat [H, S_v, S_v] i.e. h*S_v*S_v + j*S_v + i.
+            if (sout.gdn_out && sout.gdn_out->data) {
+                const float* src = (const float*)sout.gdn_out->data
+                                   + (size_t)sout.n_tokens * sv_h;
+                size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
+                memcpy(ssm_recurrent_states_[si].data(), src, sz);
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // 7. Save KV cache entries
+    // --------------------------------------------------
+    {
+        for (int il = 0; il < (int)cfg.block_count; il++) {
+            if (!is_attn_layer(il)) continue;
+            int ai = attn_cache_idx(il);
+            auto& kout = tmp_kv_outs_[ai];
+
+            if (kout.k_new && kout.k_new->data) {
+                // k_new shape (contiguous): [head_dim, n_tokens, n_kv_heads, 1]
+                // Buffer layout:            [head_dim, max_seq_len, n_kv_heads]
+                // Stride of h in k_new:     head_dim * n_tokens
+                // Stride of h in buffer:    head_dim * max_seq_len
+                const float* src = (const float*)kout.k_new->data;
+                float* buf = kv_caches_[ai].k.data();
+                for (int64_t h = 0; h < n_kv_h; h++) {
+                    memcpy(buf + h * head_dim * max_seq_len_ + (size_t)pos * head_dim,
+                           src + h * head_dim * n_tokens,
+                           (size_t)head_dim * n_tokens * sizeof(float));
+                }
+            }
+            if (kout.v_new && kout.v_new->data) {
+                const float* src = (const float*)kout.v_new->data;
+                float* buf = kv_caches_[ai].v.data();
+                for (int64_t h = 0; h < n_kv_h; h++) {
+                    memcpy(buf + h * head_dim * max_seq_len_ + (size_t)pos * head_dim,
+                           src + h * head_dim * n_tokens,
+                           (size_t)head_dim * n_tokens * sizeof(float));
+                }
+            }
+            kv_caches_[ai].len = pos + n_tokens;
+        }
+    }
+
+    // Advance position counter
+    pos_ += n_tokens;
+
+    // --------------------------------------------------
+    // 8. Read logits for the last token
     // --------------------------------------------------
     std::vector<float> result(vocab_size);
-    // logits->data has shape [vocab_size, 1] F32 (last-token logits)
     if (logits->data) {
         memcpy(result.data(), logits->data, vocab_size * sizeof(float));
     }
@@ -186,7 +385,8 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
 // build_graph()
 // ============================================================
 ggml_tensor* InferenceEngine::build_graph(ggml_context* ctx, ggml_cgraph* gf,
-                                           ggml_tensor* inp_tokens, int n_tokens) {
+                                           ggml_tensor* inp_tokens, int n_tokens,
+                                           int pos) {
     const auto& cfg = model_.config.qwen35moe;
     const auto& w   = model_.weights;
 
@@ -208,9 +408,16 @@ ggml_tensor* InferenceEngine::build_graph(ggml_context* ctx, ggml_cgraph* gf,
     ggml_set_name(inp_pos, "inp_pos");
 
     // --------------------------------------------------
-    // Causal mask (F16) for flash attention
+    // Causal mask (F16) for flash attention.
+    // Full-prompt (pos==0): [n_tokens, n_tokens] causal mask.
+    // Incremental  (pos>0): [pos+1, 1] all-zero mask.
     // --------------------------------------------------
-    struct ggml_tensor* kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_tokens, n_tokens);
+    struct ggml_tensor* kq_mask;
+    if (pos == 0) {
+        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_tokens, n_tokens);
+    } else {
+        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, pos + n_tokens, n_tokens);
+    }
     ggml_set_name(kq_mask, "kq_mask");
 
     // --------------------------------------------------
@@ -226,9 +433,9 @@ ggml_tensor* InferenceEngine::build_graph(ggml_context* ctx, ggml_cgraph* gf,
         // Sub-layer: attention or SSM
         struct ggml_tensor* attn_out;
         if (is_attn_layer(il)) {
-            attn_out = build_attn_layer(ctx, gf, normed, inp_pos, kq_mask, il, n_tokens);
+            attn_out = build_attn_layer(ctx, gf, normed, inp_pos, kq_mask, il, n_tokens, pos);
         } else {
-            attn_out = build_ssm_layer(ctx, gf, normed, il, n_tokens);
+            attn_out = build_ssm_layer(ctx, gf, normed, il, n_tokens, pos);
         }
         if (!attn_out) return nullptr;
 
@@ -278,7 +485,8 @@ ggml_tensor* InferenceEngine::build_graph(ggml_context* ctx, ggml_cgraph* gf,
 // ============================================================
 ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* gf,
                                                 ggml_tensor* cur, ggml_tensor* inp_pos,
-                                                ggml_tensor* kq_mask, int il, int n_tokens) {
+                                                ggml_tensor* kq_mask, int il,
+                                                int n_tokens, int pos) {
     const auto& cfg = model_.config.qwen35moe;
     const auto& lyr = model_.weights.layers[il];
     const float rms_eps = cfg.layer_norm_rms_epsilon > 0.0f ? cfg.layer_norm_rms_epsilon : 1e-6f;
@@ -287,8 +495,9 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
         fprintf(stderr, "[Inference] layer %d (attn): missing weights\n", il);
         return nullptr;
     }
-
-    const int64_t n_embd      = cfg.embedding_length;       // 2048
+    // Note: gf is passed for API consistency with other sub-builders but is
+    // not needed in this function because all ops are connected via return value.
+    (void)gf;
     const int64_t n_heads     = cfg.head_count;             // 16
     const int64_t n_kv_heads  = cfg.head_count_kv;          // 2
     const int64_t head_dim    = cfg.key_length;             // 256
@@ -354,7 +563,6 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
 
     // --------------------------------------------------
     // RoPE on Q and K (multi-section rope)
-    // rope_type=8 is for MRoPE; use standard RoPE (type=0) for simplicity
     // --------------------------------------------------
     const int rope_type = GGML_ROPE_TYPE_MROPE; // multi-section rotary for Qwen3.5
     Qcur = ggml_rope_multi(ctx, Qcur, inp_pos, nullptr,
@@ -368,18 +576,49 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
                            0.0f, 1.0f, 0.0f, 0.0f);
 
     // flash_attn_ext expects: q [head_dim, n_tokens, n_heads, 1]
-    //                         k [head_dim, n_tokens, n_kv_heads, 1]
-    //                         v [head_dim, n_tokens, n_kv_heads, 1]
+    //                         k [head_dim, kv_len,  n_kv_heads, 1]
+    //                         v [head_dim, kv_len,  n_kv_heads, 1]
     // Our current shape: [head_dim, n_heads/n_kv_heads, n_tokens] (3D)
     // Need to permute: [head_dim, n_tokens, n_heads, 1]
     Qcur = ggml_permute(ctx, Qcur, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads, 1]
     Kcur = ggml_permute(ctx, Kcur, 0, 2, 1, 3); // [head_dim, n_tokens, n_kv_heads, 1]
     Vcur = ggml_cont(ctx, ggml_permute(ctx, Vcur, 0, 2, 1, 3));
 
+    // Make K contiguous and save pointer for KV cache update
+    Kcur = ggml_cont(ctx, Kcur);  // [head_dim, n_tokens, n_kv_heads, 1] contiguous
+
+    // Save new K/V pointers so forward() can copy them into the KV cache
+    int ai = attn_cache_idx(il);
+    tmp_kv_outs_[ai].k_new = Kcur;
+    tmp_kv_outs_[ai].v_new = Vcur;
+
+    // --------------------------------------------------
+    // Incremental KV cache: prepend cached K/V when pos > 0
+    // --------------------------------------------------
+    struct ggml_tensor* K_for_attn = Kcur;
+    struct ggml_tensor* V_for_attn = Vcur;
+
+    if (pos > 0) {
+        // K_cache: leaf tensor [head_dim, pos, n_kv_heads, 1] filled from cache
+        char nm_kc[64]; snprintf(nm_kc, sizeof(nm_kc), "kv_k_cache_%d", il);
+        struct ggml_tensor* K_cache = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                          head_dim, pos, n_kv_heads, 1);
+        ggml_set_name(K_cache, nm_kc);
+
+        char nm_vc[64]; snprintf(nm_vc, sizeof(nm_vc), "kv_v_cache_%d", il);
+        struct ggml_tensor* V_cache = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                          head_dim, pos, n_kv_heads, 1);
+        ggml_set_name(V_cache, nm_vc);
+
+        // Concat along dim 1 (sequence): [head_dim, pos+n_tokens, n_kv_heads, 1]
+        K_for_attn = ggml_concat(ctx, K_cache, Kcur, 1);
+        V_for_attn = ggml_cont(ctx, ggml_concat(ctx, V_cache, Vcur, 1));
+    }
+
     // --------------------------------------------------
     // Flash attention (GQA: K/V broadcast from n_kv_heads to n_heads)
     // --------------------------------------------------
-    struct ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, Qcur, Kcur, Vcur,
+    struct ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, Qcur, K_for_attn, V_for_attn,
                                                         kq_mask, kq_scale, 0.0f, 0.0f);
     // attn_out: [head_dim, n_tokens, n_heads, 1]
 
@@ -406,7 +645,9 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
 // build_ssm_layer() — DeltaNet SSM (layer % 4 != 3)
 // ============================================================
 ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf,
-                                               ggml_tensor* cur, int il, int n_tokens) {
+                                               ggml_tensor* cur, int il,
+                                               int n_tokens, int pos) {
+    (void)pos;  // pos not used directly in SSM; state carries history
     const auto& cfg = model_.config.qwen35moe;
     const auto& lyr = model_.weights.layers[il];
     const float rms_eps = cfg.layer_norm_rms_epsilon > 0.0f ? cfg.layer_norm_rms_epsilon : 1e-6f;
@@ -474,7 +715,7 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     }
 
     // --------------------------------------------------
-    // Conv: zero-pad + apply 1D depthwise conv over the QKV channels
+    // Conv: persistent conv state pad + apply 1D depthwise conv over the QKV channels
     // conv1d.weight: [conv_kernel=4, qkv_channels=8192]
     // --------------------------------------------------
     // Reshape qkv: [qkv_channels, n_tokens] → [qkv_channels, n_tokens, 1]
@@ -484,7 +725,8 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     qkv_3d = ggml_permute(ctx, qkv_3d, 1, 0, 2, 3);
     qkv_3d = ggml_cont_3d(ctx, qkv_3d, n_tokens, qkv_channels, 1);
 
-    // Zero padding: [conv_kernel-1, qkv_channels, 1] = [3, 8192, 1]
+    // Persistent conv state pad: [conv_kernel-1, qkv_channels, 1] = [3, 8192, 1]
+    // Filled from ssm_conv_states_[si] (zeros on first call).
     struct ggml_tensor* conv_pad = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                                                        conv_kernel - 1, qkv_channels, 1);
     {
@@ -492,10 +734,27 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
         snprintf(nm, sizeof(nm), "ssm_conv_pad_%d", il);
         ggml_set_name(conv_pad, nm);
     }
-    // Will be zero-filled after allocation
 
     // Concatenate: [conv_kernel-1+n_tokens, qkv_channels, 1]
     struct ggml_tensor* conv_in = ggml_concat(ctx, conv_pad, qkv_3d, 0);
+
+    // Save the new conv state = last conv_kernel-1 rows of conv_in
+    // (i.e. the last n_tokens portion of qkv_3d shifted in, exactly what the
+    //  next call needs as its conv pad).
+    {
+        // View of shape [conv_kernel-1, qkv_channels, 1] starting at row n_tokens
+        // within conv_in (which has n_tokens rows from qkv_3d at the end).
+        struct ggml_tensor* new_cs = ggml_view_3d(ctx, conv_in,
+            conv_kernel - 1, qkv_channels, 1,
+            conv_in->nb[1],    // stride between qkv_channels rows
+            conv_in->nb[2],    // stride between batch dim
+            (size_t)n_tokens * sizeof(float)); // skip the first n_tokens in dim-0
+        new_cs = ggml_cont(ctx, new_cs);
+        char nm[64]; snprintf(nm, sizeof(nm), "ssm_conv_state_out_%d", il);
+        ggml_set_name(new_cs, nm);
+        ggml_build_forward_expand(gf, new_cs);
+        tmp_ssm_outs_[ssm_state_idx(il)].conv_state_out = new_cs;
+    }
 
     // ggml_ssm_conv expects sx: [d_conv-1+n_t, d_inner, n_s]
     // But conv1d.weight is [conv_kernel, qkv_channels], so d_inner = qkv_channels
@@ -517,14 +776,12 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     //   v_offset = 2*n_group*d_state,  v_size = d_inner = 4096
     // --------------------------------------------------
     const int64_t qk_size = n_group * d_state;  // 2048
-    const int64_t v_size  = d_inner;             // 4096
 
     // We need [head_k_dim, num_heads, n_tokens, 1] shaped tensors
     // q_conv: [d_state=128, n_group=16, n_tokens, 1]
     // k_conv: [d_state=128, n_group=16, n_tokens, 1]
     // v_conv: [head_v_dim=128, dt_rank=32, n_tokens, 1]
 
-    const int64_t row_sz = ggml_element_size(conv_out); // bytes per element
     const int64_t nb1    = ggml_row_size(conv_out->type, qkv_channels);
 
     struct ggml_tensor* q_conv = ggml_view_4d(ctx, conv_out,
@@ -587,13 +844,14 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     }
 
     // --------------------------------------------------
-    // Initial SSM state: zeros [head_v_dim, head_v_dim, dt_rank, 1]
+    // Persistent SSM recurrent state: [head_v_dim, head_v_dim, dt_rank, 1]
+    // Filled from ssm_recurrent_states_[si] (zeros on first call).
     // --------------------------------------------------
     struct ggml_tensor* ssm_state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
                                                         head_v_dim, head_v_dim, dt_rank, 1);
     {
         char nm[64];
-        snprintf(nm, sizeof(nm), "ssm_state_zero_%d", il);
+        snprintf(nm, sizeof(nm), "ssm_state_in_%d", il);
         ggml_set_name(ssm_state, nm);
     }
 
@@ -608,6 +866,15 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     struct ggml_tensor* gdn_out = ggml_gated_delta_net(ctx,
         q_conv, k_conv, v_conv, gate_4d, beta_4d, ssm_state);
     // gdn_out: [head_v_dim*dt_rank=4096, n_tokens + head_v_dim, 1, 1]
+
+    // Save gdn_out pointer so forward() can memcpy the updated recurrent state
+    {
+        int si = ssm_state_idx(il);
+        tmp_ssm_outs_[si].gdn_out   = gdn_out;
+        tmp_ssm_outs_[si].n_tokens  = n_tokens;
+    }
+    // Ensure gdn_out is computed (it's a source for gdn_view below, but let's be explicit)
+    ggml_build_forward_expand(gf, gdn_out);
 
     // Extract output (first n_tokens "columns")
     // Shape: [4096, n_tokens]
