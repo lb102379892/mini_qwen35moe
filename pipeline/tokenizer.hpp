@@ -438,8 +438,10 @@ private:
     // ============================================================
 
     // Pretokenizer regex for Qwen2/3.5 (LLAMA_VOCAB_PRE_TYPE_QWEN2 from llama.cpp)
+    // Note: uses explicit case variants instead of (?i:...) which is not supported
+    // by all regex engines (e.g. POSIX / std::regex ERE).
     static constexpr const char* QWEN35_PRETOKENIZE_PATTERN =
-        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
     int vocab_size_ = 0;
     std::vector<std::string> id_to_token_;
