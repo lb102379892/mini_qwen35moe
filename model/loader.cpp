@@ -52,25 +52,26 @@ void ModelLoader::load_qwen35moe_layer(GGUFReader& reader, Qwen35moeLayer& layer
     layer.attn_output    = reader.get_tensor(prefix + ".attn_output.weight");
 
     // Debug: print all tensors loaded for this layer
-    // printf("[Loader] layer %2d tensors:\n", layer_idx);
-    // auto print_t = [&](const char* name, ggml_tensor* t) {
-    //     if (t) printf("  %-40s ne=[%lld %lld %lld] type=%d\n", name,
-    //                   t->ne[0], t->ne[1], t->ne[2], (int)t->type);
-    //     else   printf("  %-40s NULL\n", name);
-    // };
-    // print_t("attn_norm",            layer.attn_norm);
-    // print_t("attn_q",               layer.attn_q);
-    // print_t("attn_k",               layer.attn_k);
-    // print_t("attn_v",               layer.attn_v);
-    // print_t("attn_output",          layer.attn_output);
-    // print_t("attn_qkv",             layer.attn_qkv);
-    // print_t("attn_gate",            layer.attn_gate);
-    // print_t("ssm_out",              layer.ssm_out);
-    // print_t("ssm_norm",             layer.ssm_norm);
-    // print_t("ssm_a",                layer.ssm_a);
-    // print_t("ssm_conv1d",           layer.ssm_conv1d);
-    // print_t("post_attention_norm",  layer.post_attention_norm);
-    // print_t("ffn_gate_inp",         layer.ffn_gate_inp);
+    printf("[Loader] layer %2d tensors:\n", layer_idx);
+    auto print_t = [&](const char* name, ggml_tensor* t) {
+        if (t) printf("  %-40s ne=[%lld %lld %lld] type=%d | ", name,
+                      t->ne[0], t->ne[1], t->ne[2], (int)t->type);
+        else   printf("  %-40s NULL | ", name);
+    };
+    print_t("attn_norm",            layer.attn_norm);
+    print_t("attn_q",               layer.attn_q);
+    print_t("attn_k",               layer.attn_k);
+    print_t("attn_v",               layer.attn_v);
+    print_t("attn_output",          layer.attn_output);
+    print_t("attn_qkv",             layer.attn_qkv);
+    print_t("attn_gate",            layer.attn_gate);
+    print_t("ssm_out",              layer.ssm_out);
+    print_t("ssm_norm",             layer.ssm_norm);
+    print_t("ssm_a",                layer.ssm_a);
+    print_t("ssm_conv1d",           layer.ssm_conv1d);
+    print_t("post_attention_norm",  layer.post_attention_norm);
+    print_t("ffn_gate_inp",         layer.ffn_gate_inp);
+    printf("\n");
 }
 
 // ============================================================
