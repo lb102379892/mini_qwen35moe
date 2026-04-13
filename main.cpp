@@ -158,40 +158,62 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
     // Generation
     auto t_start = std::chrono::high_resolution_clock::now();
     int n_generated = 0;
-    bool first_token = true;
 
     printf("\n");
 
-    while (n_generated < n_predict) {
-        auto t_fwd_start = std::chrono::high_resolution_clock::now();
-        std::vector<float> logits = engine.forward(tokens);
-        auto t_fwd_end = std::chrono::high_resolution_clock::now();
+    // --- Prefill: reset state and process the full prompt ---
+    engine.reset_state();
+    auto t_prefill_start = std::chrono::high_resolution_clock::now();
+    std::vector<float> logits = engine.forward(tokens);
+    auto t_prefill_end = std::chrono::high_resolution_clock::now();
 
-        if (logits.empty()) {
-            fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
-            break;
-        }
+    if (logits.empty()) {
+        fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
+        printf("\n");
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        fprintf(stderr, "\n[main] Generated %d tokens in %.1f ms (%.1f ms/tok)\n",
+                n_generated, total_ms,
+                n_generated > 0 ? total_ms / n_generated : 0.0);
+        return;
+    }
 
-        int next_token = sample(logits, temperature, top_p, top_k, rng);
+    if (verbose) {
+        double ms = std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+        fprintf(stderr, "[main] Prefill: %.1f ms (seq_len=%zu)\n", ms, tokens.size());
+    }
 
-        if (verbose && first_token) {
-            double ms = std::chrono::duration<double, std::milli>(t_fwd_end - t_fwd_start).count();
-            fprintf(stderr, "[main] First token forward: %.1f ms (seq_len=%zu)\n",
-                    ms, tokens.size());
-            first_token = false;
-        }
+    int next_token = sample(logits, temperature, top_p, top_k, rng);
 
-        if (tokenizer.is_stop_token(next_token)) {
-            if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
-            break;
-        }
-
+    if (tokenizer.is_stop_token(next_token)) {
+        if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
+    } else {
         std::string piece = tokenizer.decode_one(next_token);
         printf("%s", piece.c_str());
         fflush(stdout);
-
-        tokens.push_back(next_token);
         n_generated++;
+
+        // --- Decode loop: pass exactly one new token per step ---
+        while (n_generated < n_predict) {
+            logits = engine.forward({next_token});
+
+            if (logits.empty()) {
+                fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
+                break;
+            }
+
+            next_token = sample(logits, temperature, top_p, top_k, rng);
+
+            if (tokenizer.is_stop_token(next_token)) {
+                if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
+                break;
+            }
+
+            piece = tokenizer.decode_one(next_token);
+            printf("%s", piece.c_str());
+            fflush(stdout);
+            n_generated++;
+        }
     }
 
     printf("\n");
