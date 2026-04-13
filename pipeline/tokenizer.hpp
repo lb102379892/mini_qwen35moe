@@ -123,7 +123,7 @@ public:
         // Greedy scan: find special tokens with longest-match at earliest position,
         // run BPE on non-special segments between them.
         size_t pos = 0;
-        while (pos <= text.size()) {
+        while (pos < text.size()) {
             size_t earliest_pos = std::string::npos;
             int    earliest_id  = -1;
             size_t earliest_len = 0;
@@ -191,7 +191,8 @@ public:
         if (!token_type_.empty() && id < (int)token_type_.size()) {
             int32_t t = token_type_[id];
             if (t == 6) {
-                // Byte token: format is <0xXX> — parse the hex byte value
+                // Byte token: format is <0xXX> (6 chars: '<','0','x',hi,lo,'>')
+                // Parse the two hex digits at positions 3 and 4.
                 const std::string& tok = id_to_token_[id];
                 if (tok.size() == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
                     auto hex_digit = [](char c) -> unsigned char {
@@ -316,10 +317,8 @@ private:
     // ============================================================
     std::vector<std::string> pretokenize(const std::string& text) const {
         if (text.empty()) return {};
-        static const std::string QWEN35_REGEX =
-            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
         // unicode_regex_split with byte_encode=true returns GPT-2 byte-encoded pieces
-        return unicode_regex_split(text, {QWEN35_REGEX}, true);
+        return unicode_regex_split(text, {QWEN35_PRETOKENIZE_PATTERN}, true);
     }
 
     // ============================================================
@@ -437,6 +436,11 @@ private:
     // ============================================================
     // Data members
     // ============================================================
+
+    // Pretokenizer regex for Qwen2/3.5 (LLAMA_VOCAB_PRE_TYPE_QWEN2 from llama.cpp)
+    static constexpr const char* QWEN35_PRETOKENIZE_PATTERN =
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
     int vocab_size_ = 0;
     std::vector<std::string> id_to_token_;
     std::unordered_map<std::string, int> token_to_id_;
