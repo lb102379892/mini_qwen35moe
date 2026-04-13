@@ -114,13 +114,8 @@ void InferenceEngine::init_state() {
     tmp_ssm_outs_.resize(n_ssm);
     tmp_kv_outs_.resize(n_attn);
 
-    // Per-layer MoE routing result buffers (resized on first use per call)
-    const int n_top_k = (int)cfg.expert_used_count;
+    // Per-layer MoE routing result buffers (empty; resized in compute_moe_routing_cpu)
     moe_routes_.resize(n_layer);
-    for (auto& r : moe_routes_) {
-        r.selected.assign(n_top_k, 0);
-        r.weights.assign(n_top_k, 1.0f / n_top_k);
-    }
 
     pos_ = 0;
 }
@@ -560,7 +555,8 @@ void InferenceEngine::compute_moe_routing_cpu(
         // Normalize top-k weights to sum to 1
         float w_sum = 0.0f;
         for (int k = 0; k < n_top_k; k++) w_sum += logits[order[k]];
-        if (w_sum < 1e-9f) w_sum = 1e-9f;
+        constexpr float MIN_WEIGHT_SUM = 1e-9f;
+        if (w_sum < MIN_WEIGHT_SUM) w_sum = MIN_WEIGHT_SUM;
 
         // Store in ggml column-major layout: index = k + t * n_top_k
         for (int k = 0; k < n_top_k; k++) {

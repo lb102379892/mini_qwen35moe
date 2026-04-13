@@ -88,12 +88,13 @@ private:
 
     // ---------------------------------------------------------------
     // Per-layer MoE routing results (computed on CPU, fed as leaf tensors)
-    // Both vectors use ggml column-major layout [n_top_k, n_tokens]:
-    //   index = k + t * n_top_k   (k = expert slot 0..n_top_k-1, t = token)
+    // Both vectors use ggml column-major layout: index = k + t * n_top_k
+    //   (k = expert slot 0..n_top_k-1, t = token 0..n_tokens-1)
+    // Total size per layer: n_top_k * n_tokens  (resized each forward call)
     // ---------------------------------------------------------------
     struct MoERoute {
-        std::vector<int32_t> selected; // expert indices  [n_top_k * n_tokens]
-        std::vector<float>   weights;  // normalized probs [n_top_k * n_tokens]
+        std::vector<int32_t> selected; // expert indices,   size: n_top_k * n_tokens
+        std::vector<float>   weights;  // normalized probs,  size: n_top_k * n_tokens
     };
     std::vector<MoERoute> moe_routes_; // [n_layer]
 
