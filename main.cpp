@@ -19,6 +19,7 @@
 //   ./test_qwen35moe \
 //     --model Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
 //     --prompt "Hello, who are you?" --n-predict 128 --temp 0.7
+//
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -116,7 +117,7 @@ static void print_usage(const char* prog) {
         "  --verbose            Show tokenization and timing info\n"
         "\n"
         "Example:\n"
-        "  %%s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
+        "  %s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
         prog, prog);
 }
 
@@ -219,7 +220,7 @@ int main(int argc, char* argv[]) {
     // ---- Defaults ----
     std::string model_path;
     std::string prompt;
-    std::string system_msg   = "You are a helpful assistant.\n";
+    std::string system_msg   = "You are a helpful assistant.";
     int         n_predict    = 256;
     float       temperature  = 0.8f;
     float       top_p        = 0.95f;
