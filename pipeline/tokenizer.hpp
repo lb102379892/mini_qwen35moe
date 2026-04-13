@@ -76,8 +76,31 @@ public:
         if (it_eot != token_to_id_.end()) eot_id_ = it_eot->second;
         else eot_id_ = eos_id_;
 
-        fprintf(stderr, "[Tokenizer] vocab_size=%d merges=%zu eos=%d im_start=%d im_end=%d\n",
-                vocab_size_, cfg.ggml_merges.size(), eos_id_, im_start_id_, im_end_id_);
+        // Load token types and build special token list
+        if (!cfg.ggml_token_type.empty()) {
+            token_type_.resize(vocab_size_, 1); // default: NORMAL
+            for (int i = 0; i < vocab_size_ && i < (int)cfg.ggml_token_type.size(); i++) {
+                token_type_[i] = cfg.ggml_token_type[i];
+            }
+            // Collect type==3 (CONTROL) and type==4 (USER_DEFINED) as special tokens
+            for (int i = 0; i < vocab_size_; i++) {
+                int32_t t = token_type_[i];
+                if (t == 3 || t == 4) {
+                    special_tokens_sorted_.emplace_back(id_to_token_[i], i);
+                }
+            }
+            // Sort by string length descending for greedy longest-match
+            std::sort(special_tokens_sorted_.begin(), special_tokens_sorted_.end(),
+                [](const std::pair<std::string,int>& a, const std::pair<std::string,int>& b) {
+                    return a.first.size() > b.first.size();
+                });
+        } else {
+            token_type_.assign(vocab_size_, 1);
+        }
+
+        fprintf(stderr, "[Tokenizer] vocab_size=%d merges=%zu eos=%d im_start=%d im_end=%d special=%zu\n",
+                vocab_size_, cfg.ggml_merges.size(), eos_id_, im_start_id_, im_end_id_,
+                special_tokens_sorted_.size());
         return true;
     }
 
@@ -88,81 +111,67 @@ public:
         std::vector<int> result;
         if (add_bos && bos_id_ >= 0) result.push_back(bos_id_);
 
-        // Pre-tokenize: split text into "word pieces"
-        // Each piece is a UTF-8 string encoded as GPT-2 unicode chars
-        auto words = pretokenize(text);
+        if (special_tokens_sorted_.empty()) {
+            // No special tokens: just pretokenize + BPE
+            auto words = pretokenize(text);
+            for (const auto& word : words) {
+                bpe_encode_and_push(word, result);
+            }
+            return result;
+        }
 
-        for (const auto& word : words) {
-            auto tokens = bpe_encode_word(word);
-            for (const auto& tok : tokens) {
-                auto it = token_to_id_.find(tok);
-                if (it != token_to_id_.end()) {
-                    result.push_back(it->second);
-                } else {
-                    // Fallback: encode as individual bytes
-                    for (unsigned char c : tok) {
-                        // Try to find single byte token
-                        std::string byte_tok = byte_to_unicode_str(c);
-                        auto it2 = token_to_id_.find(byte_tok);
-                        if (it2 != token_to_id_.end()) {
-                            result.push_back(it2->second);
-                        }
-                        // else: skip unknown byte (shouldn't happen with full vocab)
-                    }
+        // Greedy scan: find special tokens with longest-match at earliest position,
+        // run BPE on non-special segments between them.
+        size_t pos = 0;
+        while (pos <= text.size()) {
+            size_t earliest_pos = std::string::npos;
+            int    earliest_id  = -1;
+            size_t earliest_len = 0;
+
+            for (const auto& sp : special_tokens_sorted_) {
+                if (sp.first.empty()) continue;
+                size_t p = text.find(sp.first, pos);
+                if (p == std::string::npos) continue;
+                if (earliest_pos == std::string::npos || p < earliest_pos ||
+                    (p == earliest_pos && sp.first.size() > earliest_len)) {
+                    earliest_pos = p;
+                    earliest_id  = sp.second;
+                    earliest_len = sp.first.size();
                 }
             }
+
+            if (earliest_pos == std::string::npos) {
+                // No more special tokens — encode remainder with BPE
+                if (pos < text.size()) {
+                    auto words = pretokenize(text.substr(pos));
+                    for (const auto& word : words) {
+                        bpe_encode_and_push(word, result);
+                    }
+                }
+                break;
+            }
+
+            // Encode non-special prefix with BPE
+            if (earliest_pos > pos) {
+                auto words = pretokenize(text.substr(pos, earliest_pos - pos));
+                for (const auto& word : words) {
+                    bpe_encode_and_push(word, result);
+                }
+            }
+
+            // Emit the special token directly
+            result.push_back(earliest_id);
+            pos = earliest_pos + earliest_len;
         }
         return result;
     }
 
     // ============================================================
     // Encode a pre-formatted chat prompt (already includes special tokens as text)
+    // Delegates to encode() which handles special tokens via dynamic lookup.
     // ============================================================
     std::vector<int> encode_special(const std::string& text) const {
-        // Handle special tokens by splitting on them first
-        std::vector<int> result;
-
-        // Known special tokens to detect
-        static const char* SPECIAL_TOKS[] = {
-            "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>", nullptr
-        };
-
-        std::string remaining = text;
-        while (!remaining.empty()) {
-            // Find the earliest special token
-            size_t earliest_pos = std::string::npos;
-            const char* earliest_tok = nullptr;
-            for (const char** st = SPECIAL_TOKS; *st; ++st) {
-                size_t p = remaining.find(*st);
-                if (p != std::string::npos && (earliest_pos == std::string::npos || p < earliest_pos)) {
-                    earliest_pos = p;
-                    earliest_tok = *st;
-                }
-            }
-
-            if (earliest_pos == std::string::npos) {
-                // No more special tokens
-                auto ids = encode(remaining);
-                result.insert(result.end(), ids.begin(), ids.end());
-                break;
-            }
-
-            // Encode text before the special token
-            if (earliest_pos > 0) {
-                auto ids = encode(remaining.substr(0, earliest_pos));
-                result.insert(result.end(), ids.begin(), ids.end());
-            }
-
-            // Encode the special token itself
-            std::string sp(earliest_tok);
-            auto it = token_to_id_.find(sp);
-            if (it != token_to_id_.end()) {
-                result.push_back(it->second);
-            }
-
-            remaining = remaining.substr(earliest_pos + sp.size());
-        }
-        return result;
+        return encode(text);
     }
 
     // ============================================================
@@ -171,8 +180,7 @@ public:
     std::string decode(const std::vector<int>& ids) const {
         std::string result;
         for (int id : ids) {
-            if (id < 0 || id >= vocab_size_) continue;
-            result += decode_token(id_to_token_[id]);
+            result += decode_one(id);
         }
         return result;
     }
@@ -180,6 +188,28 @@ public:
     // Decode a single token ID to string
     std::string decode_one(int id) const {
         if (id < 0 || id >= vocab_size_) return "";
+        if (!token_type_.empty() && id < (int)token_type_.size()) {
+            int32_t t = token_type_[id];
+            if (t == 6) {
+                // Byte token: format is <0xXX> — parse the hex byte value
+                const std::string& tok = id_to_token_[id];
+                if (tok.size() == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
+                    auto hex_digit = [](char c) -> unsigned char {
+                        if (c >= '0' && c <= '9') return (unsigned char)(c - '0');
+                        if (c >= 'a' && c <= 'f') return (unsigned char)(c - 'a' + 10);
+                        if (c >= 'A' && c <= 'F') return (unsigned char)(c - 'A' + 10);
+                        return 0;
+                    };
+                    unsigned char byte_val = (unsigned char)((hex_digit(tok[3]) << 4) | hex_digit(tok[4]));
+                    return std::string(1, (char)byte_val);
+                }
+                return "";
+            }
+            if (t == 3 || t == 4) {
+                // Control/user-defined special token: return raw string (no GPT-2 decoding)
+                return id_to_token_[id];
+            }
+        }
         return decode_token(id_to_token_[id]);
     }
 
@@ -280,62 +310,39 @@ private:
     }
 
     // ============================================================
-    // Pre-tokenizer: split text into word pieces
-    // GPT-2 style: space is a prefix of the following word (Ġ = U+0120)
-    // We split on whitespace boundaries, keeping the space as prefix.
+    // Pre-tokenizer: split text into word pieces using qwen35 regex rules.
+    // Returns GPT-2 byte-encoded word pieces (ready for BPE).
+    // Regex: LLAMA_VOCAB_PRE_TYPE_QWEN2 from llama.cpp
     // ============================================================
     std::vector<std::string> pretokenize(const std::string& text) const {
-        std::vector<std::string> words;
-        if (text.empty()) return words;
+        if (text.empty()) return {};
+        static const std::string QWEN35_REGEX =
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+        // unicode_regex_split with byte_encode=true returns GPT-2 byte-encoded pieces
+        return unicode_regex_split(text, {QWEN35_REGEX}, true);
+    }
 
-        // Convert each byte to GPT-2 unicode char, then split into words
-        // where each word starts at position 0 or after a non-space unicode char
-        // that followed the space character (Ġ U+0120).
-        //
-        // Simple approach: iterate over UTF-8 codepoints, convert bytes → GPT2 unicode,
-        // split when we encounter the Ġ character (U+0120, the space mapping).
-
-        // First convert raw bytes to GPT-2 unicode string
-        std::string gpt2_text;
-        gpt2_text.reserve(text.size() * 2);
-        for (unsigned char c : text) {
-            gpt2_text += codepoint_to_utf8(byte_to_unicode_[c]);
-        }
-
-        // Now split into words: a new word starts at the beginning OR when we
-        // encounter Ġ (U+0120, encoded as 0xC4 0xA0 in UTF-8).
-        // Each new word starts with Ġ (except the very first word if text doesn't start with space).
-        const std::string SPACE_CP = codepoint_to_utf8(0x0120); // Ġ = U+0120
-
-        std::string current;
-        size_t i = 0;
-        while (i < gpt2_text.size()) {
-            // Read one UTF-8 codepoint
-            unsigned char first = (unsigned char)gpt2_text[i];
-            int len = 1;
-            if (first >= 0xF0) len = 4;
-            else if (first >= 0xE0) len = 3;
-            else if (first >= 0xC0) len = 2;
-
-            std::string cp_str = gpt2_text.substr(i, len);
-            i += len;
-
-            // Check if this codepoint is Ġ (the space)
-            if (cp_str == SPACE_CP) {
-                // Start new word; save current word if non-empty
-                if (!current.empty()) {
-                    words.push_back(current);
-                }
-                current = SPACE_CP; // start new word with space prefix
+    // ============================================================
+    // BPE-encode one GPT-2 byte-encoded word piece and push token IDs to result.
+    // ============================================================
+    void bpe_encode_and_push(const std::string& word, std::vector<int>& result) const {
+        auto tokens = bpe_encode_word(word);
+        for (const auto& tok : tokens) {
+            auto it = token_to_id_.find(tok);
+            if (it != token_to_id_.end()) {
+                result.push_back(it->second);
             } else {
-                current += cp_str;
+                // Fallback: encode as individual bytes
+                for (unsigned char c : tok) {
+                    std::string byte_tok = byte_to_unicode_str(c);
+                    auto it2 = token_to_id_.find(byte_tok);
+                    if (it2 != token_to_id_.end()) {
+                        result.push_back(it2->second);
+                    }
+                    // else: skip unknown byte (shouldn't happen with full vocab)
+                }
             }
         }
-        if (!current.empty()) {
-            words.push_back(current);
-        }
-
-        return words;
     }
 
     // ============================================================
@@ -433,6 +440,11 @@ private:
     int vocab_size_ = 0;
     std::vector<std::string> id_to_token_;
     std::unordered_map<std::string, int> token_to_id_;
+
+    // token_type_[id]: 1=NORMAL, 3=CONTROL, 4=USER_DEFINED, 6=BYTE
+    std::vector<int32_t> token_type_;
+    // Special tokens (type==3 or type==4), sorted by string length descending
+    std::vector<std::pair<std::string,int>> special_tokens_sorted_;
 
     // merge_rank_[{left, right}] = priority index (lower = higher priority)
     struct PairHash {
