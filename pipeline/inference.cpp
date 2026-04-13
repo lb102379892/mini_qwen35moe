@@ -245,12 +245,10 @@ std::vector<float> InferenceEngine::exec_token_embd(
     }
 
     // Fill inp_tokens
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        struct ggml_tensor* t = ggml_graph_node(gf, i);
-        if (t && t->data && t->op == GGML_OP_NONE && t->name &&
-            strcmp(t->name, "inp_tokens") == 0) {
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "inp_tokens");
+        if (t && t->data)
             memcpy(t->data, tokens.data(), (size_t)n_tokens * sizeof(int32_t));
-        }
     }
 
     ggml_backend_graph_compute(backend_, gf);
@@ -332,75 +330,107 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         return {};
     }
 
-    // Fill all leaf tensors
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        struct ggml_tensor* t = ggml_graph_node(gf, i);
-        if (!t || !t->data || t->op != GGML_OP_NONE || !t->name) continue;
-        const char* nm = t->name;
+    // Fill all leaf tensors by direct name lookup (ggml stores leaves in
+    // gf->leafs[], not gf->nodes[]; ggml_graph_get_tensor searches both).
+    char leaf_nm[64];
 
-        if (strcmp(nm, "sub_cur") == 0) {
+    // sub_cur: current residual stream [n_embd, n_tokens]
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "sub_cur");
+        if (t && t->data)
             memcpy(t->data, cur_data.data(), (size_t)n_embd * n_tokens * sizeof(float));
+    }
 
-        } else if (strcmp(nm, "inp_pos") == 0) {
-            int32_t* pd = (int32_t*)t->data;
-            for (int s = 0; s < 4; s++)
-                for (int pp = 0; pp < n_tokens; pp++)
-                    pd[s * n_tokens + pp] = pos + pp;
-
-        } else if (strcmp(nm, "kq_mask") == 0) {
-            ggml_fp16_t* md = (ggml_fp16_t*)t->data;
-            if (pos == 0) {
-                for (int q = 0; q < n_tokens; q++)
-                    for (int k = 0; k < n_tokens; k++) {
-                        float val = (k <= q) ? 0.0f : -INFINITY;
-                        md[q * n_tokens + k] = ggml_fp32_to_fp16(val);
-                    }
-            } else {
-                int kv_len = pos + n_tokens;
-                for (int k = 0; k < kv_len; k++)
-                    md[k] = ggml_fp32_to_fp16(0.0f);
+    if (is_attn_layer(il)) {
+        // inp_pos: position indices [4 * n_tokens] I32
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, "inp_pos");
+            if (t && t->data) {
+                int32_t* pd = (int32_t*)t->data;
+                for (int s = 0; s < 4; s++)
+                    for (int pp = 0; pp < n_tokens; pp++)
+                        pd[s * n_tokens + pp] = pos + pp;
             }
-
-        } else if (strncmp(nm, "ssm_conv_pad_", 13) == 0) {
-            int lil = atoi(nm + 13);
-            int si  = ssm_state_idx(lil);
-            size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
-            memcpy(t->data, ssm_conv_states_[si].data(), sz);
-
-        } else if (strncmp(nm, "ssm_state_in_", 13) == 0) {
-            int lil = atoi(nm + 13);
-            int si  = ssm_state_idx(lil);
-            size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
-            memcpy(t->data, ssm_recurrent_states_[si].data(), sz);
-
-        } else if (strncmp(nm, "gate_zero", 9) == 0) {
-            memset(t->data, 0, ggml_nbytes(t));
-
-        } else if (strncmp(nm, "beta_ones", 9) == 0) {
-            float* fd = (float*)t->data;
-            int64_t n = ggml_nelements(t);
-            for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
-
-        } else if (strncmp(nm, "kv_k_cache_", 11) == 0) {
-            int lil = atoi(nm + 11);
-            int ai  = attn_cache_idx(lil);
-            float* dst       = (float*)t->data;
-            const float* buf = kv_caches_[ai].k.data();
-            for (int64_t h = 0; h < n_kv_h; h++) {
-                memcpy(dst + h * head_dim * pos,
-                       buf + h * head_dim * max_seq_len_,
-                       (size_t)head_dim * pos * sizeof(float));
+        }
+        // kq_mask: causal attention mask FP16
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, "kq_mask");
+            if (t && t->data) {
+                ggml_fp16_t* md = (ggml_fp16_t*)t->data;
+                if (pos == 0) {
+                    for (int q = 0; q < n_tokens; q++)
+                        for (int k = 0; k < n_tokens; k++) {
+                            float val = (k <= q) ? 0.0f : -INFINITY;
+                            md[q * n_tokens + k] = ggml_fp32_to_fp16(val);
+                        }
+                } else {
+                    int kv_len = pos + n_tokens;
+                    for (int k = 0; k < kv_len; k++)
+                        md[k] = ggml_fp32_to_fp16(0.0f);
+                }
             }
+        }
+        // KV cache leaves (only created when pos > 0)
+        if (pos > 0) {
+            int ai = attn_cache_idx(il);
+            snprintf(leaf_nm, sizeof(leaf_nm), "kv_k_cache_%d", il);
+            {
+                struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+                if (t && t->data) {
+                    float* dst       = (float*)t->data;
+                    const float* buf = kv_caches_[ai].k.data();
+                    for (int64_t h = 0; h < n_kv_h; h++)
+                        memcpy(dst + h * head_dim * pos,
+                               buf + h * head_dim * max_seq_len_,
+                               (size_t)head_dim * pos * sizeof(float));
+                }
+            }
+            snprintf(leaf_nm, sizeof(leaf_nm), "kv_v_cache_%d", il);
+            {
+                struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+                if (t && t->data) {
+                    float* dst       = (float*)t->data;
+                    const float* buf = kv_caches_[ai].v.data();
+                    for (int64_t h = 0; h < n_kv_h; h++)
+                        memcpy(dst + h * head_dim * pos,
+                               buf + h * head_dim * max_seq_len_,
+                               (size_t)head_dim * pos * sizeof(float));
+                }
+            }
+        }
+    } else {
+        // SSM layer leaves
+        int si = ssm_state_idx(il);
 
-        } else if (strncmp(nm, "kv_v_cache_", 11) == 0) {
-            int lil = atoi(nm + 11);
-            int ai  = attn_cache_idx(lil);
-            float* dst       = (float*)t->data;
-            const float* buf = kv_caches_[ai].v.data();
-            for (int64_t h = 0; h < n_kv_h; h++) {
-                memcpy(dst + h * head_dim * pos,
-                       buf + h * head_dim * max_seq_len_,
-                       (size_t)head_dim * pos * sizeof(float));
+        snprintf(leaf_nm, sizeof(leaf_nm), "ssm_conv_pad_%d", il);
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+            if (t && t->data) {
+                size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
+                memcpy(t->data, ssm_conv_states_[si].data(), sz);
+            }
+        }
+        snprintf(leaf_nm, sizeof(leaf_nm), "ssm_state_in_%d", il);
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+            if (t && t->data) {
+                size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
+                memcpy(t->data, ssm_recurrent_states_[si].data(), sz);
+            }
+        }
+        // gate_zero / beta_ones: only present when alpha/beta weights are absent
+        snprintf(leaf_nm, sizeof(leaf_nm), "gate_zero_%d", il);
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+            if (t && t->data) memset(t->data, 0, ggml_nbytes(t));
+        }
+        snprintf(leaf_nm, sizeof(leaf_nm), "beta_ones_%d", il);
+        {
+            struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
+            if (t && t->data) {
+                float* fd = (float*)t->data;
+                int64_t n = ggml_nelements(t);
+                for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
             }
         }
     }
@@ -494,12 +524,10 @@ std::vector<float> InferenceEngine::exec_rms_norm(
         return {};
     }
 
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        struct ggml_tensor* t = ggml_graph_node(gf, i);
-        if (t && t->data && t->op == GGML_OP_NONE && t->name &&
-            strcmp(t->name, "rms_inp") == 0) {
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "rms_inp");
+        if (t && t->data)
             memcpy(t->data, cur_data.data(), (size_t)n_embd * n_tokens * sizeof(float));
-        }
     }
 
     ggml_backend_graph_compute(backend_, gf);
@@ -662,23 +690,26 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
         return {};
     }
 
-    // Fill leaf tensors
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        struct ggml_tensor* t = ggml_graph_node(gf, i);
-        if (!t || !t->data || t->op != GGML_OP_NONE || !t->name) continue;
-
-        if (strcmp(t->name, "moe_ffn_in") == 0) {
+    // Fill leaf tensors by direct name lookup
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_ffn_in");
+        if (t && t->data)
             memcpy(t->data, ffn_in_data.data(),
                    (size_t)n_embd * n_tokens * sizeof(float));
-        } else if (strcmp(t->name, "moe_sel") == 0) {
+    }
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_sel");
+        if (t && t->data)
             memcpy(t->data, moe_routes_[il].selected.data(),
                    (size_t)n_top_k * n_tokens * sizeof(int32_t));
-        } else if (strcmp(t->name, "moe_wts") == 0) {
-            // weights layout is [1, n_top_k, n_tokens] stored as [n_top_k * n_tokens]
-            // moe_routes_[il].weights uses the same column-major layout
+    }
+    {
+        // weights layout is [1, n_top_k, n_tokens] stored as [n_top_k * n_tokens]
+        // moe_routes_[il].weights uses the same column-major layout
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_wts");
+        if (t && t->data)
             memcpy(t->data, moe_routes_[il].weights.data(),
                    (size_t)n_top_k * n_tokens * sizeof(float));
-        }
     }
 
     ggml_backend_graph_compute(backend_, gf);
@@ -730,10 +761,9 @@ std::vector<float> InferenceEngine::exec_lm_head(
     }
 
     // Fill last-token embedding
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        struct ggml_tensor* t = ggml_graph_node(gf, i);
-        if (t && t->data && t->op == GGML_OP_NONE && t->name &&
-            strcmp(t->name, "lm_inp") == 0) {
+    {
+        struct ggml_tensor* t = ggml_graph_get_tensor(gf, "lm_inp");
+        if (t && t->data) {
             const float* last = cur.data() + (size_t)(n_tokens - 1) * n_embd;
             memcpy(t->data, last, (size_t)n_embd * sizeof(float));
         }
