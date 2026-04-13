@@ -19,8 +19,7 @@
 //   ./test_qwen35moe \
 //     --model Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
 //     --prompt "Hello, who are you?" --n-predict 128 --temp 0.7
-//
-#include <cstdio>
+//#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -117,7 +116,7 @@ static void print_usage(const char* prog) {
         "  --verbose            Show tokenization and timing info\n"
         "\n"
         "Example:\n"
-        "  %s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
+        "  %%s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
         prog, prog);
 }
 
@@ -129,6 +128,9 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
                      const std::string& prompt_text,
                      int n_predict, float temperature, float top_p, int top_k,
                      bool use_chat, bool verbose, std::mt19937& rng) {
+
+    // Reset engine state before each new prompt
+    engine.reset_state();
 
     // Tokenize
     std::string formatted = prompt_text;
@@ -162,9 +164,12 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 
     printf("\n");
 
+    // First forward pass: process the full prompt
+    std::vector<int32_t> next_input = tokens;
+
     while (n_generated < n_predict) {
         auto t_fwd_start = std::chrono::high_resolution_clock::now();
-        std::vector<float> logits = engine.forward(tokens);
+        std::vector<float> logits = engine.forward(next_input);
         auto t_fwd_end = std::chrono::high_resolution_clock::now();
 
         if (logits.empty()) {
@@ -190,7 +195,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         printf("%s", piece.c_str());
         fflush(stdout);
 
-        tokens.push_back(next_token);
+        // After the first (full-prompt) pass, subsequent passes feed only 1 token
+        next_input = {next_token};
         n_generated++;
     }
 
@@ -206,8 +212,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 }
 
 // ============================================================
-// main()
-// ============================================================
+// main()\n// ============================================================
 
 int main(int argc, char* argv[]) {
     // ---- Defaults ----
