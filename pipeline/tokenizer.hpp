@@ -12,6 +12,7 @@
 #define QWEN35MOE_PIPELINE_TOKENIZER_HPP
 
 #include "core/config.hpp"
+#include "unicode.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -189,7 +190,6 @@ public:
                                   const std::string& system_msg = "You are a helpful assistant.") const {
         std::string prompt;
         if (im_start_id_ >= 0) {
-            prompt += "<|im_start|>system\n" + system_msg + "<|im_end|>\n";
             prompt += "<|im_start|>user\n" + user_msg + "<|im_end|>\n";
             prompt += "<|im_start|>assistant\n";
         } else {
