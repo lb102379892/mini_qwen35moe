@@ -61,13 +61,11 @@ InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads,
         return;
     }
     ggml_backend_cpu_set_n_threads(backend_, n_threads_);
-    galloc_ = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
     fprintf(stderr, "[Inference] CPU backend ready (%d threads)\n", n_threads_);
     init_state();
 }
 
 InferenceEngine::~InferenceEngine() {
-    if (galloc_)  ggml_gallocr_free(galloc_);
     if (backend_) ggml_backend_free(backend_);
 }
 
@@ -136,7 +134,7 @@ void InferenceEngine::reset_state() {
 // ============================================================
 std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) {
     if (tokens.empty()) return {};
-    if (!backend_ || !galloc_) return {};
+    if (!backend_) return {};
 
     const auto& cfg  = model_.config.qwen35moe;
     const int n_tokens   = (int)tokens.size();
@@ -239,7 +237,9 @@ std::vector<float> InferenceEngine::exec_token_embd(
     struct ggml_tensor* out = ggml_get_rows(ctx, model_.weights.token_embd, inp);
     ggml_build_forward_expand(gf, out);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return {};
     }
@@ -259,6 +259,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
     if (out->data)
         memcpy(result.data(), out->data, result.size() * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return result;
 }
@@ -324,7 +325,9 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
     }
     ggml_build_forward_expand(gf, attn_out);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return {};
     }
@@ -404,7 +407,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
 
     ggml_backend_graph_compute(backend_, gf);
 
-    // Read output BEFORE ggml_free (data lives in galloc_ buffer)
+    // Read output BEFORE ggml_free (data lives in galloc buffer)
     std::vector<float> result((size_t)n_embd * n_tokens);
     if (attn_out->data)
         memcpy(result.data(), attn_out->data, result.size() * sizeof(float));
@@ -458,6 +461,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         kout.v_new = nullptr;
     }
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return result;
 }
@@ -483,7 +487,9 @@ std::vector<float> InferenceEngine::exec_rms_norm(
     out = ggml_mul(ctx, out, norm_w);
     ggml_build_forward_expand(gf, out);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return {};
     }
@@ -502,6 +508,7 @@ std::vector<float> InferenceEngine::exec_rms_norm(
     if (out->data)
         memcpy(result.data(), out->data, result.size() * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return result;
 }
@@ -648,7 +655,9 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
 
     ggml_build_forward_expand(gf, moe_out);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return {};
     }
@@ -678,6 +687,7 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
     if (moe_out->data)
         memcpy(result.data(), moe_out->data, result.size() * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return result;
 }
@@ -712,7 +722,9 @@ std::vector<float> InferenceEngine::exec_lm_head(
     struct ggml_tensor* logits = ggml_mul_mat(ctx, w.output, normed);
     ggml_build_forward_expand(gf, logits);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, gf)) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return {};
     }
@@ -733,6 +745,7 @@ std::vector<float> InferenceEngine::exec_lm_head(
     if (logits->data)
         memcpy(result.data(), logits->data, (size_t)vocab_sz * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return result;
 }

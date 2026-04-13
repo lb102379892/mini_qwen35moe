@@ -58,7 +58,6 @@ private:
     int max_seq_len_;
 
     ggml_backend_t   backend_  = nullptr;
-    ggml_gallocr_t   galloc_   = nullptr;
 
     // ---------------------------------------------------------------
     // Persistent incremental-inference state
