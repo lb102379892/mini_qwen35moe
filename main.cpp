@@ -19,7 +19,7 @@
 //   ./test_qwen35moe \
 //     --model Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
 //     --prompt "Hello, who are you?" --n-predict 128 --temp 0.7
-//#include <cstdio>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -129,7 +129,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
                      int n_predict, float temperature, float top_p, int top_k,
                      bool use_chat, bool verbose, std::mt19937& rng) {
 
-    // Reset engine state before each new prompt
+    // Reset engine state before each new prompt (required for REPL multi-turn)
     engine.reset_state();
 
     // Tokenize
@@ -164,7 +164,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 
     printf("\n");
 
-    // First forward pass: process the full prompt
+    // First forward pass feeds the full prompt (prefill).
+    // Subsequent passes feed exactly 1 new token (decode).
     std::vector<int32_t> next_input = tokens;
 
     while (n_generated < n_predict) {
@@ -195,7 +196,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         printf("%s", piece.c_str());
         fflush(stdout);
 
-        // After the first (full-prompt) pass, subsequent passes feed only 1 token
+        // After the first (full-prompt) pass, feed only 1 token at a time
         next_input = {next_token};
         n_generated++;
     }
@@ -218,7 +219,7 @@ int main(int argc, char* argv[]) {
     // ---- Defaults ----
     std::string model_path;
     std::string prompt;
-    std::string system_msg   = "You are a helpful assistant.";
+    std::string system_msg   = "You are a helpful assistant.\n";
     int         n_predict    = 256;
     float       temperature  = 0.8f;
     float       top_p        = 0.95f;
