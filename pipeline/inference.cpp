@@ -267,13 +267,6 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             int64_t n = ggml_nelements(t);
             for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
 
-        } else if (strncmp(nm, "ones_gather_", 12) == 0) {
-            // Filled with 1.0f; used by build_moe_ffn to gather expert probs
-            // via ggml_mul_mat_id instead of ggml_get_rows.
-            float* fd = (float*)t->data;
-            int64_t n = ggml_nelements(t);
-            for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
-
         } else if (strncmp(nm, "kv_k_cache_", 11) == 0) {
             // Fill KV-K cache tensor for incremental attention.
             // K_cache tensor shape: [head_dim, pos, n_kv_heads, 1]
@@ -960,38 +953,28 @@ ggml_tensor* InferenceEngine::build_moe_ffn(ggml_context* ctx, ggml_cgraph* gf,
     // --------------------------------------------------
     // Gather expert probabilities for the selected top-k experts.
     //
-    // The old code used ggml_get_rows(probs_3d, selected) which
-    // triggered GGML_ASSERT(i01 >= 0 && i01 < ne01) at ops.cpp:4694.
-    // Root cause: ggml_get_rows(src, idx) treats ne[1] of src as the row
-    // count.  probs has shape [n_expert=256, n_tokens], so ne[1]=n_tokens
-    // (e.g. 7 for the initial prompt).  The values in `selected` are expert
-    // indices [0, 255], which far exceed n_tokens, causing the OOB crash.
+    // Use ggml_get_rows to gather the scalar probability for each selected
+    // expert per token.  ggml_get_rows(a, b) indexes into a->ne[1] using
+    // values from b, where a->ne[2] (batch dimension in source) must equal
+    // b->ne[1] (batch dimension in indices).
     //
-    // Fix: reshape probs to [1, n_expert, n_tokens] and use ggml_mul_mat_id
-    // with a ones vector [1, 1, n_tokens] to gather the probabilities of the
-    // selected experts.  ggml_mul_mat_id correctly uses `selected` to index
-    // into the n_expert dimension.
+    // probs_3d: [1, n_expert=256, n_tokens]   (ne[0]=1 row-width scalar,
+    //                                          ne[1]=n_expert is the indexed dim,
+    //                                          ne[2]=n_tokens is the batch dim)
+    // selected: [n_top_k=8, n_tokens]          (ne[1]=n_tokens matches a->ne[2])
+    // weights:  [1, n_top_k, n_tokens, 1]      nelements = 1*n_top_k*n_tokens*1 = n_top_k*n_tokens ✓
     //
-    // probs_3d: [1, n_expert, n_tokens]  (treat each expert's scalar prob as
-    //           a 1-element "embedding row")
-    // ones_in:  [1, 1, n_tokens]         (select exactly one row per expert slot)
-    // weights:  [1, n_top_k, n_tokens]   (the gathered probabilities)
+    // Semantics: weights[0, i, j] = probs_3d[0, selected[i, j], j]
+    //          = probs[selected[i, j], j]  — the probability of the i-th
+    //            selected expert for token j.
     // --------------------------------------------------
     struct ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
 
-    // ones_in leaf tensor — filled with 1.0f in forward()'s input-fill loop
-    struct ggml_tensor* ones_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, n_tokens);
-    {
-        char nm[64]; snprintf(nm, sizeof(nm), "ones_gather_%d", il);
-        ggml_set_name(ones_in, nm);
-    }
+    // weights: [1, n_top_k, n_tokens, 1]
+    struct ggml_tensor* weights = ggml_get_rows(ctx, probs_3d, selected);
 
-    // weights: [1, n_top_k, n_tokens]
-    struct ggml_tensor* weights = ggml_mul_mat_id(ctx, probs_3d, ones_in, selected);
-
-    // Normalize expert weights to sum to 1
-    // Ensure contiguous before reshape: ggml_mul_mat_id may return a non-contiguous
-    // or higher-dimensional tensor, causing GGML_ASSERT(nelements == ne0*ne1) to fail.
+    // Normalize expert weights to sum to 1.
+    // ggml_get_rows returns a 4D tensor; ensure contiguous before reshape.
     weights = ggml_cont(ctx, weights);
     struct ggml_tensor* weights_2d = ggml_reshape_2d(ctx, weights, n_top_k, n_tokens);
     // Sum along expert dim
