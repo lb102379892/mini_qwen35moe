@@ -14,7 +14,6 @@
 //   n_expert      = 256, top_k      = 8,   ff_dim = 512
 //   ssm: d_inner=4096, d_state(head_k_dim)=128, n_group=16, dt_rank(num_v_heads)=32,
 //        head_v_dim=128, conv_kernel=4
-//
 #include "pipeline/inference.hpp"
 
 #include <ggml.h>
@@ -263,6 +262,13 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             memset(t->data, 0, ggml_nbytes(t));
 
         } else if (strncmp(nm, "beta_ones", 9) == 0) {
+            float* fd = (float*)t->data;
+            int64_t n = ggml_nelements(t);
+            for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
+
+        } else if (strncmp(nm, "ones_gather_", 12) == 0) {
+            // Filled with 1.0f; used by build_moe_ffn to gather expert probs
+            // via ggml_mul_mat_id instead of ggml_get_rows.
             float* fd = (float*)t->data;
             int64_t n = ggml_nelements(t);
             for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
@@ -562,7 +568,7 @@ ggml_tensor* InferenceEngine::build_attn_layer(ggml_context* ctx, ggml_cgraph* g
     Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_kv_heads, n_tokens);
 
     // --------------------------------------------------
-    // RoPE on Q and K (multi-section rope)
+    // RoPE on Q and K (multi-section rotary for Qwen3.5)
     // --------------------------------------------------
     const int rope_type = GGML_ROPE_TYPE_MROPE; // multi-section rotary for Qwen3.5
     Qcur = ggml_rope_multi(ctx, Qcur, inp_pos, nullptr,
@@ -950,12 +956,37 @@ ggml_tensor* InferenceEngine::build_moe_ffn(ggml_context* ctx, ggml_cgraph* gf,
     struct ggml_tensor* selected = ggml_argsort_top_k(ctx, probs, (int)n_top_k);
     // selected: [n_top_k=8, n_tokens] I32
 
-    // Expand probs to get expert weights for selected experts
-    // probs_3d: [1, n_expert, n_tokens]
+    // --------------------------------------------------
+    // Gather expert probabilities for the selected top-k experts.
+    //
+    // The old code used ggml_get_rows(probs_3d, selected) which
+    // triggered GGML_ASSERT(i01 >= 0 && i01 < ne01) at ops.cpp:4694.
+    // Root cause: ggml_get_rows(src, idx) treats ne[1] of src as the row
+    // count.  probs has shape [n_expert=256, n_tokens], so ne[1]=n_tokens
+    // (e.g. 7 for the initial prompt).  The values in `selected` are expert
+    // indices [0, 255], which far exceed n_tokens, causing the OOB crash.
+    //
+    // Fix: reshape probs to [1, n_expert, n_tokens] and use ggml_mul_mat_id
+    // with a ones vector [1, 1, n_tokens] to gather the probabilities of the
+    // selected experts.  ggml_mul_mat_id correctly uses `selected` to index
+    // into the n_expert dimension.
+    //
+    // probs_3d: [1, n_expert, n_tokens]  (treat each expert's scalar prob as
+    //           a 1-element "embedding row")
+    // ones_in:  [1, 1, n_tokens]         (select exactly one row per expert slot)
+    // weights:  [1, n_top_k, n_tokens]   (the gathered probabilities)
+    // --------------------------------------------------
     struct ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
-    // weights: [1, n_top_k, n_tokens] (probabilities of selected experts)
-    struct ggml_tensor* weights = ggml_get_rows(ctx, probs_3d, selected);
-    // weights: [1, n_top_k=8, n_tokens]
+
+    // ones_in leaf tensor — filled with 1.0f in forward()'s input-fill loop
+    struct ggml_tensor* ones_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, n_tokens);
+    {
+        char nm[64]; snprintf(nm, sizeof(nm), "ones_gather_%d", il);
+        ggml_set_name(ones_in, nm);
+    }
+
+    // weights: [1, n_top_k, n_tokens]
+    struct ggml_tensor* weights = ggml_mul_mat_id(ctx, probs_3d, ones_in, selected);
 
     // Normalize expert weights to sum to 1
     struct ggml_tensor* weights_2d = ggml_reshape_2d(ctx, weights, n_top_k, n_tokens);
