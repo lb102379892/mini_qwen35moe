@@ -162,7 +162,7 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         /* .mem_size   = */ ctx_size,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
-    };
+    }; 
     struct ggml_context* ctx = ggml_init(init_params);
     if (!ctx) {
         fprintf(stderr, "[Inference] ERROR: ggml_init failed\n");
@@ -989,6 +989,9 @@ ggml_tensor* InferenceEngine::build_moe_ffn(ggml_context* ctx, ggml_cgraph* gf,
     struct ggml_tensor* weights = ggml_mul_mat_id(ctx, probs_3d, ones_in, selected);
 
     // Normalize expert weights to sum to 1
+    // Ensure contiguous before reshape: ggml_mul_mat_id may return a non-contiguous
+    // or higher-dimensional tensor, causing GGML_ASSERT(nelements == ne0*ne1) to fail.
+    weights = ggml_cont(ctx, weights);
     struct ggml_tensor* weights_2d = ggml_reshape_2d(ctx, weights, n_top_k, n_tokens);
     // Sum along expert dim
     struct ggml_tensor* w_sum = ggml_sum_rows(ctx, weights_2d); // [1, n_tokens]
