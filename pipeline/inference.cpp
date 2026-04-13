@@ -44,6 +44,37 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
     return x;
 }
 
+// Custom op: diagonal gather of expert probabilities.
+// dst [n_top_k, n_tokens] F32: out[i, t] = probs[selected[i, t], t]
+// a   [n_top_k, n_tokens] F32: placeholder — provides output shape, data unused
+// b   [n_expert, n_tokens] F32: softmax router probabilities
+// c   [n_top_k, n_tokens] I32: selected expert indices
+static void moe_gather_probs(struct ggml_tensor* dst,
+                              const struct ggml_tensor* a,
+                              const struct ggml_tensor* b,
+                              const struct ggml_tensor* c,
+                              int ith, int nth, void* userdata) {
+    (void)a; (void)userdata;
+    const int n_top_k  = (int)dst->ne[0];
+    const int n_tokens = (int)dst->ne[1];
+    const int n_expert = (int)b->ne[0];
+
+    const float*   probs = (const float*)b->data;
+    const int32_t* sel   = (const int32_t*)c->data;
+    float*         out   = (float*)dst->data;
+
+    // ggml tensors are column-major: ne[0] is the innermost/contiguous dim.
+    // probs layout:   probs[e + t * n_expert]  (e = expert index, t = token index)
+    // sel layout:     sel[i + t * n_top_k]     (i = expert slot, t = token index)
+    // out layout:     out[i + t * n_top_k]
+    for (int t = ith; t < n_tokens; t += nth) {
+        for (int i = 0; i < n_top_k; i++) {
+            const int expert_idx = sel[i + t * n_top_k];
+            out[i + t * n_top_k] = probs[expert_idx + (int64_t)t * n_expert];
+        }
+    }
+}
+
 // ============================================================
 // InferenceEngine — constructor / destructor
 // ============================================================
@@ -262,13 +293,6 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             memset(t->data, 0, ggml_nbytes(t));
 
         } else if (strncmp(nm, "beta_ones", 9) == 0) {
-            float* fd = (float*)t->data;
-            int64_t n = ggml_nelements(t);
-            for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
-
-        } else if (strncmp(nm, "ones_gather_", 12) == 0) {
-            // Filled with 1.0f; used by build_moe_ffn to gather expert probs
-            // via ggml_mul_mat_id instead of ggml_get_rows.
             float* fd = (float*)t->data;
             int64_t n = ggml_nelements(t);
             for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
@@ -976,30 +1000,32 @@ ggml_tensor* InferenceEngine::build_moe_ffn(ggml_context* ctx, ggml_cgraph* gf,
     // ones_in:  [1, 1, n_tokens]         (select exactly one row per expert slot)
     // weights:  [1, n_top_k, n_tokens]   (the gathered probabilities)
     // --------------------------------------------------
-    struct ggml_tensor* probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
-
-    // ones_in leaf tensor — filled with 1.0f in forward()'s input-fill loop
-    struct ggml_tensor* ones_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, n_tokens);
+    // --------------------------------------------------
+    // Gather expert probabilities for the selected top-k experts.
+    //
+    // We need weights_2d[i, t] = probs[selected[i, t], t], a diagonal gather
+    // that ggml_get_rows / ggml_mul_mat_id cannot express correctly.
+    // Use ggml_map_custom3 with a dedicated custom op.
+    //
+    // placeholder_w provides the output shape [n_top_k, n_tokens]; its data
+    // is ignored by moe_gather_probs.
+    // --------------------------------------------------
+    struct ggml_tensor* placeholder_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_top_k, n_tokens);
     {
-        char nm[64]; snprintf(nm, sizeof(nm), "ones_gather_%d", il);
-        ggml_set_name(ones_in, nm);
+        char nm[64]; snprintf(nm, sizeof(nm), "moe_placeholder_w_%d", il);
+        ggml_set_name(placeholder_w, nm);
     }
 
-    // weights: [1, n_top_k, n_tokens]
-    struct ggml_tensor* weights = ggml_mul_mat_id(ctx, probs_3d, ones_in, selected);
+    struct ggml_tensor* weights_2d = ggml_map_custom3(ctx,
+        placeholder_w, probs, selected,
+        moe_gather_probs, GGML_N_TASKS_MAX, nullptr);
+    // weights_2d: [n_top_k, n_tokens]
 
-    // Normalize expert weights to sum to 1
-    // Ensure contiguous before reshape: ggml_mul_mat_id may return a non-contiguous
-    // or higher-dimensional tensor, causing GGML_ASSERT(nelements == ne0*ne1) to fail.
-    weights = ggml_cont(ctx, weights);
-    struct ggml_tensor* weights_2d = ggml_reshape_2d(ctx, weights, n_top_k, n_tokens);
-    // Sum along expert dim
+    // Normalize per-token weights to sum to 1
     struct ggml_tensor* w_sum = ggml_sum_rows(ctx, weights_2d); // [1, n_tokens]
-    // Clamp to avoid division by zero
     w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
-    // Normalize
-    weights_2d = ggml_div(ctx, weights_2d, w_sum); // [n_top_k, n_tokens]
-    weights = ggml_reshape_3d(ctx, weights_2d, 1, n_top_k, n_tokens);
+    weights_2d = ggml_div(ctx, weights_2d, w_sum);              // [n_top_k, n_tokens]
+    struct ggml_tensor* weights = ggml_reshape_3d(ctx, weights_2d, 1, n_top_k, n_tokens);
 
     // Ensure weights are computed before MoE ops
     ggml_build_forward_expand(gf, weights);
