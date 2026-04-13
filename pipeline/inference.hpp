@@ -7,6 +7,11 @@
 //     KV cache are carried across calls automatically.
 //   - Call reset_state() before each new conversation / prompt.
 //
+// Architecture: per-layer execution with CPU-side MoE routing.
+// Each transformer layer is executed as separate ggml sub-graphs.
+// MoE expert routing (softmax + top-k + normalize) is computed in pure C++
+// on the CPU; only the FFN compute uses ggml.
+//
 #ifndef QWEN35MOE_PIPELINE_INFERENCE_HPP
 #define QWEN35MOE_PIPELINE_INFERENCE_HPP
 
@@ -82,8 +87,20 @@ private:
     std::vector<KVCache> kv_caches_;
 
     // ---------------------------------------------------------------
-    // Temporary pointers collected during graph building; valid until
-    // the next call to forward().  Used to read state back after compute.
+    // Per-layer MoE routing results (computed on CPU, fed as leaf tensors)
+    // Both vectors use ggml column-major layout [n_top_k, n_tokens]:
+    //   index = k + t * n_top_k   (k = expert slot 0..n_top_k-1, t = token)
+    // ---------------------------------------------------------------
+    struct MoERoute {
+        std::vector<int32_t> selected; // expert indices  [n_top_k * n_tokens]
+        std::vector<float>   weights;  // normalized probs [n_top_k * n_tokens]
+    };
+    std::vector<MoERoute> moe_routes_; // [n_layer]
+
+    // ---------------------------------------------------------------
+    // Temporary pointers set during sub-graph building; valid only
+    // between ggml_gallocr_alloc_graph() and ggml_free() for that sub-ctx.
+    // Must be read before ggml_free() is called.
     // ---------------------------------------------------------------
     struct SSMOutPtrs {
         ggml_tensor* gdn_out        = nullptr;  // full GDN output tensor
@@ -112,15 +129,44 @@ private:
     static int attn_cache_idx(int il) { return il / 4; }
 
     // ---------------------------------------------------------------
-    // Graph builders
+    // CPU-side MoE routing (pure C++, no ggml)
+    // W: ffn_gate_inp->data F32 [n_embd, n_expert] column-major
+    // X: ffn_in F32 [n_embd, n_tokens] column-major
+    // Results written to moe_routes_[il].
+    // ---------------------------------------------------------------
+    void compute_moe_routing_cpu(const float* W, const float* X,
+                                  int il, int n_tokens);
+
+    // ---------------------------------------------------------------
+    // Per-layer execution helpers
+    // Each creates a small ggml context, runs it, returns F32 data.
     // ---------------------------------------------------------------
 
-    // Build the full compute graph; returns the logits tensor.
-    // pos  = absolute position of the first token in this batch.
-    ggml_tensor* build_graph(ggml_context* ctx, ggml_cgraph* gf,
-                              ggml_tensor* inp_tokens, int n_tokens, int pos);
+    // Token embedding lookup: returns [n_embd * n_tokens] F32
+    std::vector<float> exec_token_embd(const std::vector<int32_t>& tokens,
+                                        int n_tokens);
 
-    // Sub-graph builders (pos = absolute position of first token in batch)
+    // attn_norm(cur) + attn-or-SSM sub-layer.
+    // Handles KV cache / SSM state I/O internally.
+    // Returns attn/SSM output [n_embd * n_tokens] F32 (no residual).
+    std::vector<float> exec_attn_or_ssm(const std::vector<float>& cur,
+                                         int il, int n_tokens, int pos);
+
+    // RMS norm + weight multiply: returns [n_embd * n_tokens] F32
+    std::vector<float> exec_rms_norm(const std::vector<float>& cur,
+                                      ggml_tensor* norm_weight, int n_tokens);
+
+    // MoE FFN using CPU-precomputed routing in moe_routes_[il].
+    // Returns [n_embd * n_tokens] F32.
+    std::vector<float> exec_moe_ffn(const std::vector<float>& ffn_in,
+                                     int il, int n_tokens);
+
+    // final_norm(cur[last_token]) + lm_head → logits [vocab_size] F32
+    std::vector<float> exec_lm_head(const std::vector<float>& cur, int n_tokens);
+
+    // ---------------------------------------------------------------
+    // Sub-graph builders (called from exec_attn_or_ssm)
+    // ---------------------------------------------------------------
     ggml_tensor* build_attn_layer(ggml_context* ctx, ggml_cgraph* gf,
                                    ggml_tensor* cur, ggml_tensor* inp_pos,
                                    ggml_tensor* kq_mask, int il,
@@ -129,9 +175,6 @@ private:
     ggml_tensor* build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf,
                                   ggml_tensor* cur, int il,
                                   int n_tokens, int pos);
-
-    ggml_tensor* build_moe_ffn(ggml_context* ctx, ggml_cgraph* gf,
-                                ggml_tensor* cur, int il, int n_tokens);
 };
 
 #endif // QWEN35MOE_PIPELINE_INFERENCE_HPP
