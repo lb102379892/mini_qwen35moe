@@ -441,7 +441,7 @@ private:
     // Note: uses explicit case variants instead of (?i:...) which is not supported
     // by all regex engines (e.g. POSIX / std::regex ERE).
     static constexpr const char* QWEN35_PRETOKENIZE_PATTERN =
-        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     int vocab_size_ = 0;
     std::vector<std::string> id_to_token_;
