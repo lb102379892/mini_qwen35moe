@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(QWEN35MOE_CUDA "Enable CUDA GPU support" OFF)
 
 if(QWEN35MOE_CUDA)
+    enable_language(CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     add_compile_definitions(QWEN35MOE_USE_CUDA)
 endif()
