@@ -8,6 +8,7 @@ built on top of the bundled **ggml** library.
 ```bash
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 # Binary: build/test_qwen35moe
 ```
