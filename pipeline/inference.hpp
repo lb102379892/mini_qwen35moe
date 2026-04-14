@@ -33,7 +33,7 @@ class InferenceEngine {
 public:
     // model must outlive this object
     explicit InferenceEngine(const Qwen35moeModel& model, int n_threads = 4,
-                             int max_seq_len = 2048);
+                             int max_seq_len = 2048, bool use_gpu = false);
     ~InferenceEngine();
 
     // Not copyable
@@ -58,6 +58,7 @@ private:
     int max_seq_len_;
 
     ggml_backend_t   backend_  = nullptr;
+    bool             use_gpu_  = false;
 
     // ---------------------------------------------------------------
     // Persistent incremental-inference state

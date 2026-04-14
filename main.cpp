@@ -136,6 +136,7 @@ static void print_usage(const char* prog) {
         "  --seed           <N>      RNG seed (default: random)\n"
         "  --no-chat                Pass prompt verbatim (no chat template)\n"
         "  --verbose                Show tokenization and timing info\n"
+        "  --gpu                    Use CUDA GPU backend (requires -DQWEN35MOE_CUDA=ON)\n"
         "\n"
         "Example:\n"
         "  %s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
@@ -264,6 +265,7 @@ int main(int argc, char* argv[]) {
     bool        use_chat     = true;
     bool        verbose      = false;
     bool        repl_mode    = false;
+    bool        use_gpu      = false;
     uint64_t    rng_seed     = std::random_device{}(); // random by default
 
     // ---- Parse args ----
@@ -290,6 +292,7 @@ int main(int argc, char* argv[]) {
         else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
+        else if (arg("--gpu"))       use_gpu     = true;
         else if (arg("-h") || arg("--help")) {
             print_usage(argv[0]);
             return 0;
@@ -330,7 +333,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Create inference engine ----
-    InferenceEngine engine(*model, n_threads);
+    InferenceEngine engine(*model, n_threads, 2048, use_gpu);
 
     // ---- Sampling RNG ----
     std::mt19937 rng(rng_seed);

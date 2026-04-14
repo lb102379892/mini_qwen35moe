@@ -23,6 +23,9 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
+#ifdef QWEN35MOE_USE_CUDA
+#include <ggml-cuda.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,15 +56,33 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 // ============================================================
 
 InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads,
-                                 int max_seq_len)
+                                 int max_seq_len, bool use_gpu)
     : model_(model), n_threads_(n_threads), max_seq_len_(max_seq_len) {
-    backend_ = ggml_backend_cpu_init();
-    if (!backend_) {
-        fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
-        return;
+#ifdef QWEN35MOE_USE_CUDA
+    if (use_gpu) {
+        backend_ = ggml_backend_cuda_init(0); // device 0
+        if (!backend_) {
+            fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
+        } else {
+            use_gpu_ = true;
+            fprintf(stderr, "[Inference] CUDA backend ready\n");
+        }
     }
-    ggml_backend_cpu_set_n_threads(backend_, n_threads_);
-    fprintf(stderr, "[Inference] CPU backend ready (%d threads)\n", n_threads_);
+#else
+    if (use_gpu) {
+        fprintf(stderr, "[Inference] WARNING: CUDA not compiled in, using CPU\n");
+    }
+#endif
+    if (!backend_) {
+        backend_ = ggml_backend_cpu_init();
+        if (!backend_) {
+            fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
+            return;
+        }
+        ggml_backend_cpu_set_n_threads(backend_, n_threads_);
+        use_gpu_ = false;
+        fprintf(stderr, "[Inference] CPU backend ready (%d threads)\n", n_threads_);
+    }
     init_state();
 }
 
@@ -237,7 +258,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
     struct ggml_tensor* out = ggml_get_rows(ctx, model_.weights.token_embd, inp);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -247,15 +268,14 @@ std::vector<float> InferenceEngine::exec_token_embd(
     // Fill inp_tokens
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "inp_tokens");
-        if (t && t->data)
-            memcpy(t->data, tokens.data(), (size_t)n_tokens * sizeof(int32_t));
+        if (t)
+            ggml_backend_tensor_set(t, tokens.data(), 0, (size_t)n_tokens * sizeof(int32_t));
     }
 
     ggml_backend_graph_compute(backend_, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
-    if (out->data)
-        memcpy(result.data(), out->data, result.size() * sizeof(float));
+    ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
@@ -323,7 +343,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
     }
     ggml_build_forward_expand(gf, attn_out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -337,36 +357,38 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
     // sub_cur: current residual stream [n_embd, n_tokens]
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "sub_cur");
-        if (t && t->data)
-            memcpy(t->data, cur_data.data(), (size_t)n_embd * n_tokens * sizeof(float));
+        if (t)
+            ggml_backend_tensor_set(t, cur_data.data(), 0, (size_t)n_embd * n_tokens * sizeof(float));
     }
 
     if (is_attn_layer(il)) {
         // inp_pos: position indices [4 * n_tokens] I32
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, "inp_pos");
-            if (t && t->data) {
-                int32_t* pd = (int32_t*)t->data;
+            if (t) {
+                std::vector<int32_t> pos_data(4 * n_tokens);
                 for (int s = 0; s < 4; s++)
                     for (int pp = 0; pp < n_tokens; pp++)
-                        pd[s * n_tokens + pp] = pos + pp;
+                        pos_data[s * n_tokens + pp] = pos + pp;
+                ggml_backend_tensor_set(t, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
             }
         }
         // kq_mask: causal attention mask FP16
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, "kq_mask");
-            if (t && t->data) {
-                ggml_fp16_t* md = (ggml_fp16_t*)t->data;
+            if (t) {
                 if (pos == 0) {
+                    std::vector<ggml_fp16_t> mask_buf(n_tokens * n_tokens);
                     for (int q = 0; q < n_tokens; q++)
                         for (int k = 0; k < n_tokens; k++) {
                             float val = (k <= q) ? 0.0f : -INFINITY;
-                            md[q * n_tokens + k] = ggml_fp32_to_fp16(val);
+                            mask_buf[q * n_tokens + k] = ggml_fp32_to_fp16(val);
                         }
+                    ggml_backend_tensor_set(t, mask_buf.data(), 0, mask_buf.size() * sizeof(ggml_fp16_t));
                 } else {
                     int kv_len = pos + n_tokens;
-                    for (int k = 0; k < kv_len; k++)
-                        md[k] = ggml_fp32_to_fp16(0.0f);
+                    std::vector<ggml_fp16_t> mask_buf(kv_len, ggml_fp32_to_fp16(0.0f));
+                    ggml_backend_tensor_set(t, mask_buf.data(), 0, mask_buf.size() * sizeof(ggml_fp16_t));
                 }
             }
         }
@@ -376,25 +398,27 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
             snprintf(leaf_nm, sizeof(leaf_nm), "kv_k_cache_%d", il);
             {
                 struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-                if (t && t->data) {
-                    float* dst       = (float*)t->data;
+                if (t) {
+                    std::vector<float> staging((size_t)head_dim * pos * n_kv_h);
                     const float* buf = kv_caches_[ai].k.data();
                     for (int64_t h = 0; h < n_kv_h; h++)
-                        memcpy(dst + h * head_dim * pos,
+                        memcpy(staging.data() + h * head_dim * pos,
                                buf + h * head_dim * max_seq_len_,
                                (size_t)head_dim * pos * sizeof(float));
+                    ggml_backend_tensor_set(t, staging.data(), 0, staging.size() * sizeof(float));
                 }
             }
             snprintf(leaf_nm, sizeof(leaf_nm), "kv_v_cache_%d", il);
             {
                 struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-                if (t && t->data) {
-                    float* dst       = (float*)t->data;
+                if (t) {
+                    std::vector<float> staging((size_t)head_dim * pos * n_kv_h);
                     const float* buf = kv_caches_[ai].v.data();
                     for (int64_t h = 0; h < n_kv_h; h++)
-                        memcpy(dst + h * head_dim * pos,
+                        memcpy(staging.data() + h * head_dim * pos,
                                buf + h * head_dim * max_seq_len_,
                                (size_t)head_dim * pos * sizeof(float));
+                    ggml_backend_tensor_set(t, staging.data(), 0, staging.size() * sizeof(float));
                 }
             }
         }
@@ -405,32 +429,35 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         snprintf(leaf_nm, sizeof(leaf_nm), "ssm_conv_pad_%d", il);
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-            if (t && t->data) {
+            if (t) {
                 size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
-                memcpy(t->data, ssm_conv_states_[si].data(), sz);
+                ggml_backend_tensor_set(t, ssm_conv_states_[si].data(), 0, sz);
             }
         }
         snprintf(leaf_nm, sizeof(leaf_nm), "ssm_state_in_%d", il);
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-            if (t && t->data) {
+            if (t) {
                 size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
-                memcpy(t->data, ssm_recurrent_states_[si].data(), sz);
+                ggml_backend_tensor_set(t, ssm_recurrent_states_[si].data(), 0, sz);
             }
         }
         // gate_zero / beta_ones: only present when alpha/beta weights are absent
         snprintf(leaf_nm, sizeof(leaf_nm), "gate_zero_%d", il);
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-            if (t && t->data) memset(t->data, 0, ggml_nbytes(t));
+            if (t) {
+                std::vector<char> zeros(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+            }
         }
         snprintf(leaf_nm, sizeof(leaf_nm), "beta_ones_%d", il);
         {
             struct ggml_tensor* t = ggml_graph_get_tensor(gf, leaf_nm);
-            if (t && t->data) {
-                float* fd = (float*)t->data;
+            if (t) {
                 int64_t n = ggml_nelements(t);
-                for (int64_t j = 0; j < n; j++) fd[j] = 1.0f;
+                std::vector<float> ones(n, 1.0f);
+                ggml_backend_tensor_set(t, ones.data(), 0, n * sizeof(float));
             }
         }
     }
@@ -439,8 +466,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
 
     // Read output BEFORE ggml_free (data lives in galloc buffer)
     std::vector<float> result((size_t)n_embd * n_tokens);
-    if (attn_out->data)
-        memcpy(result.data(), attn_out->data, result.size() * sizeof(float));
+    ggml_backend_tensor_get(attn_out, result.data(), 0, result.size() * sizeof(float));
 
     // Save SSM states back to persistent buffers
     if (!is_attn_layer(il)) {
@@ -448,15 +474,14 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         int si = ssm_state_idx(il);
         auto& sout = tmp_ssm_outs_[si];
 
-        if (sout.conv_state_out && sout.conv_state_out->data) {
+        if (sout.conv_state_out) {
             size_t sz = (size_t)(conv_k - 1) * (size_t)qkv_ch * sizeof(float);
-            memcpy(ssm_conv_states_[si].data(), sout.conv_state_out->data, sz);
+            ggml_backend_tensor_get(sout.conv_state_out, ssm_conv_states_[si].data(), 0, sz);
         }
-        if (sout.gdn_out && sout.gdn_out->data) {
-            const float* src = (const float*)sout.gdn_out->data
-                               + (size_t)sout.n_tokens * sv_h;
+        if (sout.gdn_out) {
+            size_t byte_offset = (size_t)sout.n_tokens * sv_h * sizeof(float);
             size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
-            memcpy(ssm_recurrent_states_[si].data(), src, sz);
+            ggml_backend_tensor_get(sout.gdn_out, ssm_recurrent_states_[si].data(), byte_offset, sz);
         }
         sout.gdn_out        = nullptr;
         sout.conv_state_out = nullptr;
@@ -468,18 +493,22 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         int ai = attn_cache_idx(il);
         auto& kout = tmp_kv_outs_[ai];
 
-        if (kout.k_new && kout.k_new->data) {
-            const float* src = (const float*)kout.k_new->data;
+        if (kout.k_new) {
+            std::vector<float> staging((size_t)head_dim * n_tokens * n_kv_h);
+            ggml_backend_tensor_get(kout.k_new, staging.data(), 0, staging.size() * sizeof(float));
             float* buf = kv_caches_[ai].k.data();
+            const float* src = staging.data();
             for (int64_t h = 0; h < n_kv_h; h++) {
                 memcpy(buf + h * head_dim * max_seq_len_ + (size_t)pos * head_dim,
                        src + h * head_dim * n_tokens,
                        (size_t)head_dim * n_tokens * sizeof(float));
             }
         }
-        if (kout.v_new && kout.v_new->data) {
-            const float* src = (const float*)kout.v_new->data;
+        if (kout.v_new) {
+            std::vector<float> staging((size_t)head_dim * n_tokens * n_kv_h);
+            ggml_backend_tensor_get(kout.v_new, staging.data(), 0, staging.size() * sizeof(float));
             float* buf = kv_caches_[ai].v.data();
+            const float* src = staging.data();
             for (int64_t h = 0; h < n_kv_h; h++) {
                 memcpy(buf + h * head_dim * max_seq_len_ + (size_t)pos * head_dim,
                        src + h * head_dim * n_tokens,
@@ -517,7 +546,7 @@ std::vector<float> InferenceEngine::exec_rms_norm(
     out = ggml_mul(ctx, out, norm_w);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -526,15 +555,14 @@ std::vector<float> InferenceEngine::exec_rms_norm(
 
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "rms_inp");
-        if (t && t->data)
-            memcpy(t->data, cur_data.data(), (size_t)n_embd * n_tokens * sizeof(float));
+        if (t)
+            ggml_backend_tensor_set(t, cur_data.data(), 0, (size_t)n_embd * n_tokens * sizeof(float));
     }
 
     ggml_backend_graph_compute(backend_, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
-    if (out->data)
-        memcpy(result.data(), out->data, result.size() * sizeof(float));
+    ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
@@ -683,7 +711,7 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
 
     ggml_build_forward_expand(gf, moe_out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -693,30 +721,29 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
     // Fill leaf tensors by direct name lookup
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_ffn_in");
-        if (t && t->data)
-            memcpy(t->data, ffn_in_data.data(),
-                   (size_t)n_embd * n_tokens * sizeof(float));
+        if (t)
+            ggml_backend_tensor_set(t, ffn_in_data.data(), 0,
+                                    (size_t)n_embd * n_tokens * sizeof(float));
     }
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_sel");
-        if (t && t->data)
-            memcpy(t->data, moe_routes_[il].selected.data(),
-                   (size_t)n_top_k * n_tokens * sizeof(int32_t));
+        if (t)
+            ggml_backend_tensor_set(t, moe_routes_[il].selected.data(), 0,
+                                    (size_t)n_top_k * n_tokens * sizeof(int32_t));
     }
     {
         // weights layout is [1, n_top_k, n_tokens] stored as [n_top_k * n_tokens]
         // moe_routes_[il].weights uses the same column-major layout
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "moe_wts");
-        if (t && t->data)
-            memcpy(t->data, moe_routes_[il].weights.data(),
-                   (size_t)n_top_k * n_tokens * sizeof(float));
+        if (t)
+            ggml_backend_tensor_set(t, moe_routes_[il].weights.data(), 0,
+                                    (size_t)n_top_k * n_tokens * sizeof(float));
     }
 
     ggml_backend_graph_compute(backend_, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
-    if (moe_out->data)
-        memcpy(result.data(), moe_out->data, result.size() * sizeof(float));
+    ggml_backend_tensor_get(moe_out, result.data(), 0, result.size() * sizeof(float));
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
@@ -753,7 +780,7 @@ std::vector<float> InferenceEngine::exec_lm_head(
     struct ggml_tensor* logits = ggml_mul_mat(ctx, w.output, normed);
     ggml_build_forward_expand(gf, logits);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -763,17 +790,16 @@ std::vector<float> InferenceEngine::exec_lm_head(
     // Fill last-token embedding
     {
         struct ggml_tensor* t = ggml_graph_get_tensor(gf, "lm_inp");
-        if (t && t->data) {
+        if (t) {
             const float* last = cur.data() + (size_t)(n_tokens - 1) * n_embd;
-            memcpy(t->data, last, (size_t)n_embd * sizeof(float));
+            ggml_backend_tensor_set(t, last, 0, (size_t)n_embd * sizeof(float));
         }
     }
 
     ggml_backend_graph_compute(backend_, gf);
 
     std::vector<float> result(vocab_sz);
-    if (logits->data)
-        memcpy(result.data(), logits->data, (size_t)vocab_sz * sizeof(float));
+    ggml_backend_tensor_get(logits, result.data(), 0, (size_t)vocab_sz * sizeof(float));
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
