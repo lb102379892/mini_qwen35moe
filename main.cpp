@@ -4,16 +4,18 @@
 //   ./test_qwen35moe --model <path.gguf> [options]
 //
 // Options:
-//   --model      <path>   GGUF model file (required)
-//   --prompt     <text>   Input prompt (default: interactive REPL)
-//   --system     <text>   System message for chat template
-//   --n-predict  <N>      Max tokens to generate (default: 256)
-//   --temp       <f>      Temperature (default: 0.8; 0 = greedy)
-//   --top-p      <f>      Top-p sampling (default: 0.95)
-//   --top-k      <N>      Top-k sampling (default: 40; 0 = disabled)
-//   --threads    <N>      CPU threads (default: 4)
-//   --no-chat            Disable chat template (pass prompt verbatim)
-//   --verbose            Print tokenization and timing info
+//   --model          <path>   GGUF model file (required)
+//   --prompt         <text>   Input prompt (default: interactive REPL)
+//   --system         <text>   System message for chat template
+//   --n-predict      <N>      Max tokens to generate (default: 256)
+//   --temp           <f>      Temperature (default: 0.8; 0 = greedy)
+//   --top-p          <f>      Top-p sampling (default: 0.95)
+//   --top-k          <N>      Top-k sampling (default: 40; 0 = disabled)
+//   --repeat-penalty <f>      Repetition penalty (default: 1.1; 1.0 = disabled)
+//   --repeat-last-n  <N>      Look-back window for repetition penalty (default: 64)
+//   --threads        <N>      CPU threads (default: 4)
+//   --no-chat                Disable chat template (pass prompt verbatim)
+//   --verbose                Print tokenization and timing info
 //
 // Minimal run example:
 //   ./test_qwen35moe \
@@ -48,15 +50,32 @@ static int sample_greedy(const std::vector<float>& logits) {
     return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 }
 
-// Temperature + top-k + top-p sampling
+// Temperature + top-k + top-p sampling with optional repetition penalty
 static int sample(const std::vector<float>& logits, float temperature,
-                  float top_p, int top_k, std::mt19937& rng) {
-    if (temperature <= 0.0f) return sample_greedy(logits);
-
+                  float top_p, int top_k, std::mt19937& rng,
+                  float repeat_penalty = 1.0f,
+                  const std::vector<int32_t>& recent_tokens = {}) {
     const int n = (int)logits.size();
 
-    // Apply temperature
+    // Apply repetition penalty to logits of recently generated tokens
     std::vector<float> probs(logits.begin(), logits.end());
+    if (repeat_penalty != 1.0f && !recent_tokens.empty()) {
+        for (int tok : recent_tokens) {
+            if (tok >= 0 && tok < n) {
+                if (probs[tok] > 0.0f) {
+                    probs[tok] /= repeat_penalty;
+                } else {
+                    probs[tok] *= repeat_penalty;
+                }
+            }
+        }
+    }
+
+    if (temperature <= 0.0f) {
+        return (int)(std::max_element(probs.begin(), probs.end()) - probs.begin());
+    }
+
+    // Apply temperature
     for (auto& v : probs) v /= temperature;
 
     // Softmax
@@ -104,17 +123,19 @@ static void print_usage(const char* prog) {
         "Usage: %s --model <path.gguf> [options]\n"
         "\n"
         "Options:\n"
-        "  --model      <path>   GGUF model file (required)\n"
-        "  --prompt     <text>   Input prompt (omit for REPL mode)\n"
-        "  --system     <text>   System prompt for chat template\n"
-        "  --n-predict  <N>      Max new tokens to generate (default: 256)\n"
-        "  --temp       <f>      Sampling temperature (default: 0.8; 0=greedy)\n"
-        "  --top-p      <f>      Top-p sampling threshold (default: 0.95)\n"
-        "  --top-k      <N>      Top-k sampling (default: 40; 0=off)\n"
-        "  --threads    <N>      CPU threads (default: 4)\n"
-        "  --seed       <N>      RNG seed (default: random)\n"
-        "  --no-chat            Pass prompt verbatim (no chat template)\n"
-        "  --verbose            Show tokenization and timing info\n"
+        "  --model          <path>   GGUF model file (required)\n"
+        "  --prompt         <text>   Input prompt (omit for REPL mode)\n"
+        "  --system         <text>   System prompt for chat template\n"
+        "  --n-predict      <N>      Max new tokens to generate (default: 256)\n"
+        "  --temp           <f>      Sampling temperature (default: 0.8; 0=greedy)\n"
+        "  --top-p          <f>      Top-p sampling threshold (default: 0.95)\n"
+        "  --top-k          <N>      Top-k sampling (default: 40; 0=off)\n"
+        "  --repeat-penalty <f>      Repetition penalty (default: 1.1; 1.0=off)\n"
+        "  --repeat-last-n  <N>      Look-back window for repetition penalty (default: 64)\n"
+        "  --threads        <N>      CPU threads (default: 4)\n"
+        "  --seed           <N>      RNG seed (default: random)\n"
+        "  --no-chat                Pass prompt verbatim (no chat template)\n"
+        "  --verbose                Show tokenization and timing info\n"
         "\n"
         "Example:\n"
         "  %s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
@@ -128,6 +149,7 @@ static void print_usage(const char* prog) {
 static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
                      const std::string& prompt_text,
                      int n_predict, float temperature, float top_p, int top_k,
+                     float repeat_penalty, int repeat_last_n,
                      bool use_chat, bool verbose, std::mt19937& rng) {
 
     // Reset engine state before each new prompt (required for REPL multi-turn)
@@ -163,6 +185,9 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
     int n_generated = 0;
     bool first_token = true;
 
+    // Sliding window of recently generated tokens for repetition penalty
+    std::vector<int32_t> recent_tokens;
+
     printf("\n");
 
     // First forward pass feeds the full prompt (prefill).
@@ -179,7 +204,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
             break;
         }
 
-        int next_token = sample(logits, temperature, top_p, top_k, rng);
+        int next_token = sample(logits, temperature, top_p, top_k, rng,
+                                repeat_penalty, recent_tokens);
 
         if (verbose && first_token) {
             double ms = std::chrono::duration<double, std::milli>(t_fwd_end - t_fwd_start).count();
@@ -199,6 +225,13 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 
         // After the first (full-prompt) pass, feed only 1 token at a time
         next_input = {next_token};
+
+        // Maintain sliding window for repetition penalty
+        recent_tokens.push_back(next_token);
+        if (repeat_last_n > 0 && (int)recent_tokens.size() > repeat_last_n) {
+            recent_tokens.erase(recent_tokens.begin());
+        }
+
         n_generated++;
     }
 
@@ -225,6 +258,8 @@ int main(int argc, char* argv[]) {
     float       temperature  = 0.8f;
     float       top_p        = 0.95f;
     int         top_k        = 40;
+    float       repeat_penalty = 1.1f;
+    int         repeat_last_n  = 64;
     int         n_threads    = 4;
     bool        use_chat     = true;
     bool        verbose      = false;
@@ -248,8 +283,10 @@ int main(int argc, char* argv[]) {
         else if (arg("--n-predict")) n_predict   = atoi(next("--n-predict"));
         else if (arg("--temp"))      temperature = (float)atof(next("--temp"));
         else if (arg("--top-p"))     top_p       = (float)atof(next("--top-p"));
-        else if (arg("--top-k"))     top_k       = atoi(next("--top-k"));
-        else if (arg("--threads"))   n_threads   = atoi(next("--threads"));
+        else if (arg("--top-k"))          top_k       = atoi(next("--top-k"));
+        else if (arg("--repeat-penalty")) repeat_penalty = (float)atof(next("--repeat-penalty"));
+        else if (arg("--repeat-last-n"))  repeat_last_n  = atoi(next("--repeat-last-n"));
+        else if (arg("--threads"))        n_threads   = atoi(next("--threads"));
         else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
@@ -302,7 +339,7 @@ int main(int argc, char* argv[]) {
     // ---- Single prompt or REPL ----
     if (!repl_mode) {
         generate(engine, tokenizer, prompt, n_predict, temperature, top_p, top_k,
-                 use_chat, verbose, rng);
+                 repeat_penalty, repeat_last_n, use_chat, verbose, rng);
     } else {
         // Interactive REPL
         fprintf(stderr, "[main] Interactive mode. Type your prompt (empty line to quit).\n");
@@ -319,7 +356,7 @@ int main(int argc, char* argv[]) {
             printf("Assistant:");
             fflush(stdout);
             generate(engine, tokenizer, line, n_predict, temperature, top_p, top_k,
-                     use_chat, verbose, rng);
+                     repeat_penalty, repeat_last_n, use_chat, verbose, rng);
         }
     }
 
