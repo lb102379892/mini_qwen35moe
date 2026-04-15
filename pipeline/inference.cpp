@@ -271,6 +271,45 @@ std::vector<float> InferenceEngine::exec_token_embd(
     const std::vector<int32_t>& tokens, int n_tokens)
 {
     const int n_embd = (int)model_.config.qwen35moe.embedding_length;
+    struct ggml_tensor* embd = model_.weights.token_embd;
+    if (!embd) return {};
+
+    // CUDA get_rows currently does not support some quantized source types
+    // (e.g. Q5_K). For GPU mode, fetch quantized embedding rows and
+    // dequantize on CPU.
+    if (use_gpu_) {
+        const ggml_type_traits* traits = ggml_get_type_traits(embd->type);
+        const ggml_to_float_t to_float = traits ? traits->to_float : nullptr;
+
+        const size_t row_bytes_q = ggml_row_size(embd->type, n_embd);
+        const size_t row_bytes_f = (size_t)n_embd * sizeof(float);
+        const int64_t n_vocab = embd->ne[1];
+
+        std::vector<float> result((size_t)n_embd * n_tokens);
+        std::vector<char> qrow(row_bytes_q);
+
+        for (int t = 0; t < n_tokens; ++t) {
+            const int32_t tok = tokens[t];
+            if (tok < 0 || (int64_t) tok >= n_vocab) {
+                fprintf(stderr, "[Inference] ERROR: token id out of range: %d\n", tok);
+                return {};
+            }
+
+            const size_t off = (size_t)tok * row_bytes_q;
+            ggml_backend_tensor_get(embd, qrow.data(), off, row_bytes_q);
+
+            if (embd->type == GGML_TYPE_F32) {
+                std::memcpy(result.data() + (size_t)t * n_embd, qrow.data(), row_bytes_f);
+            } else {
+                if (!to_float) {
+                    fprintf(stderr, "[Inference] ERROR: no to_float for embedding type %d\n", (int)embd->type);
+                    return {};
+                }
+                to_float(qrow.data(), result.data() + (size_t)t * n_embd, n_embd);
+            }
+        }
+        return result;
+    }
 
     struct ggml_init_params p = { 32*1024*1024, nullptr, true };
     struct ggml_context* ctx = ggml_init(p);
@@ -279,7 +318,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
 
     struct ggml_tensor* inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp, "inp_tokens");
-    struct ggml_tensor* out = ggml_get_rows(ctx, model_.weights.token_embd, inp);
+    struct ggml_tensor* out = ggml_get_rows(ctx, embd, inp);
     ggml_build_forward_expand(gf, out);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
