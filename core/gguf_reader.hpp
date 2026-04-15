@@ -29,12 +29,14 @@ public:
         : gctx_(other.gctx_)
         , ctx_(other.ctx_)
         , gpu_buf_(other.gpu_buf_)
+        , uploaded_backend_(other.uploaded_backend_)
         , path_(std::move(other.path_))
         , missing_(std::move(other.missing_))
     {
         other.gctx_ = nullptr;
         other.ctx_  = nullptr;
         other.gpu_buf_ = nullptr;
+        other.uploaded_backend_ = nullptr;
     }
 
     GGUFReader& operator=(GGUFReader&& other) noexcept {
@@ -43,11 +45,13 @@ public:
             gctx_    = other.gctx_;
             ctx_     = other.ctx_;
             gpu_buf_ = other.gpu_buf_;
+            uploaded_backend_ = other.uploaded_backend_;
             path_    = std::move(other.path_);
             missing_ = std::move(other.missing_);
             other.gctx_ = nullptr;
             other.ctx_  = nullptr;
             other.gpu_buf_ = nullptr;
+            other.uploaded_backend_ = nullptr;
         }
         return *this;
     }
@@ -102,6 +106,7 @@ public:
             ggml_backend_buffer_free(gpu_buf_);
             gpu_buf_ = nullptr;
         }
+        uploaded_backend_ = nullptr;
         // 注意释放顺序：
         //   gguf_free 释放 metadata（不影响 ggml_context）
         //   ggml_free 释放 tensor 数据
@@ -121,7 +126,14 @@ public:
     // ============================================================
     bool upload_to_backend(ggml_backend_t backend) {
         if (!ctx_ || !backend) return false;
-        if (gpu_buf_) return true;
+        if (gpu_buf_) {
+            if (uploaded_backend_ != backend) {
+                printf("[GGUFReader] ERROR: tensors already uploaded to backend %p, cannot upload to %p\n",
+                       (void*)uploaded_backend_, (void*)backend);
+                return false;
+            }
+            return true;
+        }
 
         struct TensorCopy {
             ggml_tensor* tensor = nullptr;
@@ -134,7 +146,8 @@ public:
             const size_t nbytes = ggml_nbytes(t);
             if (nbytes == 0) continue;
             if (!t->data) {
-                printf("[GGUFReader] ERROR: tensor '%s' has no data before backend upload\n", t->name);
+                printf("[GGUFReader] ERROR: tensor '%s' has null data pointer "
+                       "(possible uninitialized or corrupted tensor)\n", t->name);
                 return false;
             }
 
@@ -155,6 +168,7 @@ public:
         for (const auto& item : staging) {
             ggml_backend_tensor_set(item.tensor, item.bytes.data(), 0, item.bytes.size());
         }
+        uploaded_backend_ = backend;
         return true;
     }
 
@@ -221,6 +235,7 @@ private:
     struct gguf_context* gctx_ = nullptr;  // GGUF metadata (keys, tensor info)
     struct ggml_context* ctx_  = nullptr;  // GGML tensor data (weights in memory)
     ggml_backend_buffer_t gpu_buf_ = nullptr;
+    ggml_backend_t uploaded_backend_ = nullptr;
     std::string path_;
     std::vector<std::string> missing_;     // require_tensor 失败时记录
 };

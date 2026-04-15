@@ -64,7 +64,7 @@ InferenceEngine::InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader
         if (!backend_) {
             fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
         } else if (!reader_) {
-            fprintf(stderr, "[Inference] WARNING: GGUFReader unavailable for GPU weight upload, falling back to CPU\n");
+            fprintf(stderr, "[Inference] WARNING: GGUFReader not provided for GPU weight upload, falling back to CPU\n");
             ggml_backend_free(backend_);
             backend_ = nullptr;
         } else if (!reader_->upload_to_backend(backend_)) {
@@ -233,7 +233,7 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         std::vector<float> gate_w_cpu;
 
         if (use_gpu_) {
-            if (ggml_nbytes(lyr.ffn_gate_inp) < gate_bytes) {
+            if (ggml_nbytes(lyr.ffn_gate_inp) != gate_bytes) {
                 fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp size mismatch\n", il);
                 return {};
             }
