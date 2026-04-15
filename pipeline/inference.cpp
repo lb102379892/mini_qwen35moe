@@ -55,17 +55,25 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 // InferenceEngine — constructor / destructor
 // ============================================================
 
-InferenceEngine::InferenceEngine(const Qwen35moeModel& model, int n_threads,
-                                 int max_seq_len, bool use_gpu)
-    : model_(model), n_threads_(n_threads), max_seq_len_(max_seq_len) {
+InferenceEngine::InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader,
+                                 int n_threads, int max_seq_len, bool use_gpu)
+    : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len) {
 #ifdef QWEN35MOE_USE_CUDA
     if (use_gpu) {
         backend_ = ggml_backend_cuda_init(0); // device 0
         if (!backend_) {
             fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
+        } else if (!reader_) {
+            fprintf(stderr, "[Inference] WARNING: GGUFReader unavailable for GPU weight upload, falling back to CPU\n");
+            ggml_backend_free(backend_);
+            backend_ = nullptr;
+        } else if (!reader_->upload_to_backend(backend_)) {
+            fprintf(stderr, "[Inference] WARNING: failed to upload model tensors to CUDA backend, falling back to CPU\n");
+            ggml_backend_free(backend_);
+            backend_ = nullptr;
         } else {
             use_gpu_ = true;
-            fprintf(stderr, "[Inference] CUDA backend ready\n");
+            fprintf(stderr, "[Inference] CUDA backend ready (weights uploaded)\n");
         }
     }
 #else
@@ -218,9 +226,25 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp\n", il);
             return {};
         }
-        compute_moe_routing_cpu(
-            (const float*)lyr.ffn_gate_inp->data,
-            ffn_in.data(), il, n_tokens);
+        const int n_expert = (int)cfg.expert_count;
+        const size_t gate_elem = (size_t)n_embd * n_expert;
+        const size_t gate_bytes = gate_elem * sizeof(float);
+        const float* gate_w = nullptr;
+        std::vector<float> gate_w_cpu;
+
+        if (use_gpu_) {
+            if (ggml_nbytes(lyr.ffn_gate_inp) < gate_bytes) {
+                fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp size mismatch\n", il);
+                return {};
+            }
+            gate_w_cpu.resize(gate_elem);
+            ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_w_cpu.data(), 0, gate_bytes);
+            gate_w = gate_w_cpu.data();
+        } else {
+            gate_w = (const float*)lyr.ffn_gate_inp->data;
+        }
+
+        compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
 
         // 2e. MoE FFN sub-graph (selected + weights are pre-filled leaf tensors)
         std::vector<float> moe_out = exec_moe_ffn(ffn_in, il, n_tokens);

@@ -15,6 +15,7 @@
 #ifndef QWEN35MOE_PIPELINE_INFERENCE_HPP
 #define QWEN35MOE_PIPELINE_INFERENCE_HPP
 
+#include "core/gguf_reader.hpp"
 #include "model/model.hpp"
 #include <vector>
 #include <cstdint>
@@ -32,8 +33,8 @@ typedef struct ggml_backend * ggml_backend_t;
 class InferenceEngine {
 public:
     // model must outlive this object
-    explicit InferenceEngine(const Qwen35moeModel& model, int n_threads = 4,
-                             int max_seq_len = 2048, bool use_gpu = false);
+    explicit InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader = nullptr,
+                             int n_threads = 4, int max_seq_len = 2048, bool use_gpu = false);
     ~InferenceEngine();
 
     // Not copyable
@@ -54,6 +55,7 @@ public:
 
 private:
     const Qwen35moeModel& model_;
+    GGUFReader* reader_ = nullptr;
     int n_threads_;
     int max_seq_len_;
 

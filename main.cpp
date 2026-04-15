@@ -333,7 +333,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Create inference engine ----
-    InferenceEngine engine(*model, n_threads, 2048, use_gpu);
+    InferenceEngine engine(*model, recognizer.reader(), n_threads, 2048, use_gpu);
 
     // ---- Sampling RNG ----
     std::mt19937 rng(rng_seed);

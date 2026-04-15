@@ -3,11 +3,13 @@
 #define FUNASR_CORE_GGUF_READER_HPP
 
 #include <ggml.h>
+#include <ggml-backend.h>
 #include <gguf.h>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <utility>
+#include <cstring>
 
 
 class GGUFReader {
@@ -26,11 +28,13 @@ public:
     GGUFReader(GGUFReader&& other) noexcept
         : gctx_(other.gctx_)
         , ctx_(other.ctx_)
+        , gpu_buf_(other.gpu_buf_)
         , path_(std::move(other.path_))
         , missing_(std::move(other.missing_))
     {
         other.gctx_ = nullptr;
         other.ctx_  = nullptr;
+        other.gpu_buf_ = nullptr;
     }
 
     GGUFReader& operator=(GGUFReader&& other) noexcept {
@@ -38,10 +42,12 @@ public:
             close();
             gctx_    = other.gctx_;
             ctx_     = other.ctx_;
+            gpu_buf_ = other.gpu_buf_;
             path_    = std::move(other.path_);
             missing_ = std::move(other.missing_);
             other.gctx_ = nullptr;
             other.ctx_  = nullptr;
+            other.gpu_buf_ = nullptr;
         }
         return *this;
     }
@@ -92,6 +98,10 @@ public:
     // 调用后所有 tensor 指针失效
     // ============================================================
     void close() {
+        if (gpu_buf_) {
+            ggml_backend_buffer_free(gpu_buf_);
+            gpu_buf_ = nullptr;
+        }
         // 注意释放顺序：
         //   gguf_free 释放 metadata（不影响 ggml_context）
         //   ggml_free 释放 tensor 数据
@@ -104,6 +114,48 @@ public:
             ctx_ = nullptr;
         }
         missing_.clear();
+    }
+
+    // ============================================================
+    // 将当前 context 中的 tensor 数据上传到指定 backend（如 CUDA）
+    // ============================================================
+    bool upload_to_backend(ggml_backend_t backend) {
+        if (!ctx_ || !backend) return false;
+        if (gpu_buf_) return true;
+
+        struct TensorCopy {
+            ggml_tensor* tensor = nullptr;
+            std::vector<uint8_t> bytes;
+        };
+        std::vector<TensorCopy> staging;
+        staging.reserve((size_t)tensor_count());
+
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
+            const size_t nbytes = ggml_nbytes(t);
+            if (nbytes == 0) continue;
+            if (!t->data) {
+                printf("[GGUFReader] ERROR: tensor '%s' has no data before backend upload\n", t->name);
+                return false;
+            }
+
+            TensorCopy copy;
+            copy.tensor = t;
+            copy.bytes.resize(nbytes);
+            std::memcpy(copy.bytes.data(), t->data, nbytes);
+            staging.emplace_back(std::move(copy));
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        gpu_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
+        if (!gpu_buf_) {
+            printf("[GGUFReader] ERROR: failed to allocate backend tensor buffer\n");
+            return false;
+        }
+
+        for (const auto& item : staging) {
+            ggml_backend_tensor_set(item.tensor, item.bytes.data(), 0, item.bytes.size());
+        }
+        return true;
     }
 
     // ============================================================
@@ -168,6 +220,7 @@ public:
 private:
     struct gguf_context* gctx_ = nullptr;  // GGUF metadata (keys, tensor info)
     struct ggml_context* ctx_  = nullptr;  // GGML tensor data (weights in memory)
+    ggml_backend_buffer_t gpu_buf_ = nullptr;
     std::string path_;
     std::vector<std::string> missing_;     // require_tensor 失败时记录
 };
