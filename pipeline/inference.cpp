@@ -283,14 +283,14 @@ std::vector<float> InferenceEngine::exec_token_embd(
 
         const size_t row_bytes_q = ggml_row_size(embd->type, n_embd);
         const size_t row_bytes_f = (size_t)n_embd * sizeof(float);
+        const int64_t n_vocab = embd->ne[1];
 
         std::vector<float> result((size_t)n_embd * n_tokens);
         std::vector<char> qrow(row_bytes_q);
-        std::vector<float> frow(n_embd);
 
         for (int t = 0; t < n_tokens; ++t) {
             const int32_t tok = tokens[t];
-            if (tok < 0 || tok >= embd->ne[1]) {
+            if (tok < 0 || (int64_t) tok >= n_vocab) {
                 fprintf(stderr, "[Inference] ERROR: token id out of range: %d\n", tok);
                 return {};
             }
@@ -305,8 +305,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
                     fprintf(stderr, "[Inference] ERROR: no to_float for embedding type %d\n", (int)embd->type);
                     return {};
                 }
-                to_float(qrow.data(), frow.data(), n_embd);
-                std::memcpy(result.data() + (size_t)t * n_embd, frow.data(), row_bytes_f);
+                to_float(qrow.data(), result.data() + (size_t)t * n_embd, n_embd);
             }
         }
         return result;
