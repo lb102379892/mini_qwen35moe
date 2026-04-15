@@ -314,7 +314,7 @@ int main(int argc, char* argv[]) {
     // ---- Load model ----
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
     Recognizer recognizer;
-    if (!recognizer.init(model_path, verbose)) {
+    if (!recognizer.init(model_path, verbose, use_gpu)) {
         fprintf(stderr, "[main] ERROR: failed to load model: %s\n",
                 recognizer.last_error().c_str());
         return 1;
@@ -333,7 +333,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Create inference engine ----
-    InferenceEngine engine(*model, recognizer.reader(), n_threads, 2048, use_gpu);
+    InferenceEngine engine(*model, use_gpu ? recognizer.reader() : nullptr, n_threads, 2048, use_gpu);
 
     // ---- Sampling RNG ----
     std::mt19937 rng(rng_seed);
