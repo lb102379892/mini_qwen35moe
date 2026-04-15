@@ -45,6 +45,8 @@ public:
     const ModelConfig&         config()     const { return model_->config; }
     // Expose the full model for inference engine
     const Qwen35moeModel*      model()      const { return model_.get(); }
+    GGUFReader*                reader()            { return reader_.get(); }
+    const GGUFReader*          reader()      const { return reader_.get(); }
 
 private:
     std::unique_ptr<GGUFReader>      reader_;
