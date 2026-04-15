@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 
 class GGUFReader {
@@ -172,7 +173,7 @@ public:
         }
 
         bool ok = true;
-        std::vector<uint8_t> staging(64u * 1024u * 1024u);
+        std::vector<uint8_t> staging(kUploadStagingBytes);
         const size_t data_offset = gguf_get_data_offset(gctx_);
         const int n_tensors = gguf_get_n_tensors(gctx_);
 
@@ -191,7 +192,8 @@ public:
             const size_t tensor_offset = gguf_get_tensor_offset(gctx_, i);
             const size_t file_offset = data_offset + tensor_offset;
 
-            if (std::fseek(f, static_cast<long>(file_offset), SEEK_SET) != 0) {
+            if (file_offset > static_cast<size_t>(std::numeric_limits<off_t>::max()) ||
+                fseeko(f, static_cast<off_t>(file_offset), SEEK_SET) != 0) {
                 printf("[GGUFReader] ERROR: seek failed for tensor '%s'\n", name);
                 ok = false;
                 break;
@@ -202,7 +204,11 @@ public:
                 const size_t chunk = std::min(staging.size(), nbytes - done);
                 const size_t got = std::fread(staging.data(), 1, chunk, f);
                 if (got != chunk) {
-                    printf("[GGUFReader] ERROR: short read while uploading tensor '%s'\n", name);
+                    if (std::ferror(f)) {
+                        printf("[GGUFReader] ERROR: read error while uploading tensor '%s'\n", name);
+                    } else {
+                        printf("[GGUFReader] ERROR: unexpected EOF while uploading tensor '%s'\n", name);
+                    }
                     ok = false;
                     break;
                 }
@@ -283,6 +289,7 @@ public:
     }
 
 private:
+    static constexpr size_t kUploadStagingBytes = 64u * 1024u * 1024u;
     struct gguf_context* gctx_ = nullptr;  // GGUF metadata (keys, tensor info)
     struct ggml_context* ctx_  = nullptr;  // GGML tensor data (weights in memory)
     ggml_backend_buffer_t gpu_buf_ = nullptr;
