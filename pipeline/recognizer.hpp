@@ -20,11 +20,13 @@ public:
     Recognizer& operator=(const Recognizer&) = delete;
 
     // Load model from GGUF file
-    bool init(const std::string& model_path, bool verbose = true) {
+    bool init(const std::string& model_path, bool verbose = true, bool gpu_mode = false) {
         if (verbose) printf("[Recognizer] Loading model: %s\n", model_path.c_str());
 
         reader_ = std::make_unique<GGUFReader>();
-        if (!reader_->open(model_path)) {
+        const bool ok = gpu_mode ? reader_->open_no_alloc(model_path)
+                                 : reader_->open(model_path);
+        if (!ok) {
             last_error_ = "Failed to open model file";
             return false;
         }

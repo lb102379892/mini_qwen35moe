@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <utility>
 #include <cstring>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 
 
 class GGUFReader {
@@ -58,9 +61,29 @@ public:
 
     // ============================================================
     // 打开 GGUF 文件
-    // 分配内存，读取所有 tensor 数据到 ggml_context
+    // 分配内存并读取 tensor 数据到 ggml_context（默认 no_alloc=false）
     // ============================================================
     bool open(const std::string& path) {
+        return open_impl(path, /* no_alloc = */ false);
+    }
+
+    // ============================================================
+    // 打开 GGUF 文件（no_alloc=true）
+    // 仅加载 metadata + tensor 信息，不在 CPU 分配权重数据
+    // ============================================================
+    bool open_no_alloc(const std::string& path) {
+        return open_impl(path, /* no_alloc = */ true);
+    }
+
+    // ============================================================
+    // 打开 GGUF 文件（可选 no_alloc）
+    // ============================================================
+    bool open(const std::string& path, bool no_alloc) {
+        return open_impl(path, no_alloc);
+    }
+
+private:
+    bool open_impl(const std::string& path, bool no_alloc) {
         // 如果已经打开了别的文件，先关闭
         if (gctx_) {
             close();
@@ -69,10 +92,9 @@ public:
         path_ = path;
         missing_.clear();
 
-        // no_alloc = false: 立即分配内存并读取 tensor 数据
         // ctx 传递二级指针，gguf_init_from_file 会填充它
         struct gguf_init_params params = {
-            /*.no_alloc =*/ false,
+            /*.no_alloc =*/ no_alloc,
             /*.ctx      =*/ &ctx_,
         };
 
@@ -90,13 +112,14 @@ public:
             return false;
         }
 
-        printf("[GGUFReader] Opened '%s'\n", path.c_str());
+        printf("[GGUFReader] Opened '%s' (no_alloc=%s)\n", path.c_str(), no_alloc ? "true" : "false");
         printf("  Tensors: %d\n", tensor_count());
         printf("  KV pairs: %d\n", kv_count());
 
         return true;
     }
 
+public:
     // ============================================================
     // 关闭文件，释放所有资源
     // 调用后所有 tensor 指针失效
@@ -125,7 +148,7 @@ public:
     // 将当前 context 中的 tensor 数据上传到指定 backend（如 CUDA）
     // ============================================================
     bool upload_to_backend(ggml_backend_t backend) {
-        if (!ctx_ || !backend) return false;
+        if (!ctx_ || !gctx_ || !backend) return false;
         if (gpu_buf_) {
             if (uploaded_backend_ != backend) {
                 printf("[GGUFReader] ERROR: tensors already uploaded to backend %p, cannot upload to %p\n",
@@ -135,39 +158,73 @@ public:
             return true;
         }
 
-        struct TensorCopy {
-            ggml_tensor* tensor = nullptr;
-            std::vector<uint8_t> bytes;
-        };
-        std::vector<TensorCopy> staging;
-        staging.reserve((size_t)tensor_count());
-
-        for (ggml_tensor* t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
-            const size_t nbytes = ggml_nbytes(t);
-            if (nbytes == 0) continue;
-            if (!t->data) {
-                printf("[GGUFReader] ERROR: tensor '%s' has null data pointer "
-                       "(possible uninitialized or corrupted tensor)\n", t->name);
-                return false;
-            }
-
-            TensorCopy copy;
-            copy.tensor = t;
-            copy.bytes.resize(nbytes);
-            std::memcpy(copy.bytes.data(), t->data, nbytes);
-            staging.emplace_back(std::move(copy));
-        }
-
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-        gpu_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
+        gpu_buf_ = ggml_backend_alloc_ctx_tensors(ctx_, backend);
         if (!gpu_buf_) {
             printf("[GGUFReader] ERROR: failed to allocate backend tensor buffer\n");
             return false;
         }
 
-        for (const auto& item : staging) {
-            ggml_backend_tensor_set(item.tensor, item.bytes.data(), 0, item.bytes.size());
+        FILE* f = std::fopen(path_.c_str(), "rb");
+        if (!f) {
+            printf("[GGUFReader] ERROR: failed to reopen '%s' for tensor upload\n", path_.c_str());
+            ggml_backend_buffer_free(gpu_buf_);
+            gpu_buf_ = nullptr;
+            return false;
         }
+
+        bool ok = true;
+        std::vector<uint8_t> staging(kUploadStagingBytes);
+        const size_t data_offset = gguf_get_data_offset(gctx_);
+        const int n_tensors = gguf_get_n_tensors(gctx_);
+
+        for (int i = 0; i < n_tensors && ok; ++i) {
+            const char* name = gguf_get_tensor_name(gctx_, i);
+            ggml_tensor* t = ggml_get_tensor(ctx_, name);
+            if (!t) {
+                continue;
+            }
+
+            const size_t nbytes = ggml_nbytes(t);
+            if (nbytes == 0) {
+                continue;
+            }
+
+            const size_t tensor_offset = gguf_get_tensor_offset(gctx_, i);
+            const size_t file_offset = data_offset + tensor_offset;
+
+            if (file_offset > static_cast<size_t>(std::numeric_limits<off_t>::max()) ||
+                fseeko(f, static_cast<off_t>(file_offset), SEEK_SET) != 0) {
+                printf("[GGUFReader] ERROR: seek failed for tensor '%s'\n", name);
+                ok = false;
+                break;
+            }
+
+            size_t done = 0;
+            while (done < nbytes) {
+                const size_t chunk = std::min(staging.size(), nbytes - done);
+                const size_t got = std::fread(staging.data(), 1, chunk, f);
+                if (got != chunk) {
+                    if (std::ferror(f)) {
+                        printf("[GGUFReader] ERROR: read error while uploading tensor '%s'\n", name);
+                    } else {
+                        printf("[GGUFReader] ERROR: unexpected EOF while uploading tensor '%s'\n", name);
+                    }
+                    ok = false;
+                    break;
+                }
+                ggml_backend_tensor_set(t, staging.data(), done, chunk);
+                done += chunk;
+            }
+        }
+
+        std::fclose(f);
+        if (!ok) {
+            ggml_backend_buffer_free(gpu_buf_);
+            gpu_buf_ = nullptr;
+            uploaded_backend_ = nullptr;
+            return false;
+        }
+
         uploaded_backend_ = backend;
         return true;
     }
@@ -232,6 +289,7 @@ public:
     }
 
 private:
+    static constexpr size_t kUploadStagingBytes = 64u * 1024u * 1024u;
     struct gguf_context* gctx_ = nullptr;  // GGUF metadata (keys, tensor info)
     struct ggml_context* ctx_  = nullptr;  // GGML tensor data (weights in memory)
     ggml_backend_buffer_t gpu_buf_ = nullptr;
