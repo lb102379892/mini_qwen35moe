@@ -69,7 +69,9 @@ private:
     ggml_backend_t   backend_gpu_  = nullptr;
     ggml_backend_t   backend_cpu_  = nullptr;
     ggml_backend_buffer_t gpu_weights_buf_ = nullptr;
+    ggml_backend_buffer_t cpu_weights_buf_ = nullptr;
     ggml_context* gpu_weights_ctx_ = nullptr;
+    ggml_context* cpu_weights_ctx_ = nullptr;
     bool             use_gpu_  = false;
     GpuMode          gpu_mode_ = GpuMode::Off;
 
@@ -136,8 +138,7 @@ private:
 
     // Allocate / zero all persistent state buffers from model config.
     void init_state();
-    bool upload_non_expert_weights_to_gpu();
-    bool upload_all_weights_to_gpu();
+    bool load_weights_to_backends();
 
     // Map layer index → SSM state slot (0-based among SSM layers).
     static int ssm_state_idx(int il) { return il - il / 4; }
