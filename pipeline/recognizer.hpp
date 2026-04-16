@@ -7,6 +7,7 @@
 #include "core/gguf_reader.hpp"
 #include "model/model.hpp"
 #include "model/loader.hpp"
+#include "pipeline/inference.hpp"
 #include <memory>
 #include <string>
 
@@ -20,10 +21,12 @@ public:
     Recognizer& operator=(const Recognizer&) = delete;
 
     // Load model from GGUF file
-    bool init(const std::string& model_path, bool verbose = true, bool gpu_mode = false) {
+    bool init(const std::string& model_path, bool verbose = true, GpuMode gpu_mode = GpuMode::Off) {
         if (verbose) printf("[Recognizer] Loading model: %s\n", model_path.c_str());
-        if (verbose && gpu_mode) {
+        if (verbose && gpu_mode == GpuMode::Hybrid) {
             printf("[Recognizer] GPU mode: loading CPU weights for hybrid CPU-GPU offload\n");
+        } else if (verbose && gpu_mode == GpuMode::Full) {
+            printf("[Recognizer] GPU mode: loading CPU weights for full GPU offload\n");
         }
 
         reader_ = std::make_unique<GGUFReader>();

@@ -30,11 +30,18 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
+enum class GpuMode {
+    Off,
+    Hybrid,
+    Full,
+};
+
 class InferenceEngine {
 public:
     // model must outlive this object
     explicit InferenceEngine(Qwen35moeModel& model, GGUFReader* reader = nullptr,
-                             int n_threads = 4, int max_seq_len = 2048, bool use_gpu = false);
+                             int n_threads = 4, int max_seq_len = 2048,
+                             GpuMode gpu_mode = GpuMode::Off);
     ~InferenceEngine();
 
     // Not copyable
@@ -64,6 +71,7 @@ private:
     ggml_backend_buffer_t gpu_weights_buf_ = nullptr;
     ggml_context* gpu_weights_ctx_ = nullptr;
     bool             use_gpu_  = false;
+    GpuMode          gpu_mode_ = GpuMode::Off;
 
     // ---------------------------------------------------------------
     // Persistent incremental-inference state
@@ -102,6 +110,7 @@ private:
         std::vector<float>   weights;  // normalized probs,  size: n_top_k * n_tokens
     };
     std::vector<MoERoute> moe_routes_; // [n_layer]
+    std::vector<std::vector<float>> moe_gate_inp_cpu_cache_; // [n_layer], only used in full GPU mode
 
     // ---------------------------------------------------------------
     // Temporary pointers set during sub-graph building; valid only
@@ -128,6 +137,7 @@ private:
     // Allocate / zero all persistent state buffers from model config.
     void init_state();
     bool upload_non_expert_weights_to_gpu();
+    bool upload_all_weights_to_gpu();
 
     // Map layer index → SSM state slot (0-based among SSM layers).
     static int ssm_state_idx(int il) { return il - il / 4; }

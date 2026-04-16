@@ -16,6 +16,8 @@
 //   --threads        <N>      CPU threads (default: 4)
 //   --no-chat                Disable chat template (pass prompt verbatim)
 //   --verbose                Print tokenization and timing info
+//   --gpu-mode      <mode>   GPU mode: off|hybrid|full (default: off)
+//   --gpu                    Alias for --gpu-mode hybrid
 //
 // Minimal run example:
 //   ./test_qwen35moe \
@@ -136,7 +138,8 @@ static void print_usage(const char* prog) {
         "  --seed           <N>      RNG seed (default: random)\n"
         "  --no-chat                Pass prompt verbatim (no chat template)\n"
         "  --verbose                Show tokenization and timing info\n"
-        "  --gpu                    Use CUDA GPU backend (requires -DQWEN35MOE_CUDA=ON)\n"
+        "  --gpu-mode      <mode>   GPU mode: off|hybrid|full (default: off)\n"
+        "  --gpu                    Alias for --gpu-mode hybrid\n"
         "\n"
         "Example:\n"
         "  %s --model model.gguf --prompt \"Hello!\" --n-predict 128 --temp 0.7\n",
@@ -265,7 +268,7 @@ int main(int argc, char* argv[]) {
     bool        use_chat     = true;
     bool        verbose      = false;
     bool        repl_mode    = false;
-    bool        use_gpu      = false;
+    GpuMode     gpu_mode     = GpuMode::Off;
     uint64_t    rng_seed     = std::random_device{}(); // random by default
 
     // ---- Parse args ----
@@ -292,7 +295,20 @@ int main(int argc, char* argv[]) {
         else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
-        else if (arg("--gpu"))       use_gpu     = true;
+        else if (arg("--gpu"))       gpu_mode    = GpuMode::Hybrid;
+        else if (arg("--gpu-mode")) {
+            const char* mode = next("--gpu-mode");
+            if (strcmp(mode, "off") == 0) {
+                gpu_mode = GpuMode::Off;
+            } else if (strcmp(mode, "hybrid") == 0) {
+                gpu_mode = GpuMode::Hybrid;
+            } else if (strcmp(mode, "full") == 0) {
+                gpu_mode = GpuMode::Full;
+            } else {
+                fprintf(stderr, "ERROR: invalid --gpu-mode '%s' (expected off|hybrid|full)\n", mode);
+                return 1;
+            }
+        }
         else if (arg("-h") || arg("--help")) {
             print_usage(argv[0]);
             return 0;
@@ -314,7 +330,7 @@ int main(int argc, char* argv[]) {
     // ---- Load model ----
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
     Recognizer recognizer;
-    if (!recognizer.init(model_path, verbose, use_gpu)) {
+    if (!recognizer.init(model_path, verbose, gpu_mode)) {
         fprintf(stderr, "[main] ERROR: failed to load model: %s\n",
                 recognizer.last_error().c_str());
         return 1;
@@ -333,7 +349,8 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Create inference engine ----
-    InferenceEngine engine(*model, use_gpu ? recognizer.reader() : nullptr, n_threads, 2048, use_gpu);
+    InferenceEngine engine(*model, gpu_mode != GpuMode::Off ? recognizer.reader() : nullptr,
+                           n_threads, 2048, gpu_mode);
 
     // ---- Sampling RNG ----
     std::mt19937 rng(rng_seed);
