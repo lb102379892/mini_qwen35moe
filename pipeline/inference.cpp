@@ -55,7 +55,7 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 // InferenceEngine — constructor / destructor
 // ============================================================
 
-InferenceEngine::InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader,
+InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader,
                                  int n_threads, int max_seq_len, bool use_gpu)
     : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len) {
     backend_cpu_ = ggml_backend_cpu_init();
@@ -64,18 +64,16 @@ InferenceEngine::InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader
         return;
     }
     ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
-    backend_gpu_ = backend_cpu_;
-
 #ifdef QWEN35MOE_USE_CUDA
     if (use_gpu) {
-        ggml_backend_t cuda_backend = ggml_backend_cuda_init(0); // device 0
-        if (!cuda_backend) {
+        ggml_backend_t temp_cuda_backend = ggml_backend_cuda_init(0); // device 0
+        if (!temp_cuda_backend) {
             fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
         } else {
-            backend_gpu_ = cuda_backend;
+            backend_gpu_ = temp_cuda_backend;
             if (!upload_non_expert_weights_to_gpu()) {
                 fprintf(stderr, "[Inference] WARNING: failed to upload non-expert tensors to CUDA backend, falling back to CPU\n");
-                ggml_backend_free(cuda_backend);
+                ggml_backend_free(temp_cuda_backend);
                 backend_gpu_ = backend_cpu_;
             } else {
                 use_gpu_ = true;
@@ -123,13 +121,13 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
     };
     std::vector<UploadItem> items;
 
-    auto add_item = [&](ggml_tensor*& t, const char* name) {
+    auto add_item = [&items](ggml_tensor*& t, const char* name) {
         if (t) {
             items.push_back(UploadItem{&t, name});
         }
     };
 
-    auto& weights = const_cast<Qwen35moeWeights&>(model_.weights);
+    auto& weights = model_.weights;
     add_item(weights.token_embd, "token_embd");
     add_item(weights.output, "output");
     add_item(weights.output_norm, "output_norm");
@@ -156,7 +154,9 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
         add_item(lyr.ssm_out, "ssm_out");
     }
 
-    ggml_init_params p = { 32 * 1024 * 1024, nullptr, true };
+    // Metadata-only context for non-expert tensor descriptors before backend alloc.
+    static constexpr size_t kGpuWeightsCtxBytes = 32u * 1024u * 1024u;
+    ggml_init_params p = { kGpuWeightsCtxBytes, nullptr, true };
     gpu_weights_ctx_ = ggml_init(p);
     if (!gpu_weights_ctx_) {
         fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
@@ -193,7 +193,7 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
             }
             ggml_backend_tensor_set(dst, src->data, 0, nbytes);
         }
-        *items[i].tensor = dst;
+        *items[i].tensor = dst; // Rebind model weight pointer to the GPU-backed tensor.
     }
 
     return true;

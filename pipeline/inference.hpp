@@ -33,7 +33,7 @@ typedef struct ggml_backend * ggml_backend_t;
 class InferenceEngine {
 public:
     // model must outlive this object
-    explicit InferenceEngine(const Qwen35moeModel& model, GGUFReader* reader = nullptr,
+    explicit InferenceEngine(Qwen35moeModel& model, GGUFReader* reader = nullptr,
                              int n_threads = 4, int max_seq_len = 2048, bool use_gpu = false);
     ~InferenceEngine();
 
@@ -54,7 +54,7 @@ public:
     void reset_state();
 
 private:
-    const Qwen35moeModel& model_;
+    Qwen35moeModel& model_;
     GGUFReader* reader_ = nullptr;
     int n_threads_;
     int max_seq_len_;
