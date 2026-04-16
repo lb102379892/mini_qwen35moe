@@ -444,10 +444,12 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer %d\n", il);
             return {};
         }
-        if (attn_out.size() == cur.size()) {
-            for (size_t i = 0; i < cur.size(); ++i) {
-                cur[i] += attn_out[i];
-            }
+        if (attn_out.size() != cur.size()) {
+            fprintf(stderr, "[Inference] ERROR: attn residual size mismatch at layer %d\n", il);
+            return {};
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            cur[i] += attn_out[i];
         }
 
         // 2b. post_attn_norm(cur) → ffn_in
@@ -463,7 +465,7 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
 
         // 2c. CPU-side MoE routing: softmax(W^T * ffn_in) → top-k → normalize
         if (!lyr.ffn_gate_inp) {
-            fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp\n", il);
+            fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp (gate weight tensor)\n", il);
             return {};
         }
         const int n_expert = (int)cfg.expert_count;
@@ -485,10 +487,12 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             fprintf(stderr, "[Inference] ERROR: exec_moe_ffn failed at layer %d\n", il);
             return {};
         }
-        if (moe_out.size() == cur.size()) {
-            for (size_t i = 0; i < cur.size(); ++i) {
-                cur[i] += moe_out[i];
-            }
+        if (moe_out.size() != cur.size()) {
+            fprintf(stderr, "[Inference] ERROR: moe residual size mismatch at layer %d\n", il);
+            return {};
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            cur[i] += moe_out[i];
         }
     }
 
