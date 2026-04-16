@@ -24,13 +24,15 @@ public:
     bool init(const std::string& model_path, bool verbose = true, GpuMode gpu_mode = GpuMode::Off) {
         if (verbose) printf("[Recognizer] Loading model: %s\n", model_path.c_str());
         if (verbose && gpu_mode == GpuMode::Hybrid) {
-            printf("[Recognizer] GPU mode: loading CPU weights for hybrid CPU-GPU offload\n");
+            printf("[Recognizer] GPU mode: metadata-only load for hybrid CPU-GPU direct backend loading\n");
         } else if (verbose && gpu_mode == GpuMode::Full) {
-            printf("[Recognizer] GPU mode: loading CPU weights for full GPU offload\n");
+            printf("[Recognizer] GPU mode: metadata-only load for full GPU direct backend loading\n");
         }
 
         reader_ = std::make_unique<GGUFReader>();
-        const bool ok = reader_->open(model_path);
+        const bool ok = (gpu_mode == GpuMode::Off)
+            ? reader_->open(model_path)
+            : reader_->open_no_alloc(model_path);
         if (!ok) {
             last_error_ = "Failed to open model file";
             return false;

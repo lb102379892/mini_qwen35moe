@@ -36,16 +36,18 @@
 #include <algorithm>
 #include <numeric>
 #include <limits>
+#include <memory>
+#include <string>
+#include <unordered_map>
 
 // ============================================================
 // Helpers
 // ============================================================
 
 static inline bool is_attn_layer(int il) { return (il % 4) == 3; }
-// Metadata-only ggml contexts for GPU tensor descriptors (not tensor payloads).
-// 64 MiB is enough for full-model tensor metadata with current model sizes.
-static constexpr size_t kGpuWeightsCtxBytesNonExpert = 32u * 1024u * 1024u;
-static constexpr size_t kGpuWeightsCtxBytesAll       = 64u * 1024u * 1024u;
+// Metadata-only ggml contexts for backend tensor descriptors (not tensor payloads).
+static constexpr size_t kWeightsCtxBytes = 64u * 1024u * 1024u;
+static constexpr size_t kStagingBufferBytes = 64u * 1024u * 1024u;
 
 // RMS norm helper
 static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
@@ -77,20 +79,25 @@ InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader,
             gpu_mode_ = GpuMode::Off;
         } else {
             backend_gpu_ = temp_cuda_backend;
-            const bool upload_ok = (gpu_mode_ == GpuMode::Full)
-                ? upload_all_weights_to_gpu()
-                : upload_non_expert_weights_to_gpu();
-            if (!upload_ok) {
-                fprintf(stderr, "[Inference] WARNING: failed to upload tensors to CUDA backend, falling back to CPU\n");
+            if (!reader_) {
+                fprintf(stderr, "[Inference] WARNING: reader is null in GPU mode, falling back to CPU\n");
                 ggml_backend_free(temp_cuda_backend);
                 backend_gpu_ = backend_cpu_;
                 gpu_mode_ = GpuMode::Off;
             } else {
-                use_gpu_ = true;
-                if (gpu_mode_ == GpuMode::Full) {
-                    fprintf(stderr, "[Inference] CUDA backend ready (all tensors on GPU)\n");
+                const bool load_ok = load_weights_to_backends();
+                if (!load_ok) {
+                    fprintf(stderr, "[Inference] WARNING: failed to load tensors directly to backends, falling back to CPU\n");
+                    ggml_backend_free(temp_cuda_backend);
+                    backend_gpu_ = backend_cpu_;
+                    gpu_mode_ = GpuMode::Off;
                 } else {
-                    fprintf(stderr, "[Inference] CUDA backend ready (non-expert tensors on GPU)\n");
+                    use_gpu_ = true;
+                    if (gpu_mode_ == GpuMode::Full) {
+                        fprintf(stderr, "[Inference] CUDA backend ready (all tensors on GPU)\n");
+                    } else {
+                        fprintf(stderr, "[Inference] CUDA backend ready (hybrid: expert tensors on CPU)\n");
+                    }
                 }
             }
         }
@@ -113,9 +120,17 @@ InferenceEngine::~InferenceEngine() {
         ggml_backend_buffer_free(gpu_weights_buf_);
         gpu_weights_buf_ = nullptr;
     }
+    if (cpu_weights_buf_) {
+        ggml_backend_buffer_free(cpu_weights_buf_);
+        cpu_weights_buf_ = nullptr;
+    }
     if (gpu_weights_ctx_) {
         ggml_free(gpu_weights_ctx_);
         gpu_weights_ctx_ = nullptr;
+    }
+    if (cpu_weights_ctx_) {
+        ggml_free(cpu_weights_ctx_);
+        cpu_weights_ctx_ = nullptr;
     }
     if (backend_gpu_ && backend_gpu_ != backend_cpu_) {
         ggml_backend_free(backend_gpu_);
@@ -125,193 +140,199 @@ InferenceEngine::~InferenceEngine() {
     }
 }
 
-bool InferenceEngine::upload_non_expert_weights_to_gpu() {
-    if (!backend_gpu_ || backend_gpu_ == backend_cpu_) {
-        return true;
-    }
-
-    struct UploadItem {
-        ggml_tensor** tensor;
-        const char* name;
-    };
-    std::vector<UploadItem> items;
-
-    auto add_item = [&items](ggml_tensor*& t, const char* name) {
-        if (t) {
-            items.push_back(UploadItem{&t, name});
-        }
-    };
-
-    auto& weights = model_.weights;
-    add_item(weights.token_embd, "token_embd");
-    add_item(weights.output, "output");
-    add_item(weights.output_norm, "output_norm");
-
-    for (auto& lyr : weights.layers) {
-        add_item(lyr.attn_norm, "attn_norm");
-        add_item(lyr.post_attention_norm, "post_attention_norm");
-
-        add_item(lyr.attn_q, "attn_q");
-        add_item(lyr.attn_k, "attn_k");
-        add_item(lyr.attn_v, "attn_v");
-        add_item(lyr.attn_output, "attn_output");
-        add_item(lyr.attn_q_norm, "attn_q_norm");
-        add_item(lyr.attn_k_norm, "attn_k_norm");
-
-        add_item(lyr.attn_qkv, "attn_qkv");
-        add_item(lyr.attn_gate, "attn_gate");
-        add_item(lyr.ssm_a, "ssm_a");
-        add_item(lyr.ssm_alpha, "ssm_alpha");
-        add_item(lyr.ssm_beta, "ssm_beta");
-        add_item(lyr.ssm_conv1d, "ssm_conv1d");
-        add_item(lyr.ssm_dt_b, "ssm_dt_b");
-        add_item(lyr.ssm_norm, "ssm_norm");
-        add_item(lyr.ssm_out, "ssm_out");
-    }
-
-    // Metadata-only context for non-expert tensor descriptors before backend alloc.
-    ggml_init_params p = { kGpuWeightsCtxBytesNonExpert, nullptr, true };
-    gpu_weights_ctx_ = ggml_init(p);
-    if (!gpu_weights_ctx_) {
-        fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
-        return false;
-    }
-
-    std::vector<ggml_tensor*> dst_tensors;
-    dst_tensors.reserve(items.size());
-    for (const auto& item : items) {
-        ggml_tensor* src = *item.tensor;
-        ggml_tensor* dst = ggml_new_tensor(gpu_weights_ctx_, src->type, ggml_n_dims(src), src->ne);
-        if (!dst) {
-            fprintf(stderr, "[Inference] ERROR: failed to allocate GPU tensor for %s\n", item.name);
-            return false;
-        }
-        if (src->name[0] != '\0') {
-            ggml_set_name(dst, src->name);
-        }
-        dst_tensors.push_back(dst);
-    }
-
-    gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
-    if (!gpu_weights_buf_) {
-        fprintf(stderr, "[Inference] ERROR: failed to allocate GPU buffer for non-expert tensors\n");
-        return false;
-    }
-
-    for (size_t i = 0; i < items.size(); ++i) {
-        ggml_tensor* src = *items[i].tensor;
-        ggml_tensor* dst = dst_tensors[i];
-        const size_t nbytes = ggml_nbytes(src);
-        if (nbytes > 0) {
-            if (!src->data) {
-                fprintf(stderr, "[Inference] ERROR: source tensor has no CPU data: %s\n", items[i].name);
-                return false;
-            }
-            ggml_backend_tensor_set(dst, src->data, 0, nbytes);
-        }
-        *items[i].tensor = dst; // Rebind model weight pointer to the GPU-backed tensor.
-    }
-
-    return true;
+static bool is_expert_tensor_name(const char* name) {
+    if (!name || name[0] == '\0') return false;
+    return std::strstr(name, "ffn_down_exps") ||
+           std::strstr(name, "ffn_gate_exps") ||
+           std::strstr(name, "ffn_up_exps") ||
+           std::strstr(name, "ffn_down_shexp") ||
+           std::strstr(name, "ffn_gate_shexp") ||
+           std::strstr(name, "ffn_up_shexp") ||
+           std::strstr(name, "ffn_gate_inp.weight") ||
+           std::strstr(name, "ffn_gate_inp_shexp");
 }
 
-bool InferenceEngine::upload_all_weights_to_gpu() {
-    if (!backend_gpu_ || backend_gpu_ == backend_cpu_) {
+bool InferenceEngine::load_weights_to_backends() {
+    if (gpu_mode_ == GpuMode::Off) {
         return true;
     }
+    if (!reader_ || !reader_->is_open() || !backend_cpu_ || !backend_gpu_) {
+        fprintf(stderr, "[Inference] ERROR: invalid state for direct backend loading\n");
+        return false;
+    }
 
-    struct UploadItem {
-        ggml_tensor** tensor;
-        const char* name;
+    struct TensorRef {
+        ggml_tensor** slot;
+        ggml_tensor* src;
     };
-    std::vector<UploadItem> items;
+    std::vector<TensorRef> refs;
+    refs.reserve(16 + model_.weights.layers.size() * 24);
 
-    auto add_item = [&items](ggml_tensor*& t, const char* name) {
-        if (t) {
-            items.push_back(UploadItem{&t, name});
-        }
+    auto add_ref = [&refs](ggml_tensor*& t) {
+        if (t) refs.push_back(TensorRef{&t, t});
     };
 
     auto& weights = model_.weights;
-    add_item(weights.token_embd, "token_embd");
-    add_item(weights.output, "output");
-    add_item(weights.output_norm, "output_norm");
-
+    add_ref(weights.token_embd);
+    add_ref(weights.output);
+    add_ref(weights.output_norm);
     for (auto& lyr : weights.layers) {
-        add_item(lyr.attn_norm, "attn_norm");
-        add_item(lyr.post_attention_norm, "post_attention_norm");
-
-        add_item(lyr.attn_q, "attn_q");
-        add_item(lyr.attn_k, "attn_k");
-        add_item(lyr.attn_v, "attn_v");
-        add_item(lyr.attn_output, "attn_output");
-        add_item(lyr.attn_q_norm, "attn_q_norm");
-        add_item(lyr.attn_k_norm, "attn_k_norm");
-
-        add_item(lyr.attn_qkv, "attn_qkv");
-        add_item(lyr.attn_gate, "attn_gate");
-        add_item(lyr.ssm_a, "ssm_a");
-        add_item(lyr.ssm_alpha, "ssm_alpha");
-        add_item(lyr.ssm_beta, "ssm_beta");
-        add_item(lyr.ssm_conv1d, "ssm_conv1d");
-        add_item(lyr.ssm_dt_b, "ssm_dt_b");
-        add_item(lyr.ssm_norm, "ssm_norm");
-        add_item(lyr.ssm_out, "ssm_out");
-
-        add_item(lyr.ffn_gate_exps, "ffn_gate_exps");
-        add_item(lyr.ffn_up_exps, "ffn_up_exps");
-        add_item(lyr.ffn_down_exps, "ffn_down_exps");
-        add_item(lyr.ffn_gate_shexp, "ffn_gate_shexp");
-        add_item(lyr.ffn_up_shexp, "ffn_up_shexp");
-        add_item(lyr.ffn_down_shexp, "ffn_down_shexp");
-        add_item(lyr.ffn_gate_inp, "ffn_gate_inp");
-        add_item(lyr.ffn_gate_inp_shexp, "ffn_gate_inp_shexp");
+        add_ref(lyr.attn_norm);
+        add_ref(lyr.post_attention_norm);
+        add_ref(lyr.attn_q);
+        add_ref(lyr.attn_k);
+        add_ref(lyr.attn_v);
+        add_ref(lyr.attn_output);
+        add_ref(lyr.attn_q_norm);
+        add_ref(lyr.attn_k_norm);
+        add_ref(lyr.attn_qkv);
+        add_ref(lyr.attn_gate);
+        add_ref(lyr.ssm_a);
+        add_ref(lyr.ssm_alpha);
+        add_ref(lyr.ssm_beta);
+        add_ref(lyr.ssm_conv1d);
+        add_ref(lyr.ssm_dt_b);
+        add_ref(lyr.ssm_norm);
+        add_ref(lyr.ssm_out);
+        add_ref(lyr.ffn_gate_exps);
+        add_ref(lyr.ffn_up_exps);
+        add_ref(lyr.ffn_down_exps);
+        add_ref(lyr.ffn_gate_shexp);
+        add_ref(lyr.ffn_up_shexp);
+        add_ref(lyr.ffn_down_shexp);
+        add_ref(lyr.ffn_gate_inp);
+        add_ref(lyr.ffn_gate_inp_shexp);
     }
 
-    // Metadata-only context for tensor descriptors before backend alloc.
-    ggml_init_params p = { kGpuWeightsCtxBytesAll, nullptr, true };
+    std::unordered_map<std::string, int> tensor_index;
+    const int n_tensors = gguf_get_n_tensors(reader_->gguf_ctx());
+    tensor_index.reserve((size_t)n_tensors);
+    for (int i = 0; i < n_tensors; ++i) {
+        const char* name = gguf_get_tensor_name(reader_->gguf_ctx(), i);
+        if (name) tensor_index.emplace(name, i);
+    }
+
+    if (gpu_weights_ctx_) {
+        ggml_free(gpu_weights_ctx_);
+        gpu_weights_ctx_ = nullptr;
+    }
+    if (cpu_weights_ctx_) {
+        ggml_free(cpu_weights_ctx_);
+        cpu_weights_ctx_ = nullptr;
+    }
+    if (gpu_weights_buf_) {
+        ggml_backend_buffer_free(gpu_weights_buf_);
+        gpu_weights_buf_ = nullptr;
+    }
+    if (cpu_weights_buf_) {
+        ggml_backend_buffer_free(cpu_weights_buf_);
+        cpu_weights_buf_ = nullptr;
+    }
+
+    ggml_init_params p = { kWeightsCtxBytes, nullptr, true };
     gpu_weights_ctx_ = ggml_init(p);
-    if (!gpu_weights_ctx_) {
-        fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
+    cpu_weights_ctx_ = ggml_init(p);
+    if (!gpu_weights_ctx_ || !cpu_weights_ctx_) {
+        fprintf(stderr, "[Inference] ERROR: failed to init weight contexts\n");
         return false;
     }
 
-    std::vector<ggml_tensor*> dst_tensors;
-    dst_tensors.reserve(items.size());
-    for (const auto& item : items) {
-        ggml_tensor* src = *item.tensor;
-        ggml_tensor* dst = ggml_new_tensor(gpu_weights_ctx_, src->type, ggml_n_dims(src), src->ne);
-        if (!dst) {
-            fprintf(stderr, "[Inference] ERROR: failed to allocate GPU tensor for %s\n", item.name);
+    struct LoadItem {
+        ggml_tensor** slot;
+        ggml_tensor* dst;
+        int tensor_idx;
+    };
+    std::vector<LoadItem> gpu_items;
+    std::vector<LoadItem> cpu_items;
+    gpu_items.reserve(refs.size());
+    cpu_items.reserve(refs.size());
+
+    for (const auto& ref : refs) {
+        if (!ref.src) continue;
+        const char* name = ref.src->name;
+        if (!name || name[0] == '\0') {
+            fprintf(stderr, "[Inference] ERROR: source tensor has no name\n");
             return false;
         }
-        if (src->name[0] != '\0') {
-            ggml_set_name(dst, src->name);
+
+        const auto it = tensor_index.find(name);
+        if (it == tensor_index.end()) {
+            fprintf(stderr, "[Inference] ERROR: tensor '%s' not found in GGUF index\n", name);
+            return false;
         }
-        dst_tensors.push_back(dst);
+
+        const bool to_gpu = (gpu_mode_ == GpuMode::Full) ||
+                            (gpu_mode_ == GpuMode::Hybrid && !is_expert_tensor_name(name));
+        ggml_context* target_ctx = to_gpu ? gpu_weights_ctx_ : cpu_weights_ctx_;
+        ggml_tensor* dst = ggml_new_tensor(target_ctx, ref.src->type, ggml_n_dims(ref.src), ref.src->ne);
+        if (!dst) {
+            fprintf(stderr, "[Inference] ERROR: failed to create destination tensor '%s'\n", name);
+            return false;
+        }
+        ggml_set_name(dst, name);
+
+        LoadItem li{ref.slot, dst, it->second};
+        if (to_gpu) gpu_items.push_back(li);
+        else cpu_items.push_back(li);
     }
 
-    gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
-    if (!gpu_weights_buf_) {
-        fprintf(stderr, "[Inference] ERROR: failed to allocate GPU buffer for tensors\n");
+    if (!gpu_items.empty()) {
+        gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
+        if (!gpu_weights_buf_) {
+            fprintf(stderr, "[Inference] ERROR: failed to allocate GPU weight buffer\n");
+            return false;
+        }
+    }
+    if (!cpu_items.empty()) {
+        cpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(cpu_weights_ctx_, backend_cpu_);
+        if (!cpu_weights_buf_) {
+            fprintf(stderr, "[Inference] ERROR: failed to allocate CPU weight buffer\n");
+            return false;
+        }
+    }
+
+    std::unique_ptr<FILE, int(*)(FILE*)> f(std::fopen(reader_->path().c_str(), "rb"), std::fclose);
+    if (!f) {
+        fprintf(stderr, "[Inference] ERROR: failed to open model file for backend loading: %s\n", reader_->path().c_str());
         return false;
     }
 
-    for (size_t i = 0; i < items.size(); ++i) {
-        ggml_tensor* src = *items[i].tensor;
-        ggml_tensor* dst = dst_tensors[i];
-        const size_t nbytes = ggml_nbytes(src);
-        if (nbytes > 0) {
-            if (!src->data) {
-                fprintf(stderr, "[Inference] ERROR: source tensor has no CPU data: %s\n", items[i].name);
+    std::vector<uint8_t> staging(kStagingBufferBytes);
+    const size_t data_offset = gguf_get_data_offset(reader_->gguf_ctx());
+
+    auto load_group = [&](const std::vector<LoadItem>& items) -> bool {
+        for (const auto& item : items) {
+            const char* name = item.dst->name;
+            const size_t nbytes = ggml_nbytes(item.dst);
+            const size_t tensor_offset = gguf_get_tensor_offset(reader_->gguf_ctx(), item.tensor_idx);
+            const size_t file_offset = data_offset + tensor_offset;
+            if (file_offset > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+                fprintf(stderr, "[Inference] ERROR: tensor '%s' file offset overflow (%zu)\n", name, file_offset);
                 return false;
             }
-            ggml_backend_tensor_set(dst, src->data, 0, nbytes);
-        }
-        *items[i].tensor = dst; // Rebind model weight pointer to the GPU-backed tensor.
-    }
+            if (fseeko(f.get(), static_cast<off_t>(file_offset), SEEK_SET) != 0) {
+                fprintf(stderr, "[Inference] ERROR: seek failed for tensor '%s'\n", name);
+                return false;
+            }
 
-    return true;
+            size_t done = 0;
+            while (done < nbytes) {
+                const size_t chunk = std::min(staging.size(), nbytes - done);
+                const size_t got = std::fread(staging.data(), 1, chunk, f.get());
+                if (got != chunk) {
+                    fprintf(stderr, "[Inference] ERROR: read failed for tensor '%s'\n", name);
+                    return false;
+                }
+                ggml_backend_tensor_set(item.dst, staging.data(), done, chunk);
+                done += chunk;
+            }
+            *item.slot = item.dst;
+        }
+        return true;
+    };
+
+    const bool ok = load_group(cpu_items) && load_group(gpu_items);
+    return ok;
 }
 
 // ============================================================
@@ -446,10 +467,6 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         const int n_expert = (int)cfg.expert_count;
         const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
         if (!gate_w) {
-            if (gpu_mode_ != GpuMode::Full) {
-                fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp has no CPU data\n", il);
-                return {};
-            }
             auto& gate_cache = moe_gate_inp_cpu_cache_[il];
             if (gate_cache.empty()) {
                 const size_t gate_count = (size_t)n_embd * n_expert;
