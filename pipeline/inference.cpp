@@ -56,8 +56,9 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 // ============================================================
 
 InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader,
-                                 int n_threads, int max_seq_len, bool use_gpu)
-    : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len) {
+                                 int n_threads, int max_seq_len, GpuMode gpu_mode)
+    : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len),
+      gpu_mode_(gpu_mode) {
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
         fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
@@ -65,25 +66,35 @@ InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader,
     }
     ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
 #ifdef QWEN35MOE_USE_CUDA
-    if (use_gpu) {
+    if (gpu_mode_ != GpuMode::Off) {
         ggml_backend_t temp_cuda_backend = ggml_backend_cuda_init(0); // device 0
         if (!temp_cuda_backend) {
             fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
+            gpu_mode_ = GpuMode::Off;
         } else {
             backend_gpu_ = temp_cuda_backend;
-            if (!upload_non_expert_weights_to_gpu()) {
-                fprintf(stderr, "[Inference] WARNING: failed to upload non-expert tensors to CUDA backend, falling back to CPU\n");
+            const bool upload_ok = (gpu_mode_ == GpuMode::Full)
+                ? upload_all_weights_to_gpu()
+                : upload_non_expert_weights_to_gpu();
+            if (!upload_ok) {
+                fprintf(stderr, "[Inference] WARNING: failed to upload tensors to CUDA backend, falling back to CPU\n");
                 ggml_backend_free(temp_cuda_backend);
                 backend_gpu_ = backend_cpu_;
+                gpu_mode_ = GpuMode::Off;
             } else {
                 use_gpu_ = true;
-                fprintf(stderr, "[Inference] CUDA backend ready (non-expert tensors on GPU)\n");
+                if (gpu_mode_ == GpuMode::Full) {
+                    fprintf(stderr, "[Inference] CUDA backend ready (all tensors on GPU)\n");
+                } else {
+                    fprintf(stderr, "[Inference] CUDA backend ready (non-expert tensors on GPU)\n");
+                }
             }
         }
     }
 #else
-    if (use_gpu) {
+    if (gpu_mode_ != GpuMode::Off) {
         fprintf(stderr, "[Inference] WARNING: CUDA not compiled in, using CPU\n");
+        gpu_mode_ = GpuMode::Off;
     }
 #endif
     if (!use_gpu_) {
@@ -179,6 +190,104 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
     gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
     if (!gpu_weights_buf_) {
         fprintf(stderr, "[Inference] ERROR: failed to allocate GPU buffer for non-expert tensors\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        ggml_tensor* src = *items[i].tensor;
+        ggml_tensor* dst = dst_tensors[i];
+        const size_t nbytes = ggml_nbytes(src);
+        if (nbytes > 0) {
+            if (!src->data) {
+                fprintf(stderr, "[Inference] ERROR: source tensor has no CPU data: %s\n", items[i].name);
+                return false;
+            }
+            ggml_backend_tensor_set(dst, src->data, 0, nbytes);
+        }
+        *items[i].tensor = dst; // Rebind model weight pointer to the GPU-backed tensor.
+    }
+
+    return true;
+}
+
+bool InferenceEngine::upload_all_weights_to_gpu() {
+    if (!backend_gpu_ || backend_gpu_ == backend_cpu_) {
+        return true;
+    }
+
+    struct UploadItem {
+        ggml_tensor** tensor;
+        const char* name;
+    };
+    std::vector<UploadItem> items;
+
+    auto add_item = [&items](ggml_tensor*& t, const char* name) {
+        if (t) {
+            items.push_back(UploadItem{&t, name});
+        }
+    };
+
+    auto& weights = model_.weights;
+    add_item(weights.token_embd, "token_embd");
+    add_item(weights.output, "output");
+    add_item(weights.output_norm, "output_norm");
+
+    for (auto& lyr : weights.layers) {
+        add_item(lyr.attn_norm, "attn_norm");
+        add_item(lyr.post_attention_norm, "post_attention_norm");
+
+        add_item(lyr.attn_q, "attn_q");
+        add_item(lyr.attn_k, "attn_k");
+        add_item(lyr.attn_v, "attn_v");
+        add_item(lyr.attn_output, "attn_output");
+        add_item(lyr.attn_q_norm, "attn_q_norm");
+        add_item(lyr.attn_k_norm, "attn_k_norm");
+
+        add_item(lyr.attn_qkv, "attn_qkv");
+        add_item(lyr.attn_gate, "attn_gate");
+        add_item(lyr.ssm_a, "ssm_a");
+        add_item(lyr.ssm_alpha, "ssm_alpha");
+        add_item(lyr.ssm_beta, "ssm_beta");
+        add_item(lyr.ssm_conv1d, "ssm_conv1d");
+        add_item(lyr.ssm_dt_b, "ssm_dt_b");
+        add_item(lyr.ssm_norm, "ssm_norm");
+        add_item(lyr.ssm_out, "ssm_out");
+
+        add_item(lyr.ffn_gate_exps, "ffn_gate_exps");
+        add_item(lyr.ffn_up_exps, "ffn_up_exps");
+        add_item(lyr.ffn_down_exps, "ffn_down_exps");
+        add_item(lyr.ffn_gate_shexp, "ffn_gate_shexp");
+        add_item(lyr.ffn_up_shexp, "ffn_up_shexp");
+        add_item(lyr.ffn_down_shexp, "ffn_down_shexp");
+        add_item(lyr.ffn_gate_inp, "ffn_gate_inp");
+        add_item(lyr.ffn_gate_inp_shexp, "ffn_gate_inp_shexp");
+    }
+
+    // Metadata-only context for tensor descriptors before backend alloc.
+    static constexpr size_t kGpuWeightsCtxBytes = 64u * 1024u * 1024u;
+    ggml_init_params p = { kGpuWeightsCtxBytes, nullptr, true };
+    gpu_weights_ctx_ = ggml_init(p);
+    if (!gpu_weights_ctx_) {
+        fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
+        return false;
+    }
+
+    std::vector<ggml_tensor*> dst_tensors;
+    dst_tensors.reserve(items.size());
+    for (const auto& item : items) {
+        ggml_tensor* src = *item.tensor;
+        ggml_tensor* dst = ggml_new_tensor(gpu_weights_ctx_, src->type, ggml_n_dims(src), src->ne);
+        if (!dst) {
+            fprintf(stderr, "[Inference] ERROR: failed to allocate GPU tensor for %s\n", item.name);
+            return false;
+        }
+        ggml_set_name(dst, src->name);
+        dst_tensors.push_back(dst);
+    }
+
+    gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
+    if (!gpu_weights_buf_) {
+        fprintf(stderr, "[Inference] ERROR: failed to allocate GPU buffer for tensors\n");
         return false;
     }
 
@@ -329,9 +438,16 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         }
         const int n_expert = (int)cfg.expert_count;
         const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
+        std::vector<float> gate_w_cpu;
         if (!gate_w) {
-            fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp has no CPU data\n", il);
-            return {};
+            if (gpu_mode_ != GpuMode::Full) {
+                fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp has no CPU data\n", il);
+                return {};
+            }
+            const size_t gate_count = (size_t)n_embd * n_expert;
+            gate_w_cpu.resize(gate_count);
+            ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_w_cpu.data(), 0, gate_count * sizeof(float));
+            gate_w = gate_w_cpu.data();
         }
 
         compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
@@ -864,7 +980,8 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
 
     ggml_build_forward_expand(gf, moe_out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_cpu_));
+    ggml_backend_t moe_backend = (gpu_mode_ == GpuMode::Full) ? backend_gpu_ : backend_cpu_;
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(moe_backend));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -893,7 +1010,7 @@ std::vector<float> InferenceEngine::exec_moe_ffn(
                                     (size_t)n_top_k * n_tokens * sizeof(float));
     }
 
-    ggml_backend_graph_compute(backend_cpu_, gf);
+    ggml_backend_graph_compute(moe_backend, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
     ggml_backend_tensor_get(moe_out, result.data(), 0, result.size() * sizeof(float));
