@@ -22,10 +22,12 @@ public:
     // Load model from GGUF file
     bool init(const std::string& model_path, bool verbose = true, bool gpu_mode = false) {
         if (verbose) printf("[Recognizer] Loading model: %s\n", model_path.c_str());
+        if (verbose && gpu_mode) {
+            printf("[Recognizer] GPU mode: loading CPU weights for hybrid CPU-GPU offload\n");
+        }
 
         reader_ = std::make_unique<GGUFReader>();
-        const bool ok = gpu_mode ? reader_->open_no_alloc(model_path)
-                                 : reader_->open(model_path);
+        const bool ok = reader_->open(model_path);
         if (!ok) {
             last_error_ = "Failed to open model file";
             return false;
@@ -46,6 +48,7 @@ public:
     const std::string&         last_error() const { return last_error_; }
     const ModelConfig&         config()     const { return model_->config; }
     // Expose the full model for inference engine
+    Qwen35moeModel*            model()            { return model_.get(); }
     const Qwen35moeModel*      model()      const { return model_.get(); }
     GGUFReader*                reader()            { return reader_.get(); }
     const GGUFReader*          reader()      const { return reader_.get(); }

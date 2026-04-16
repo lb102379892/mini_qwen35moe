@@ -320,7 +320,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const Qwen35moeModel* model = recognizer.model();
+    Qwen35moeModel* model = recognizer.model();
     fprintf(stderr, "[main] Model loaded. vocab_size=%ld n_layers=%u\n",
             model->weights.token_embd->ne[1],
             model->config.qwen35moe.block_count);
