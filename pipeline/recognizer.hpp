@@ -24,8 +24,8 @@ public:
         if (verbose) printf("[Recognizer] Loading model: %s\n", model_path.c_str());
 
         reader_ = std::make_unique<GGUFReader>();
-        const bool ok = gpu_mode ? reader_->open_no_alloc(model_path)
-                                 : reader_->open(model_path);
+        (void)gpu_mode;
+        const bool ok = reader_->open(model_path);
         if (!ok) {
             last_error_ = "Failed to open model file";
             return false;
