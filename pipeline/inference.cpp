@@ -42,6 +42,10 @@
 // ============================================================
 
 static inline bool is_attn_layer(int il) { return (il % 4) == 3; }
+// Metadata-only ggml contexts for GPU tensor descriptors (not tensor payloads).
+// 64 MiB is enough for full-model tensor metadata with current model sizes.
+static constexpr size_t kGpuWeightsCtxBytesNonExpert = 32u * 1024u * 1024u;
+static constexpr size_t kGpuWeightsCtxBytesAll       = 64u * 1024u * 1024u;
 
 // RMS norm helper
 static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
@@ -166,8 +170,7 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
     }
 
     // Metadata-only context for non-expert tensor descriptors before backend alloc.
-    static constexpr size_t kGpuWeightsCtxBytes = 32u * 1024u * 1024u;
-    ggml_init_params p = { kGpuWeightsCtxBytes, nullptr, true };
+    ggml_init_params p = { kGpuWeightsCtxBytesNonExpert, nullptr, true };
     gpu_weights_ctx_ = ggml_init(p);
     if (!gpu_weights_ctx_) {
         fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
@@ -183,7 +186,9 @@ bool InferenceEngine::upload_non_expert_weights_to_gpu() {
             fprintf(stderr, "[Inference] ERROR: failed to allocate GPU tensor for %s\n", item.name);
             return false;
         }
-        ggml_set_name(dst, src->name);
+        if (src->name[0] != '\0') {
+            ggml_set_name(dst, src->name);
+        }
         dst_tensors.push_back(dst);
     }
 
@@ -264,8 +269,7 @@ bool InferenceEngine::upload_all_weights_to_gpu() {
     }
 
     // Metadata-only context for tensor descriptors before backend alloc.
-    static constexpr size_t kGpuWeightsCtxBytes = 64u * 1024u * 1024u;
-    ggml_init_params p = { kGpuWeightsCtxBytes, nullptr, true };
+    ggml_init_params p = { kGpuWeightsCtxBytesAll, nullptr, true };
     gpu_weights_ctx_ = ggml_init(p);
     if (!gpu_weights_ctx_) {
         fprintf(stderr, "[Inference] ERROR: failed to init GPU weights context\n");
@@ -281,7 +285,9 @@ bool InferenceEngine::upload_all_weights_to_gpu() {
             fprintf(stderr, "[Inference] ERROR: failed to allocate GPU tensor for %s\n", item.name);
             return false;
         }
-        ggml_set_name(dst, src->name);
+        if (src->name[0] != '\0') {
+            ggml_set_name(dst, src->name);
+        }
         dst_tensors.push_back(dst);
     }
 
@@ -353,6 +359,7 @@ void InferenceEngine::init_state() {
 
     // Per-layer MoE routing result buffers (empty; resized in compute_moe_routing_cpu)
     moe_routes_.resize(n_layer);
+    moe_gate_inp_cpu_cache_.resize(n_layer);
 
     pos_ = 0;
 }
@@ -438,16 +445,18 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         }
         const int n_expert = (int)cfg.expert_count;
         const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
-        std::vector<float> gate_w_cpu;
         if (!gate_w) {
             if (gpu_mode_ != GpuMode::Full) {
                 fprintf(stderr, "[Inference] ERROR: layer %d ffn_gate_inp has no CPU data\n", il);
                 return {};
             }
-            const size_t gate_count = (size_t)n_embd * n_expert;
-            gate_w_cpu.resize(gate_count);
-            ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_w_cpu.data(), 0, gate_count * sizeof(float));
-            gate_w = gate_w_cpu.data();
+            auto& gate_cache = moe_gate_inp_cpu_cache_[il];
+            if (gate_cache.empty()) {
+                const size_t gate_count = (size_t)n_embd * n_expert;
+                gate_cache.resize(gate_count);
+                ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_cache.data(), 0, gate_count * sizeof(float));
+            }
+            gate_w = gate_cache.data();
         }
 
         compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);

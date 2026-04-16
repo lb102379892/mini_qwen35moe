@@ -110,6 +110,7 @@ private:
         std::vector<float>   weights;  // normalized probs,  size: n_top_k * n_tokens
     };
     std::vector<MoERoute> moe_routes_; // [n_layer]
+    std::vector<std::vector<float>> moe_gate_inp_cpu_cache_; // [n_layer], only used in full GPU mode
 
     // ---------------------------------------------------------------
     // Temporary pointers set during sub-graph building; valid only
