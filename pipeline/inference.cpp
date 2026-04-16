@@ -39,7 +39,6 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <future>
 
 // ============================================================
 // Helpers
@@ -56,16 +55,6 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
     x = ggml_rms_norm(ctx, x, eps);
     x = ggml_mul(ctx, x, w);
     return x;
-}
-
-static inline void add_residual(std::vector<float>& cur, const std::vector<float>& residual) {
-    const size_t n = cur.size();
-    if (residual.size() != n) {
-        return;
-    }
-    for (size_t i = 0; i < n; ++i) {
-        cur[i] += residual[i];
-    }
 }
 
 // ============================================================
@@ -441,13 +430,44 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         return {};
     }
 
-    auto get_gate_weight_ptr = [&](int il) -> const float * {
+    // ── Step 2: Per-layer execution (serial path for CPU-only / hybrid / full-GPU) ──
+    for (int il = 0; il < n_layer; il++) {
         const auto& lyr = model_.weights.layers[il];
-        if (!lyr.ffn_gate_inp) {
-            fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp\n", il);
-            return nullptr;
+        if (!lyr.attn_norm) {
+            fprintf(stderr, "[Inference] ERROR: layer %d missing attn_norm\n", il);
+            return {};
         }
 
+        // 2a. attn_norm(cur) + attn/SSM → attn_out  [n_embd * n_tokens]
+        std::vector<float> attn_out = exec_attn_or_ssm(cur, il, n_tokens, pos);
+        if (attn_out.empty()) {
+            fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer %d\n", il);
+            return {};
+        }
+        if (attn_out.size() != cur.size()) {
+            fprintf(stderr, "[Inference] ERROR: attn residual size mismatch at layer %d\n", il);
+            return {};
+        }
+        for (size_t i = 0; i < cur.size(); ++i) {
+            cur[i] += attn_out[i];
+        }
+
+        // 2b. post_attn_norm(cur) → ffn_in
+        if (!lyr.post_attention_norm) {
+            fprintf(stderr, "[Inference] ERROR: layer %d missing post_attention_norm\n", il);
+            return {};
+        }
+        std::vector<float> ffn_in = exec_rms_norm(cur, lyr.post_attention_norm, n_tokens);
+        if (ffn_in.empty()) {
+            fprintf(stderr, "[Inference] ERROR: exec_rms_norm failed at layer %d\n", il);
+            return {};
+        }
+
+        // 2c. CPU-side MoE routing: softmax(W^T * ffn_in) → top-k → normalize
+        if (!lyr.ffn_gate_inp) {
+            fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp (gate weight tensor)\n", il);
+            return {};
+        }
         const int n_expert = (int)cfg.expert_count;
         const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
         if (!gate_w) {
@@ -459,138 +479,20 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             }
             gate_w = gate_cache.data();
         }
-        return gate_w;
-    };
+        compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
 
-    static constexpr int kMinLayersForPipeline = 2;
-    // Hybrid pipeline needs at least 2 layers to overlap layer N GPU work with layer N-1 CPU MoE work.
-    const bool use_hybrid_pipeline = use_gpu_ && gpu_mode_ == GpuMode::Hybrid &&
-                                     n_layer >= kMinLayersForPipeline;
-    if (use_hybrid_pipeline) {
-        // Warmup layer 0 (no CPU/GPU overlap available yet)
-        const auto& lyr0 = model_.weights.layers[0];
-        if (!lyr0.attn_norm || !lyr0.post_attention_norm) {
-            fprintf(stderr, "[Inference] ERROR: layer 0 missing required norm tensors\n");
+        // 2d. MoE FFN sub-graph (selected + weights are pre-filled leaf tensors)
+        std::vector<float> moe_out = exec_moe_ffn(ffn_in, il, n_tokens);
+        if (moe_out.empty()) {
+            fprintf(stderr, "[Inference] ERROR: exec_moe_ffn failed at layer %d\n", il);
             return {};
         }
-
-        std::vector<float> attn_out0 = exec_attn_or_ssm(cur, 0, n_tokens, pos);
-        if (attn_out0.empty()) {
-            fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer 0\n");
+        if (moe_out.size() != cur.size()) {
+            fprintf(stderr, "[Inference] ERROR: moe residual size mismatch at layer %d\n", il);
             return {};
         }
-        add_residual(cur, attn_out0);
-
-        std::vector<float> prev_ffn_in = exec_rms_norm(cur, lyr0.post_attention_norm, n_tokens);
-        if (prev_ffn_in.empty()) {
-            fprintf(stderr, "[Inference] ERROR: exec_rms_norm failed at layer 0\n");
-            return {};
-        }
-        std::vector<float> prev_cur_after_attn = cur;
-        int prev_layer = 0;
-
-        // Pipeline stage: GPU(layer il attn/ssm) || CPU(layer il-1 moe)
-        for (int il = 1; il < n_layer; il++) {
-            const auto& lyr = model_.weights.layers[il];
-            if (!lyr.attn_norm || !lyr.post_attention_norm) {
-                fprintf(stderr, "[Inference] ERROR: layer %d missing required norm tensors\n", il);
-                return {};
-            }
-
-            std::vector<float> gpu_input = cur;
-            auto fut_attn = std::async(std::launch::async, [this, gpu_input = std::move(gpu_input), il, n_tokens, pos]() {
-                return exec_attn_or_ssm(gpu_input, il, n_tokens, pos);
-            });
-
-            const float* gate_w_prev = get_gate_weight_ptr(prev_layer);
-            if (!gate_w_prev) {
-                return {};
-            }
-            compute_moe_routing_cpu(gate_w_prev, prev_ffn_in.data(), prev_layer, n_tokens);
-            std::vector<float> moe_out_prev = exec_moe_ffn(prev_ffn_in, prev_layer, n_tokens);
-            if (moe_out_prev.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_moe_ffn failed at layer %d\n", prev_layer);
-                return {};
-            }
-
-            std::vector<float> attn_out = fut_attn.get();
-            if (attn_out.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer %d\n", il);
-                return {};
-            }
-
-            cur = prev_cur_after_attn;
-            add_residual(cur, moe_out_prev);
-            add_residual(cur, attn_out);
-
-            std::vector<float> ffn_in = exec_rms_norm(cur, lyr.post_attention_norm, n_tokens);
-            if (ffn_in.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_rms_norm failed at layer %d\n", il);
-                return {};
-            }
-
-            prev_cur_after_attn = cur;
-            prev_ffn_in = std::move(ffn_in);
-            prev_layer = il;
-        }
-
-        const float* gate_w_last = get_gate_weight_ptr(prev_layer);
-        if (!gate_w_last) {
-            return {};
-        }
-        compute_moe_routing_cpu(gate_w_last, prev_ffn_in.data(), prev_layer, n_tokens);
-        std::vector<float> moe_out_last = exec_moe_ffn(prev_ffn_in, prev_layer, n_tokens);
-        if (moe_out_last.empty()) {
-            fprintf(stderr, "[Inference] ERROR: exec_moe_ffn failed at layer %d\n", prev_layer);
-            return {};
-        }
-        add_residual(cur, moe_out_last);
-    } else {
-        // ── Step 2: Per-layer execution (serial path for CPU-only / full-GPU) ──
-        for (int il = 0; il < n_layer; il++) {
-            const auto& lyr = model_.weights.layers[il];
-            if (!lyr.attn_norm) {
-                fprintf(stderr, "[Inference] ERROR: layer %d missing attn_norm\n", il);
-                return {};
-            }
-
-            // 2a. attn_norm(cur) + attn/SSM → attn_out  [n_embd * n_tokens]
-            std::vector<float> attn_out = exec_attn_or_ssm(cur, il, n_tokens, pos);
-            if (attn_out.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer %d\n", il);
-                return {};
-            }
-
-            // 2b. Residual: cur += attn_out
-            add_residual(cur, attn_out);
-
-            // 2c. post_attn_norm(cur) → ffn_in
-            if (!lyr.post_attention_norm) {
-                fprintf(stderr, "[Inference] ERROR: layer %d missing post_attention_norm\n", il);
-                return {};
-            }
-            std::vector<float> ffn_in = exec_rms_norm(cur, lyr.post_attention_norm, n_tokens);
-            if (ffn_in.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_rms_norm failed at layer %d\n", il);
-                return {};
-            }
-
-            // 2d. CPU-side MoE routing: softmax(W^T * ffn_in) → top-k → normalize
-            const float* gate_w = get_gate_weight_ptr(il);
-            if (!gate_w) {
-                return {};
-            }
-            compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
-
-            // 2e. MoE FFN sub-graph (selected + weights are pre-filled leaf tensors)
-            std::vector<float> moe_out = exec_moe_ffn(ffn_in, il, n_tokens);
-            if (moe_out.empty()) {
-                fprintf(stderr, "[Inference] ERROR: exec_moe_ffn failed at layer %d\n", il);
-                return {};
-            }
-
-            // 2f. Residual: cur += moe_out
-            add_residual(cur, moe_out);
+        for (size_t i = 0; i < cur.size(); ++i) {
+            cur[i] += moe_out[i];
         }
     }
 
