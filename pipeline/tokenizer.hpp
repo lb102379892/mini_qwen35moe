@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <sstream>
 #include <climits>
 
@@ -33,6 +34,15 @@ public:
     // Load vocab + merges from TokenizerConfig
     // ============================================================
     bool load(const TokenizerConfig& cfg) {
+        constexpr int32_t kTokenTypeControl = 3;
+        constexpr int32_t kTokenTypeUserDefined = 4;
+        static const std::array<std::string, 4> kEogTokenPatterns = {
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|end_of_text|>",
+            "<|eot_id|>"
+        };
+
         if (cfg.ggml_tokens.empty()) {
             fprintf(stderr, "[Tokenizer] ERROR: no tokens in config\n");
             return false;
@@ -86,7 +96,7 @@ public:
             // Collect type==3 (CONTROL) and type==4 (USER_DEFINED) as special tokens
             for (int i = 0; i < vocab_size_; i++) {
                 int32_t t = token_type_[i];
-                if (t == 3 || t == 4) {
+                if (t == kTokenTypeControl || t == kTokenTypeUserDefined) {
                     special_tokens_sorted_.emplace_back(id_to_token_[i], i);
                 }
             }
@@ -107,12 +117,9 @@ public:
 
         // Scan CONTROL(type==3) and USER_DEFINED(type==4) tokens for known EOG patterns
         for (int i = 0; i < vocab_size_; i++) {
-            if (token_type_[i] != 3 && token_type_[i] != 4) continue;
+            if (token_type_[i] != kTokenTypeControl && token_type_[i] != kTokenTypeUserDefined) continue;
             const std::string& text = id_to_token_[i];
-            if (text == "<|im_end|>" ||
-                text == "<|endoftext|>" ||
-                text == "<|end_of_text|>" ||
-                text == "<|eot_id|>") {
+            if (std::find(kEogTokenPatterns.begin(), kEogTokenPatterns.end(), text) != kEogTokenPatterns.end()) {
                 eog_ids_.insert(i);
             }
         }
