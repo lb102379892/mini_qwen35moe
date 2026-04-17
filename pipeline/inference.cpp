@@ -1399,23 +1399,23 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
     // conv_out: [qkv_channels=8192, n_tokens, 1]
 
     // --------------------------------------------------
-    // Split conv_out into Q, K, V
-    //   q_offset = 0,                  q_size = n_group * d_state = 16*128 = 2048
-    //   k_offset = n_group*d_state,    k_size = 2048
-    //   v_offset = 2*n_group*d_state,  v_size = d_inner = 4096
+    // Split conv_out into V, K, Q (Qwen3.5 DeltaNet layout)
+    //   v_offset = 0,                  v_size = d_inner = 4096
+    //   k_offset = d_inner,            k_size = n_group * d_state = 16*128 = 2048
+    //   q_offset = d_inner + qk_size,  q_size = 2048
     // --------------------------------------------------
     const int64_t qk_size = n_group * d_state;  // 2048
 
     // We need [head_k_dim, num_heads, n_tokens, 1] shaped tensors
-    // q_conv: [d_state=128, n_group=16, n_tokens, 1]
-    // k_conv: [d_state=128, n_group=16, n_tokens, 1]
     // v_conv: [head_v_dim=128, dt_rank=32, n_tokens, 1]
+    // k_conv: [d_state=128, n_group=16, n_tokens, 1]
+    // q_conv: [d_state=128, n_group=16, n_tokens, 1]
 
     const int64_t nb1    = ggml_row_size(conv_out->type, qkv_channels);
 
-    struct ggml_tensor* q_conv = ggml_view_4d(ctx, conv_out,
-        d_state, n_group, n_tokens, 1,
-        ggml_row_size(conv_out->type, d_state),
+    struct ggml_tensor* v_conv = ggml_view_4d(ctx, conv_out,
+        head_v_dim, dt_rank, n_tokens, 1,
+        ggml_row_size(conv_out->type, head_v_dim),
         nb1,
         nb1 * n_tokens,
         0);  // offset 0
@@ -1425,14 +1425,14 @@ ggml_tensor* InferenceEngine::build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf
         ggml_row_size(conv_out->type, d_state),
         nb1,
         nb1 * n_tokens,
-        ggml_row_size(conv_out->type, qk_size)); // offset after q
+        ggml_row_size(conv_out->type, d_inner)); // offset after v
 
-    struct ggml_tensor* v_conv = ggml_view_4d(ctx, conv_out,
-        head_v_dim, dt_rank, n_tokens, 1,
-        ggml_row_size(conv_out->type, head_v_dim),
+    struct ggml_tensor* q_conv = ggml_view_4d(ctx, conv_out,
+        d_state, n_group, n_tokens, 1,
+        ggml_row_size(conv_out->type, d_state),
         nb1,
         nb1 * n_tokens,
-        ggml_row_size(conv_out->type, 2 * qk_size)); // offset after q+k
+        ggml_row_size(conv_out->type, d_inner + qk_size)); // offset after v+k
 
     // Make contiguous for l2_norm
     q_conv = ggml_cont(ctx, q_conv);

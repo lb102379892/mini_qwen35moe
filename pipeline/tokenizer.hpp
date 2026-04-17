@@ -237,6 +237,9 @@ public:
                                   const std::string& system_msg = "You are a helpful assistant.") const {
         std::string prompt;
         if (im_start_id_ >= 0) {
+            if (!system_msg.empty()) {
+                prompt += "<|im_start|>system\n" + system_msg + "<|im_end|>\n";
+            }
             prompt += "<|im_start|>user\n" + user_msg + "<|im_end|>\n";
             prompt += "<|im_start|>assistant\n";
         } else {
