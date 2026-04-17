@@ -22,7 +22,6 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
-#include <array>
 #include <sstream>
 #include <climits>
 
@@ -34,15 +33,6 @@ public:
     // Load vocab + merges from TokenizerConfig
     // ============================================================
     bool load(const TokenizerConfig& cfg) {
-        constexpr int32_t kTokenTypeControl = 3;
-        constexpr int32_t kTokenTypeUserDefined = 4;
-        static const std::array<std::string, 4> kEogTokenPatterns = {
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<|end_of_text|>",
-            "<|eot_id|>"
-        };
-
         if (cfg.ggml_tokens.empty()) {
             fprintf(stderr, "[Tokenizer] ERROR: no tokens in config\n");
             return false;
@@ -96,7 +86,7 @@ public:
             // Collect type==3 (CONTROL) and type==4 (USER_DEFINED) as special tokens
             for (int i = 0; i < vocab_size_; i++) {
                 int32_t t = token_type_[i];
-                if (t == kTokenTypeControl || t == kTokenTypeUserDefined) {
+                if (t == TOKEN_TYPE_CONTROL || t == TOKEN_TYPE_USER_DEFINED) {
                     special_tokens_sorted_.emplace_back(id_to_token_[i], i);
                 }
             }
@@ -117,9 +107,9 @@ public:
 
         // Scan CONTROL(type==3) and USER_DEFINED(type==4) tokens for known EOG patterns
         for (int i = 0; i < vocab_size_; i++) {
-            if (token_type_[i] != kTokenTypeControl && token_type_[i] != kTokenTypeUserDefined) continue;
+            if (token_type_[i] != TOKEN_TYPE_CONTROL && token_type_[i] != TOKEN_TYPE_USER_DEFINED) continue;
             const std::string& text = id_to_token_[i];
-            if (std::find(kEogTokenPatterns.begin(), kEogTokenPatterns.end(), text) != kEogTokenPatterns.end()) {
+            if (kEogTokenPatterns.count(text) > 0) {
                 eog_ids_.insert(i);
             }
         }
@@ -272,6 +262,15 @@ public:
     }
 
 private:
+    static constexpr int32_t TOKEN_TYPE_CONTROL = 3;
+    static constexpr int32_t TOKEN_TYPE_USER_DEFINED = 4;
+    inline static const std::unordered_set<std::string> kEogTokenPatterns = {
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|eot_id|>"
+    };
+
     // ============================================================
     // GPT-2 byte-to-unicode mapping
     // ============================================================
