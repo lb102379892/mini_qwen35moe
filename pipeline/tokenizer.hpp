@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <cassert>
 #include <cstdio>
@@ -96,6 +97,24 @@ public:
                 });
         } else {
             token_type_.assign(vocab_size_, 1);
+        }
+
+        // Build EOG (end-of-generation) token set automatically
+        eog_ids_.clear();
+        if (eos_id_ >= 0) eog_ids_.insert(eos_id_);
+        if (eot_id_ >= 0) eog_ids_.insert(eot_id_);
+        if (im_end_id_ >= 0) eog_ids_.insert(im_end_id_);
+
+        // Scan CONTROL(type==3) and USER_DEFINED(type==4) tokens for known EOG patterns
+        for (int i = 0; i < vocab_size_; i++) {
+            if (token_type_[i] != 3 && token_type_[i] != 4) continue;
+            const std::string& text = id_to_token_[i];
+            if (text == "<|im_end|>" ||
+                text == "<|endoftext|>" ||
+                text == "<|end_of_text|>" ||
+                text == "<|eot_id|>") {
+                eog_ids_.insert(i);
+            }
         }
 
         fprintf(stderr, "[Tokenizer] vocab_size=%d merges=%zu eos=%d im_start=%d im_end=%d special=%zu\n",
@@ -242,7 +261,7 @@ public:
     int eot_id()      const { return eot_id_; }
 
     bool is_stop_token(int id) const {
-        return id == eos_id_ || id == eot_id_ || id == im_end_id_;
+        return eog_ids_.count(id) > 0;
     }
 
 private:
@@ -470,6 +489,7 @@ private:
     int im_start_id_ = -1;
     int im_end_id_   = -1;
     int eot_id_      = -1;
+    std::unordered_set<int> eog_ids_;
 };
 
 #endif // QWEN35MOE_PIPELINE_TOKENIZER_HPP
