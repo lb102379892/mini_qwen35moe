@@ -32,25 +32,38 @@ public:
     // ============================================================
     // Load vocab + merges from TokenizerConfig
     // ============================================================
+    /**
+     * @brief 加载分词器配置
+     * 
+     * 该方法负责从 TokenizerConfig 中加载分词器所需的所有配置信息，
+     * 包括词汇表、合并规则、特殊标记等。
+     * 
+     * @param cfg 分词器配置对象
+     * @return bool 是否成功加载配置
+     */
     bool load(const TokenizerConfig& cfg) {
+        // 检查配置中是否包含 tokens
         if (cfg.ggml_tokens.empty()) {
             fprintf(stderr, "[Tokenizer] ERROR: no tokens in config\n");
             return false;
         }
 
+        // 初始化词汇表大小和 ID 到 token 的映射
         vocab_size_ = (int)cfg.ggml_tokens.size();
         id_to_token_.resize(vocab_size_);
 
+        // 构建 token 到 ID 和 ID 到 token 的双向映射
         for (int i = 0; i < vocab_size_; i++) {
             const std::string& tok = cfg.ggml_tokens[i];
-            id_to_token_[i]  = tok;
-            token_to_id_[tok] = i;
+            id_to_token_[i]  = tok;      // ID 到 token 的映射
+            token_to_id_[tok] = i;        // token 到 ID 的映射
         }
 
-        // Load merges: each merge is a string like "a b" (two tokens separated by space)
-        for (int i = 0; i < (int)cfg.ggml_merges.size(); i++) {
+        // 加载合并规则：每个合并规则是一个形如 "a b" 的字符串（两个 token 用空格分隔）
+        int n_merges = (int)cfg.ggml_merges.size();
+        for (int i = 0; i < n_merges; i++) {
             const std::string& m = cfg.ggml_merges[i];
-            // Find the single space separator
+
             size_t sep = m.find(' ');
             if (sep == std::string::npos) continue;
             std::string left  = m.substr(0, sep);
@@ -58,54 +71,54 @@ public:
             merge_rank_[{left, right}] = i;
         }
 
-        // Build byte-to-unicode lookup table (GPT-2 style)
+        // 构建字节到 unicode 的查找表（GPT-2 风格）
         build_byte_to_unicode();
 
-        // Find special token IDs
-        eos_id_     = (int)cfg.ggml_eos_token_id;
-        pad_id_     = (int)cfg.ggml_padding_token_id;
-        bos_id_     = -1; // Qwen3.5 has no explicit BOS, uses chat format
+        // 查找特殊 token ID
+        eos_id_     = (int)cfg.ggml_eos_token_id;     // 结束标记 ID
+        pad_id_     = (int)cfg.ggml_padding_token_id; // 填充标记 ID
+        bos_id_     = -1; // Qwen3.5 没有显式的 BOS 标记，使用聊天格式
 
-        // Find <|im_start|> and <|im_end|> by searching the vocab
+        // 通过搜索词汇表查找 <|im_start|> 和 <|im_end|> 标记
         auto it_start = token_to_id_.find("<|im_start|>");
         auto it_end   = token_to_id_.find("<|im_end|>");
         im_start_id_ = (it_start != token_to_id_.end()) ? it_start->second : -1;
         im_end_id_   = (it_end   != token_to_id_.end()) ? it_end->second   : -1;
 
-        // Find <|endoftext|>
+        // 查找 <|endoftext|> 标记
         auto it_eot = token_to_id_.find("<|endoftext|>");
         if (it_eot != token_to_id_.end()) eot_id_ = it_eot->second;
-        else eot_id_ = eos_id_;
+        else eot_id_ = eos_id_; // 如果不存在，则使用 eos_id_
 
-        // Load token types and build special token list
+        // 加载 token 类型并构建特殊 token 列表
         if (!cfg.ggml_token_type.empty()) {
-            token_type_.resize(vocab_size_, 1); // default: NORMAL
+            token_type_.resize(vocab_size_, 1); // 默认: NORMAL
             for (int i = 0; i < vocab_size_ && i < (int)cfg.ggml_token_type.size(); i++) {
                 token_type_[i] = cfg.ggml_token_type[i];
             }
-            // Collect type==3 (CONTROL) and type==4 (USER_DEFINED) as special tokens
+            // 收集类型为 3 (CONTROL) 和 4 (USER_DEFINED) 的标记作为特殊标记
             for (int i = 0; i < vocab_size_; i++) {
                 int32_t t = token_type_[i];
                 if (t == TOKEN_TYPE_CONTROL || t == TOKEN_TYPE_USER_DEFINED) {
                     special_tokens_sorted_.emplace_back(id_to_token_[i], i);
                 }
             }
-            // Sort by string length descending for greedy longest-match
+            // 按字符串长度降序排序，用于贪心最长匹配
             std::sort(special_tokens_sorted_.begin(), special_tokens_sorted_.end(),
                 [](const std::pair<std::string,int>& a, const std::pair<std::string,int>& b) {
                     return a.first.size() > b.first.size();
                 });
         } else {
-            token_type_.assign(vocab_size_, 1);
+            token_type_.assign(vocab_size_, 1); // 如果没有 token 类型信息，全部设为 NORMAL
         }
 
-        // Build EOG (end-of-generation) token set automatically
+        // 自动构建 EOG (end-of-generation) 标记集合
         eog_ids_.clear();
         if (eos_id_ >= 0) eog_ids_.insert(eos_id_);
         if (eot_id_ >= 0) eog_ids_.insert(eot_id_);
         if (im_end_id_ >= 0) eog_ids_.insert(im_end_id_);
 
-        // Scan CONTROL(type==3) and USER_DEFINED(type==4) tokens for known EOG patterns
+        // 扫描 CONTROL(type==3) 和 USER_DEFINED(type==4) 标记，查找已知的 EOG 模式
         for (int i = 0; i < vocab_size_; i++) {
             if (token_type_[i] != TOKEN_TYPE_CONTROL && token_type_[i] != TOKEN_TYPE_USER_DEFINED) continue;
             const std::string& text = id_to_token_[i];
@@ -114,9 +127,11 @@ public:
             }
         }
 
+        // 打印分词器信息
         fprintf(stderr, "[Tokenizer] vocab_size=%d merges=%zu eos=%d im_start=%d im_end=%d special=%zu\n",
                 vocab_size_, cfg.ggml_merges.size(), eos_id_, im_start_id_, im_end_id_,
                 special_tokens_sorted_.size());
+        chat_template_ = cfg.chat_template;
         return true;
     }
 
@@ -234,14 +249,27 @@ public:
     // Build chat-format prompt for Qwen3.5
     // ============================================================
     std::string make_chat_prompt(const std::string& user_msg,
-                                  const std::string& system_msg = "You are a helpful assistant.") const {
+                                  const std::string& system_msg = "",
+                                  bool enable_thinking = false) const {
+        std::string templated = render_chat_template(user_msg, system_msg, enable_thinking);
+        if (!templated.empty()) {
+            return templated;
+        }
+
         std::string prompt;
+        std::stringstream ss;
         if (im_start_id_ >= 0) {
             if (!system_msg.empty()) {
-                prompt += "<|im_start|>system\n" + system_msg + "<|im_end|>\n";
+                ss << "<|im_start|>system\n" << system_msg << "<|im_end|>\n";
             }
-            prompt += "<|im_start|>user\n" + user_msg + "<|im_end|>\n";
-            prompt += "<|im_start|>assistant\n";
+            ss << "<|im_start|>user\n" << user_msg << "<|im_end|>\n";
+            ss << "<|im_start|>assistant\n";
+            if (enable_thinking) {
+                ss << "<think>\n";
+            } else {
+                ss << "<think>\n\n</think>\n\n";
+            }
+            prompt = ss.str();
         } else {
             // Fallback: plain prompt
             prompt = user_msg;
@@ -264,6 +292,21 @@ public:
         return eog_ids_.count(id) > 0;
     }
 
+    bool has_chat_template() const {
+        return !chat_template_.empty();
+    }
+
+    bool should_skip_output_token(int id) const {
+        if (id < 0 || id >= vocab_size_) return true;
+        if (!token_type_.empty() && id < (int)token_type_.size()) {
+            int32_t t = token_type_[id];
+            if (t == TOKEN_TYPE_CONTROL || t == TOKEN_TYPE_USER_DEFINED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     static constexpr int32_t TOKEN_TYPE_CONTROL = 3;
     static constexpr int32_t TOKEN_TYPE_USER_DEFINED = 4;
@@ -273,6 +316,47 @@ private:
         "<|end_of_text|>",
         "<|eot_id|>"
     };
+
+    struct ChatMessage {
+        std::string role;
+        std::string content;
+    };
+
+    std::string render_chat_template(const std::string& user_msg,
+                                     const std::string& system_msg,
+                                     bool enable_thinking) const {
+        if (chat_template_.empty()) return "";
+        if (chat_template_.find("messages") == std::string::npos) return "";
+        if (chat_template_.find("<|im_start|>") == std::string::npos ||
+            chat_template_.find("<|im_end|>") == std::string::npos) {
+            return "";
+        }
+
+        std::vector<ChatMessage> messages;
+        if (!system_msg.empty()) {
+            messages.push_back({"system", system_msg});
+        }
+        messages.push_back({"user", user_msg});
+
+        std::stringstream ss;
+        for (const auto& msg : messages) {
+            ss << "<|im_start|>" << msg.role << "\n"
+               << msg.content << "<|im_end|>\n";
+        }
+
+        if (chat_template_.find("add_generation_prompt") != std::string::npos ||
+            chat_template_.find("<|im_start|>assistant") != std::string::npos) {
+            ss << "<|im_start|>assistant\n";
+            if (chat_template_.find("enable_thinking") != std::string::npos) {
+                if (enable_thinking) {
+                    ss << "<think>\n";
+                } else {
+                    ss << "<think>\n\n</think>\n\n";
+                }
+            }
+        }
+        return ss.str();
+    }
 
     // ============================================================
     // GPT-2 byte-to-unicode mapping
@@ -498,6 +582,7 @@ private:
     int im_start_id_ = -1;
     int im_end_id_   = -1;
     int eot_id_      = -1;
+    std::string chat_template_;
     std::unordered_set<int> eog_ids_;
 };
 

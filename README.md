@@ -8,7 +8,8 @@ built on top of the bundled **ggml** library.
 ```bash
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+cmake .. -DQWEN35MOE_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Debug
 make -j$(nproc)
 # Binary: build/test_qwen35moe
 ```
@@ -19,6 +20,43 @@ Requires: CMake >= 3.14, C++17, Linux or macOS.
 
 ### Single prompt (one-shot generation)
 ```bash
+./test_qwen35moe \
+  --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
+  --prompt "你的模型是什么" \
+  --n-predict 256 \
+  --verbose
+
+
+./test_qwen35moe \
+  --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
+  --prompt "你的模型是什么" \
+  --n-predict 1024 \
+  --temp 0.3 \
+  --top-k 10 \
+  --top-p 0.8 \
+  --threads 1
+
+./test_qwen35moe \
+  --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
+  --prompt "你的模型是什么" \
+  --n-predict 1024 \
+  --temp 0.3 \
+  --top-k 10 \
+  --top-p 0.8 \
+  --threads 1 \
+  --gpu
+
+./test_qwen35moe \
+  --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
+  --prompt "你的模型是什么" \
+  --n-predict 1024 \
+  --temp 0.3 \
+  --top-k 10 \
+  --top-p 0.8 \
+  --threads 1 \
+  --gpu-mode "hybrid"
+  
+
 ./build/test_qwen35moe \
   --model Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
   --prompt "Hello, explain quantum computing" \
