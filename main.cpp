@@ -230,7 +230,7 @@ static size_t utf8_safe_prefix_len_limit(const std::string& text, size_t limit) 
     return i;
 }
 
-static bool is_escape_like_char(unsigned char c) {
+static bool is_fragment_char(unsigned char c) {
     return std::isalnum(c) || c == '_' || c == '-' || c == '\\';
 }
 
@@ -247,7 +247,7 @@ static bool has_suspicious_repeated_fragment_tail(const std::string& text) {
         const std::string fragment = text.substr(text.size() - frag_len, frag_len);
         bool escape_like = true;
         for (unsigned char c : fragment) {
-            if (!is_escape_like_char(c)) {
+            if (!is_fragment_char(c)) {
                 escape_like = false;
                 break;
             }
@@ -316,8 +316,6 @@ static int sample(const std::vector<float>& logits, float temperature,
         return (int)(std::max_element(probs.begin(), probs.end()) - probs.begin());
     }
 
-    const float effective_top_p = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
-
     // Apply temperature
     for (auto& v : probs) v /= temperature;
 
@@ -337,6 +335,7 @@ static int sample(const std::vector<float>& logits, float temperature,
     if (k <= 0) k = 1;
 
     // Top-p filter
+    const float effective_top_p = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
     if (effective_top_p < 1.0f) {
         float cum = 0.0f;
         int p_cutoff = k;
@@ -489,7 +488,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
     std::vector<int32_t> recent_tokens;
     std::vector<int32_t> degeneration_window;
     static constexpr int kDegenerationWindowSize = 32;
-    static constexpr int kDegenerationMaxDominantCount = 22; // 68.75%
+    static constexpr int kDegenerationMaxDominantCount = 22; // >=22 tokens in a 32-token window => one token dominates
     OutputRenderer renderer;
     std::string visible_output;
     size_t emitted_visible_len = 0;
@@ -529,6 +528,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         if (tokenizer.is_stop_token(next_token)) {
             termination_reason = "token stop";
             termination_detail = std::to_string(next_token);
+            if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
             break;
         }
 
@@ -557,20 +557,20 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         if ((int)degeneration_window.size() == kDegenerationWindowSize) {
             std::unordered_map<int32_t, int> counts;
             int max_count = 0;
-            int dominant_tok = degeneration_window.front();
+            int dominant_token = degeneration_window.front();
             for (int32_t tok : degeneration_window) {
                 const int c = ++counts[tok];
                 if (c > max_count) {
                     max_count = c;
-                    dominant_tok = tok;
+                    dominant_token = tok;
                 }
             }
             if (max_count >= kDegenerationMaxDominantCount) {
                 termination_reason = "degeneration";
-                termination_detail = "window dominated by token " + std::to_string(dominant_tok);
+                termination_detail = "window dominated by token " + std::to_string(dominant_token);
                 if (verbose) {
                     fprintf(stderr, "\n[main] Degeneration guard: token %d dominates recent %d-token window (%d/%d); stopping early\n",
-                            dominant_tok, kDegenerationWindowSize, max_count, kDegenerationWindowSize);
+                            dominant_token, kDegenerationWindowSize, max_count, kDegenerationWindowSize);
                 }
                 break;
             }
