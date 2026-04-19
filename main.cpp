@@ -47,6 +47,18 @@ static int sample(const std::vector<float>& logits, float temperature, float top
 
     // Apply repetition / presence penalties in logit space.
     std::vector<float> probs(logits.begin(), logits.end());
+
+    // --- 新增：重复惩罚 (Repetition Penalty) ---
+    // 设定一个惩罚系数，例如 1.1
+    const float penalty = 1.1f;
+    for (int32_t tok : recent_tokens) {
+        if (probs[tok] > 0) {
+            probs[tok] /= penalty; // 如果 logit 是正数，减小它
+        } else {
+            probs[tok] *= penalty; // 如果 logit 是负数，使其更负
+        }
+    }
+    
     if (temperature <= 0.0f) {
         return (int)(std::max_element(probs.begin(), probs.end()) - probs.begin());
     }
@@ -56,9 +68,9 @@ static int sample(const std::vector<float>& logits, float temperature, float top
 
     // Softmax
     float max_v = *std::max_element(probs.begin(), probs.end());
-    float sum = 0.0f;
+    double sum = 0.0;
     for (auto& v : probs) { v = std::exp(v - max_v); sum += v; }
-    for (auto& v : probs) v /= sum;
+    for (auto& v : probs) v /= (float)sum;
 
     // Build sorted indices
     std::vector<int> idx(n);
@@ -200,7 +212,7 @@ int main(int argc, char* argv[]) {
     int         n_threads    = 1;
     int         ctx_size     = 1024;
     bool        use_chat     = true;
-    bool        verbose      = false;
+    bool        verbose      = true;
     bool        repl_mode    = false;
     GpuMode     gpu_mode     = GpuMode::Off;
     uint64_t    rng_seed     = std::random_device{}(); // random by default
