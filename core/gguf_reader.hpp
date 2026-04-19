@@ -1,4 +1,3 @@
-// GGUF 文件读取器 — RAII 管理文件生命周期
 #ifndef FUNASR_CORE_GGUF_READER_HPP
 #define FUNASR_CORE_GGUF_READER_HPP
 
@@ -29,12 +28,8 @@ public:
 
     // ===== 允许移动 =====
     GGUFReader(GGUFReader&& other) noexcept
-        : gctx_(other.gctx_)
-        , ctx_(other.ctx_)
-        , gpu_buf_(other.gpu_buf_)
-        , uploaded_backend_(other.uploaded_backend_)
-        , path_(std::move(other.path_))
-        , missing_(std::move(other.missing_))
+        :gctx_(other.gctx_), ctx_(other.ctx_), gpu_buf_(other.gpu_buf_),
+        uploaded_backend_(other.uploaded_backend_), path_(std::move(other.path_)), missing_(std::move(other.missing_))
     {
         other.gctx_ = nullptr;
         other.ctx_  = nullptr;
@@ -60,19 +55,17 @@ public:
     }
 
     // ============================================================
-    // 打开 GGUF 文件
-    // 分配内存并读取 tensor 数据到 ggml_context（默认 no_alloc=false）
+    // 打开 GGUF 文件, 分配内存并读取 tensor 数据到 ggml_context（默认 no_alloc=false）
     // ============================================================
     bool open(const std::string& path) {
-        return open_impl(path, /* no_alloc = */ false);
+        return open_impl(path, false);
     }
 
     // ============================================================
-    // 打开 GGUF 文件（no_alloc=true）
-    // 仅加载 metadata + tensor 信息，不在 CPU 分配权重数据
+    // 打开 GGUF 文件（no_alloc=true）, 仅加载 metadata + tensor 信息，不在 CPU 分配权重数据
     // ============================================================
     bool open_no_alloc(const std::string& path) {
-        return open_impl(path, /* no_alloc = */ true);
+        return open_impl(path, true);
     }
 
     // ============================================================
@@ -172,7 +165,8 @@ public:
      */
     bool upload_to_backend(ggml_backend_t backend) {
         // 检查上下文和后端是否有效
-        if (!ctx_ || !gctx_ || !backend) return false;
+        if (!ctx_ || !gctx_ || !backend) 
+            return false;
         
         // 检查是否已经上传到其他后端
         if (gpu_buf_) {
@@ -226,8 +220,7 @@ public:
             const size_t file_offset = data_offset + tensor_offset;
 
             // 检查偏移量是否有效并定位文件指针
-            if (file_offset > static_cast<size_t>(std::numeric_limits<off_t>::max()) ||
-                fseeko(f, static_cast<off_t>(file_offset), SEEK_SET) != 0) {
+            if (file_offset > static_cast<size_t>(std::numeric_limits<off_t>::max()) || fseeko(f, static_cast<off_t>(file_offset), SEEK_SET) != 0) {
                 printf("[GGUFReader] ERROR: seek failed for tensor '%s'\n", name);
                 ok = false;
                 break;
@@ -297,10 +290,10 @@ public:
     // ============================================================
     // 查询接口
     // ============================================================
-    bool is_open()                          const { return gctx_ != nullptr && ctx_ != nullptr; }
-    struct gguf_context* gguf_ctx()         const { return gctx_; }
-    struct ggml_context* ggml_ctx()         const { return ctx_; }
-    const std::string& path()               const { return path_; }
+    bool is_open() const { return gctx_ != nullptr && ctx_ != nullptr; }
+    struct gguf_context* gguf_ctx() const { return gctx_; }
+    struct ggml_context* ggml_ctx() const { return ctx_; }
+    const std::string& path() const { return path_; }
 
     int tensor_count() const {
         return gctx_ ? gguf_get_n_tensors(gctx_) : 0;
@@ -314,7 +307,7 @@ public:
     // 错误追踪
     // ============================================================
     const std::vector<std::string>& missing_tensors() const { return missing_; }
-    bool has_errors()                                 const { return !missing_.empty(); }
+    bool has_errors() const { return !missing_.empty(); }
 
     // 清除错误记录（在开始新一轮加载前调用）
     void clear_errors() { missing_.clear(); }
@@ -332,13 +325,16 @@ public:
     }
 
 private:
-    static constexpr size_t kUploadStagingBytes = 64u * 1024u * 1024u;
-    struct gguf_context* gctx_ = nullptr;  // GGUF metadata (keys, tensor info)
-    struct ggml_context* ctx_  = nullptr;  // GGML tensor data (weights in memory)
+    std::string path_{""};
+    // require_tensor 失败时记录
+    std::vector<std::string> missing_;     
+    // GGUF metadata (keys, tensor info)
+    struct gguf_context* gctx_ = nullptr;  
+    // GGML tensor data (weights in memory)
+    struct ggml_context* ctx_  = nullptr;  
     ggml_backend_buffer_t gpu_buf_ = nullptr;
     ggml_backend_t uploaded_backend_ = nullptr;
-    std::string path_;
-    std::vector<std::string> missing_;     // require_tensor 失败时记录
+    static constexpr size_t kUploadStagingBytes = 64u * 1024u * 1024u;
 };
 
 #endif

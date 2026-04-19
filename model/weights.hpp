@@ -1,16 +1,8 @@
-
-// 设计原则：
-//   1. 每个结构体只包含 ggml_tensor* 指针，不管理生命周期
-//   2. 指针的有效性由 GGUFReader 的生命周期保证
-//   3. is_valid() 检查全部指针非空，一次性报告完整性
-//   4. 字段命名统一：组件_角色_后缀 (如 attn_q_w)
-//
 // 下面是使用Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf模型的参数：
 // tensors:
 //     token_embd.weight	[2048, 248320]	Q5_K
 //     output.weight	[2048, 248320]	Q6_K
 //     output_norm.weight	[2048]	F32
-
 //     blk.*，*是0/1/2/4/5/6/8/9/10/12/13/14/17/18/20/21/22/24/25/26/28/29/30/32/33/34/36/37/38时是下面的参数：
 //     blk
 //         blk.0
@@ -60,11 +52,13 @@
 #include <vector>
 #include <cstdio>
 
+// 判断某层是否为 Attention 层（每 4 层一个，index % 4 == 3）
+inline bool is_attn_layer(int idx) { return (idx % 4) == 3; }
+
 // ============================================================
-//
+// 模型文件中每层的权重结构
 // ============================================================
 struct Qwen35moeLayer {
-    // normalization
     struct ggml_tensor * attn_k          = nullptr;
     struct ggml_tensor * attn_k_norm     = nullptr;
     struct ggml_tensor * attn_norm       = nullptr;
@@ -74,13 +68,11 @@ struct Qwen35moeLayer {
     struct ggml_tensor * attn_q_norm     = nullptr;
     struct ggml_tensor * attn_v          = nullptr;
     
-    // ff MoE
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
   
-    // ff shared expert (shexp)
     struct ggml_tensor * ffn_down_shexp     = nullptr;
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
@@ -96,10 +88,6 @@ struct Qwen35moeLayer {
     
     struct ggml_tensor * post_attention_norm = nullptr;
     struct ggml_tensor * attn_output        = nullptr;
-
-    bool is_valid() const {
-        return true;
-    }
 };
 
 // ============================================================
@@ -112,17 +100,24 @@ struct Qwen35moeWeights {
     ggml_tensor* output_norm = nullptr;
 
     bool is_valid() const {
-        if (!token_embd || !output || !output_norm)
-            return false;
-        for (const auto& layer : layers) {
-            if (!layer.is_valid()) 
-                return false;
+        bool layer_ok = true;
+        size_t layer_count = layers.size();
+        for (size_t i = 0; i < layer_count; i++) {
+            const Qwen35moeLayer& lyr = layers[i];
+            if (is_attn_layer(i)) {
+                bool ok = lyr.attn_q && lyr.attn_k && lyr.attn_v && lyr.attn_output;
+                if (!ok) layer_ok = false;
+            } else {
+                bool ok = lyr.attn_qkv && lyr.attn_gate && lyr.ssm_out;
+                if (!ok) layer_ok = false;
+            }
         }
-        return true;
-    }
+        if (false == layer_ok) {
+            printf("[Loader] ERROR: one or more layers are missing required tensors\n");
+            return false;
+        }
 
-    int tensor_count() const {
-        return 0;
+        return true;
     }
 };
 

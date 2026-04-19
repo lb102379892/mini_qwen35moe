@@ -43,8 +43,6 @@
 // ============================================================
 // Helpers
 // ============================================================
-
-static inline bool is_attn_layer(int il) { return (il % 4) == 3; }
 // Metadata-only ggml contexts for backend tensor descriptors (not tensor payloads).
 static constexpr size_t kWeightsCtxBytes = 64u * 1024u * 1024u;
 static constexpr size_t kStagingBufferBytes = 64u * 1024u * 1024u;
@@ -61,10 +59,10 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x,
 // InferenceEngine — constructor / destructor
 // ============================================================
 
-InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader,
-                                 int n_threads, int max_seq_len, GpuMode gpu_mode)
+InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader, int n_threads, int max_seq_len, 
+    GpuMode gpu_mode) 
     : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len),
-      gpu_mode_(gpu_mode) {
+    gpu_mode_(gpu_mode) {
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
         fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");

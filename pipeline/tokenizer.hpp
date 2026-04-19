@@ -198,14 +198,6 @@ public:
     }
 
     // ============================================================
-    // Encode a pre-formatted chat prompt (already includes special tokens as text)
-    // Delegates to encode() which handles special tokens via dynamic lookup.
-    // ============================================================
-    std::vector<int> encode_special(const std::string& text) const {
-        return encode(text);
-    }
-
-    // ============================================================
     // Decode token IDs → text
     // ============================================================
     std::string decode(const std::vector<int>& ids) const {
@@ -248,28 +240,12 @@ public:
     // ============================================================
     // Build chat-format prompt for Qwen3.5
     // ============================================================
-    std::string make_chat_prompt(const std::string& user_msg,
-                                  const std::string& system_msg = "",
-                                  bool enable_thinking = false) const {
-        std::string templated = render_chat_template(user_msg, system_msg, enable_thinking);
-        if (!templated.empty()) {
-            return templated;
-        }
-
+    std::string make_chat_prompt(const std::string& user_msg) const {
         std::string prompt;
         std::stringstream ss;
         if (im_start_id_ >= 0) {
-            if (!system_msg.empty()) {
-                ss << "<|im_start|>system\n" << system_msg << "<|im_end|>\n";
-            }
             ss << "<|im_start|>user\n" << user_msg << "<|im_end|>\n";
             ss << "<|im_start|>assistant\n";
-            if (enable_thinking) {
-                ss << "<think>\n";
-            } 
-            // else {
-            //     ss << "<think>\n\n</think>\n\n";
-            // }
             prompt = ss.str();
         } else {
             // Fallback: plain prompt
@@ -322,40 +298,6 @@ private:
         std::string role;
         std::string content;
     };
-
-    std::string render_chat_template(const std::string& user_msg,
-                                     const std::string& system_msg,
-                                     bool enable_thinking) const {
-        if (chat_template_.empty()) return "";
-        if (chat_template_.find("messages") == std::string::npos) return "";
-        if (chat_template_.find("<|im_start|>") == std::string::npos ||
-            chat_template_.find("<|im_end|>") == std::string::npos) {
-            return "";
-        }
-
-        std::vector<ChatMessage> messages;
-        if (!system_msg.empty()) {
-            messages.push_back({"system", system_msg});
-        }
-        messages.push_back({"user", user_msg});
-
-        std::stringstream ss;
-        for (const auto& msg : messages) {
-            ss << "<|im_start|>" << msg.role << "\n"
-               << msg.content << "<|im_end|>\n";
-        }
-
-        if (chat_template_.find("add_generation_prompt") != std::string::npos ||
-            chat_template_.find("<|im_start|>assistant") != std::string::npos) {
-            ss << "<|im_start|>assistant\n";
-            if (chat_template_.find("enable_thinking") != std::string::npos) {
-                if (enable_thinking) {
-                    ss << "<think>\n";
-                }
-            }
-        }
-        return ss.str();
-    }
 
     // ============================================================
     // GPT-2 byte-to-unicode mapping

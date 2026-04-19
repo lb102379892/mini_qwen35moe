@@ -49,9 +49,7 @@ public:
         // 根据GPU模式选择打开方式
         // Off模式：直接打开并分配内存
         // Hybrid/Full模式：仅加载元数据，不分配内存
-        const bool ok = (gpu_mode == GpuMode::Off)
-            ? reader_->open(model_path)
-            : reader_->open_no_alloc(model_path);
+        const bool ok = (gpu_mode == GpuMode::Off) ? reader_->open(model_path) : reader_->open_no_alloc(model_path);
         
         // 处理打开失败的情况
         if (!ok) {
@@ -74,20 +72,20 @@ public:
         return true;
     }
 
-    bool                       is_ready()   const { return ready_; }
-    const std::string&         last_error() const { return last_error_; }
-    const ModelConfig&         config()     const { return model_->config; }
+    bool is_ready() const { return ready_; }
+    const std::string& last_error() const { return last_error_; }
+    const ModelConfig& config() const { return model_->config; }
     // Expose the full model for inference engine
-    Qwen35moeModel*            model()            { return model_.get(); }
-    const Qwen35moeModel*      model()      const { return model_.get(); }
-    GGUFReader*                reader()            { return reader_.get(); }
-    const GGUFReader*          reader()      const { return reader_.get(); }
+    Qwen35moeModel* model() { return model_.get(); }
+    const Qwen35moeModel* model() const { return model_.get(); }
+    GGUFReader* reader() { return reader_.get(); }
+    const GGUFReader* reader() const { return reader_.get(); }
 
 private:
-    std::unique_ptr<GGUFReader>      reader_;
-    std::unique_ptr<Qwen35moeModel>  model_;
-    bool        ready_      = false;
-    std::string last_error_;
+    std::unique_ptr<GGUFReader> reader_ = nullptr;
+    std::unique_ptr<Qwen35moeModel> model_ = nullptr;
+    bool ready_ = false;
+    std::string last_error_ = "";
 };
 
 #endif // FUNASR_PIPELINE_RECOGNIZER_HPP

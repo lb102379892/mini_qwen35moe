@@ -26,8 +26,8 @@ struct ggml_context;
 struct ggml_cgraph;
 struct ggml_tensor;
 struct ggml_gallocr;
-typedef struct ggml_gallocr * ggml_gallocr_t;
 struct ggml_backend;
+typedef struct ggml_gallocr * ggml_gallocr_t;
 typedef struct ggml_backend * ggml_backend_t;
 
 enum class GpuMode {
@@ -39,21 +39,17 @@ enum class GpuMode {
 class InferenceEngine {
 public:
     // model must outlive this object
-    explicit InferenceEngine(Qwen35moeModel& model, GGUFReader* reader = nullptr,
-                             int n_threads = 4, int max_seq_len = 2048,
-                             GpuMode gpu_mode = GpuMode::Off);
+    explicit InferenceEngine(Qwen35moeModel& model, GGUFReader* reader = nullptr, int n_threads = 4, int max_seq_len = 2048, 
+        GpuMode gpu_mode = GpuMode::Off);
+        
     ~InferenceEngine();
 
     // Not copyable
     InferenceEngine(const InferenceEngine&) = delete;
     InferenceEngine& operator=(const InferenceEngine&) = delete;
 
-    // Run forward pass.
-    // First call: pass the full prompt tokens → processes all of them, returns
-    //             logits for the last token.
-    // Subsequent calls: pass exactly one new token → uses cached SSM/KV state,
-    //                   returns logits for that token.
-    // Returns empty vector on error.
+    // First call: pass the full prompt tokens → processes all of them, returns logits for the last token.
+    // Subsequent calls: pass exactly one new token → uses cached SSM/KV state, returns logits for that token.
     std::vector<float> forward(const std::vector<int32_t>& tokens);
 
     // Reset all cached state (SSM conv, SSM recurrent, KV cache) and position
@@ -152,8 +148,7 @@ private:
     // X: ffn_in F32 [n_embd, n_tokens] column-major
     // Results written to moe_routes_[il].
     // ---------------------------------------------------------------
-    void compute_moe_routing_cpu(const float* W, const float* X,
-                                  int il, int n_tokens);
+    void compute_moe_routing_cpu(const float* W, const float* X, int il, int n_tokens);
 
     // ---------------------------------------------------------------
     // Per-layer execution helpers
@@ -161,23 +156,19 @@ private:
     // ---------------------------------------------------------------
 
     // Token embedding lookup: returns [n_embd * n_tokens] F32
-    std::vector<float> exec_token_embd(const std::vector<int32_t>& tokens,
-                                        int n_tokens);
+    std::vector<float> exec_token_embd(const std::vector<int32_t>& tokens, int n_tokens);
 
     // attn_norm(cur) + attn-or-SSM sub-layer.
     // Handles KV cache / SSM state I/O internally.
     // Returns attn/SSM output [n_embd * n_tokens] F32 (no residual).
-    std::vector<float> exec_attn_or_ssm(const std::vector<float>& cur,
-                                         int il, int n_tokens, int pos);
+    std::vector<float> exec_attn_or_ssm(const std::vector<float>& cur, int il, int n_tokens, int pos);
 
     // RMS norm + weight multiply: returns [n_embd * n_tokens] F32
-    std::vector<float> exec_rms_norm(const std::vector<float>& cur,
-                                      ggml_tensor* norm_weight, int n_tokens);
+    std::vector<float> exec_rms_norm(const std::vector<float>& cur, ggml_tensor* norm_weight, int n_tokens);
 
     // MoE FFN using CPU-precomputed routing in moe_routes_[il].
     // Returns [n_embd * n_tokens] F32.
-    std::vector<float> exec_moe_ffn(const std::vector<float>& ffn_in,
-                                     int il, int n_tokens);
+    std::vector<float> exec_moe_ffn(const std::vector<float>& ffn_in, int il, int n_tokens);
 
     // final_norm(cur[last_token]) + lm_head → logits [vocab_size] F32
     std::vector<float> exec_lm_head(const std::vector<float>& cur, int n_tokens);
@@ -185,14 +176,9 @@ private:
     // ---------------------------------------------------------------
     // Sub-graph builders (called from exec_attn_or_ssm)
     // ---------------------------------------------------------------
-    ggml_tensor* build_attn_layer(ggml_context* ctx, ggml_cgraph* gf,
-                                   ggml_tensor* cur, ggml_tensor* inp_pos,
-                                   ggml_tensor* kq_mask, int il,
-                                   int n_tokens, int pos);
+    ggml_tensor* build_attn_layer(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* inp_pos, ggml_tensor* kq_mask, int il, int n_tokens, int pos);
 
-    ggml_tensor* build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf,
-                                  ggml_tensor* cur, int il,
-                                  int n_tokens, int pos);
+    ggml_tensor* build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* cur, int il, int n_tokens, int pos);
 };
 
 #endif // QWEN35MOE_PIPELINE_INFERENCE_HPP
