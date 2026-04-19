@@ -418,28 +418,16 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
     GGML_UNUSED(max_tensor_size);
 }
 
-/**
- * @brief 检查 CPU 后端设备是否支持指定的操作
- * 
- * 该函数用于判断 CPU 后端是否能够执行给定的操作。它会根据操作类型和
- * 操作数的类型来进行判断，确保 CPU 后端能够正确处理该操作。
- * 
- * @param dev CPU 后端设备
- * @param op  要检查的操作张量，包含操作类型和操作数
- * @return bool 如果 CPU 后端支持该操作，返回 true；否则返回 false
- */
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    const struct ggml_tensor * src0 = op->src[0];  // 第一个操作数
-    const struct ggml_tensor * src1 = op->src[1];  // 第二个操作数
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
 
-    // 这些操作是纯内存操作，CPU 总是支持
-    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || 
-        op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
 
-    // 检查额外的缓冲区类型
-    // 注意：为了减少开销，只检查前 4 个源操作数的额外缓冲区类型，必要时可以增加
+    // check extra buffer types
+    // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
@@ -448,11 +436,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
-    // 根据具体操作类型进行检查
     switch (op->op) {
-        case GGML_OP_CPY:      // 复制操作
-        case GGML_OP_SET_ROWS: // 设置行操作
-            // 不支持这些量化类型，因为缺少 from_float 类型特性
+        case GGML_OP_CPY:
+        case GGML_OP_SET_ROWS:
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&
@@ -460,41 +446,27 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_XS  &&
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
-                op->type != GGML_TYPE_IQ1_M;
-        
-        case GGML_OP_MUL_MAT:  // 矩阵乘法操作
-            // 第二个操作数必须是 F32 类型，或者与第一个操作数的向量点积类型匹配
+                op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
-        
-        case GGML_OP_SOFT_MAX_BACK: { // SoftMax 反向操作
-            // 两个输入操作数都必须是 F32 类型
+        case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
             }
             float max_bias = 0.0f;
-            // 从操作参数中获取 max_bias 值
+
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-            // 只支持 max_bias 为 0.0 的情况
+
             return max_bias == 0.0f;
         }
-        
-        case GGML_OP_IM2COL_BACK:  // 图像到列的反向操作
-            // 两个输入操作数都必须是 F32 类型
+        case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
-        
-        case GGML_OP_GET_ROWS_BACK: // 获取行的反向操作
-            // 输入操作数必须是 F32 或 F16 类型
+        case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
-        
-        case GGML_OP_OUT_PROD:  // 外积操作
-            // 第一个操作数可以是 F32 类型，或者是量化类型且维度匹配
-            // 第二个操作数和输出必须是 F32 类型
-            return (src0->type == GGML_TYPE_F32 || 
-                    (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
+        case GGML_OP_OUT_PROD:
+            return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-        
         default:
-            // 其他操作默认支持
             return true;
     }
 }

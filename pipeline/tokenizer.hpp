@@ -266,9 +266,10 @@ public:
             ss << "<|im_start|>assistant\n";
             if (enable_thinking) {
                 ss << "<think>\n";
-            } else {
-                ss << "<think>\n\n</think>\n\n";
-            }
+            } 
+            // else {
+            //     ss << "<think>\n\n</think>\n\n";
+            // }
             prompt = ss.str();
         } else {
             // Fallback: plain prompt

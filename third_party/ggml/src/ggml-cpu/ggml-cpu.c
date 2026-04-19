@@ -217,6 +217,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F16,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q1_0] = {
+        .from_float               = quantize_row_q1_0,
+        .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -2540,7 +2546,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         case GGML_SCHED_PRIO_LOW:      policy = SCHED_OTHER; p.sched_priority = 0;  break;
         case GGML_SCHED_PRIO_NORMAL:   policy = SCHED_OTHER; p.sched_priority = 0;  break;
         case GGML_SCHED_PRIO_MEDIUM:   policy = SCHED_FIFO;  p.sched_priority = 40; break;
-        case :     policy = SCHED_FIFO;  p.sched_priority = 80; break;
+        case GGML_SCHED_PRIO_HIGH:     policy = SCHED_FIFO;  p.sched_priority = 80; break;
         case GGML_SCHED_PRIO_REALTIME: policy = SCHED_FIFO;  p.sched_priority = 90; break;
     }
 
