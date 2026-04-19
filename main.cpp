@@ -45,31 +45,40 @@ static int sample(const std::vector<float>& logits, float temperature, float top
     const std::vector<int32_t>& recent_tokens = {}) {
     const int n = (int)logits.size();
 
-    // Apply repetition / presence penalties in logit space.
-    std::vector<float> probs(logits.begin(), logits.end());
+    // 1. 拷贝原始 Logits
+    std::vector<float> modified_logits = logits;
 
-    // --- 新增：重复惩罚 (Repetition Penalty) ---
-    // 设定一个惩罚系数，例如 1.1
+    // --- 改进：在 Logits 空间应用重复惩罚 ---
+    // 建议 penalty 设置在 1.0 到 1.2 之间，例如 1.1f
     const float penalty = 1.1f;
     for (int32_t tok : recent_tokens) {
-        if (probs[tok] > 0) {
-            probs[tok] /= penalty; // 如果 logit 是正数，减小它
+        if (tok < 0 || tok >= n) continue;
+
+        // 如果 logit > 0，缩小它（除以系数）
+        // 如果 logit <= 0，放大负值（乘以系数，使其更负）
+        if (modified_logits[tok] > 0) {
+            modified_logits[tok] /= penalty;
         } else {
-            probs[tok] *= penalty; // 如果 logit 是负数，使其更负
+            modified_logits[tok] *= penalty;
         }
     }
     
+    // 2. 处理贪婪搜索 (Greedy)
     if (temperature <= 0.0f) {
-        return (int)(std::max_element(probs.begin(), probs.end()) - probs.begin());
+        return (int)(std::max_element(modified_logits.begin(), modified_logits.end()) - modified_logits.begin());
     }
 
-    // Apply temperature
-    for (auto& v : probs) v /= temperature;
+    // 3. 应用温度缩放 (Temperature)
+    for (auto& v : modified_logits) v /= temperature;
 
-    // Softmax
-    float max_v = *std::max_element(probs.begin(), probs.end());
+    // 4. 计算 Softmax 得到概率分布
+    float max_v = *std::max_element(modified_logits.begin(), modified_logits.end());
+    std::vector<float> probs(n);
     double sum = 0.0;
-    for (auto& v : probs) { v = std::exp(v - max_v); sum += v; }
+    for (int i = 0; i < n; i++) {
+        probs[i] = std::exp(modified_logits[i] - max_v);
+        sum += probs[i];
+    }
     for (auto& v : probs) v /= (float)sum;
 
     // Build sorted indices
