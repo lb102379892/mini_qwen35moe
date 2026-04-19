@@ -351,8 +351,6 @@ private:
             if (chat_template_.find("enable_thinking") != std::string::npos) {
                 if (enable_thinking) {
                     ss << "<think>\n";
-                } else {
-                    ss << "<think>\n\n</think>\n\n";
                 }
             }
         }

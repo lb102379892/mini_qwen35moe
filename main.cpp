@@ -38,6 +38,7 @@
 #include <random>
 #include <chrono>
 #include <cctype>
+#include <unordered_map>
 
 #include "core/gguf_reader.hpp"
 #include "model/model.hpp"
@@ -206,6 +207,65 @@ static bool contains_ascii_nocase(const std::string& haystack, const std::string
     return lower_haystack.find(lower_needle) != std::string::npos;
 }
 
+static size_t utf8_safe_prefix_len_limit(const std::string& text, size_t limit) {
+    if (limit >= text.size()) return text.size();
+    if (limit == 0) return 0;
+
+    size_t i = limit;
+    while (i > 0 && ((unsigned char)text[i] & 0xC0) == 0x80) {
+        --i;
+    }
+    if (i == limit) return limit;
+    if (i == 0) return 0;
+
+    unsigned char lead = (unsigned char)text[i];
+    size_t expected = 1;
+    if ((lead & 0x80) == 0x00) expected = 1;
+    else if ((lead & 0xE0) == 0xC0) expected = 2;
+    else if ((lead & 0xF0) == 0xE0) expected = 3;
+    else if ((lead & 0xF8) == 0xF0) expected = 4;
+    else return i;
+
+    if (i + expected <= limit) return limit;
+    return i;
+}
+
+static bool is_fragment_char(unsigned char c) {
+    return std::isalnum(c) || c == '_' || c == '-' || c == '\\';
+}
+
+static bool has_suspicious_repeated_fragment_tail(const std::string& text) {
+    if (text.size() < 32) return false;
+    const size_t max_fragment_len = 8;
+    const size_t min_fragment_len = 2;
+    const size_t min_repeats = 8;
+
+    for (size_t frag_len = min_fragment_len; frag_len <= max_fragment_len; ++frag_len) {
+        const size_t need = frag_len * min_repeats;
+        if (text.size() < need) continue;
+        const size_t start = text.size() - need;
+        const std::string fragment = text.substr(text.size() - frag_len, frag_len);
+        bool escape_like = true;
+        for (unsigned char c : fragment) {
+            if (!is_fragment_char(c)) {
+                escape_like = false;
+                break;
+            }
+        }
+        if (!escape_like) continue;
+
+        bool all_match = true;
+        for (size_t pos = start; pos < text.size(); pos += frag_len) {
+            if (text.compare(pos, frag_len, fragment) != 0) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) return true;
+    }
+    return false;
+}
+
 static bool looks_like_code_request(const std::string& prompt) {
     static const char* keywords[] = {
         "代码", "示例", "服务器", "服务端", "脚本", "函数", "类", "编译", "运行",
@@ -272,15 +332,20 @@ static int sample(const std::vector<float>& logits, float temperature,
 
     // Top-k filter
     int k = (top_k > 0 && top_k < n) ? top_k : n;
+    if (k <= 0) k = 1;
 
     // Top-p filter
-    float cum = 0.0f;
-    int p_cutoff = k;
-    for (int i = 0; i < k; i++) {
-        cum += probs[idx[i]];
-        if (cum >= top_p) { p_cutoff = i + 1; break; }
+    const float effective_top_p = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
+    if (effective_top_p < 1.0f) {
+        float cum = 0.0f;
+        int p_cutoff = k;
+        for (int i = 0; i < k; i++) {
+            cum += probs[idx[i]];
+            if (cum >= effective_top_p) { p_cutoff = i + 1; break; }
+        }
+        k = std::min(k, p_cutoff);
     }
-    k = std::min(k, p_cutoff);
+    if (k <= 0) k = 1;
 
     // Sample from top-k/p
     float total = 0.0f;
@@ -350,6 +415,9 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         formatted = tokenizer.make_chat_prompt(prompt_text, system_msg, enable_thinking);
     }
     if (verbose) fprintf(stderr, "[main] Formatted prompt:%s\n", formatted.c_str());
+    const bool think_tags_in_prompt =
+        formatted.find("<think>") != std::string::npos ||
+        formatted.find("</think>") != std::string::npos;
 
     std::vector<int32_t> tokens;
     if (use_chat && tokenizer.im_start_id() >= 0) {
@@ -375,9 +443,35 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         fprintf(stderr, "[main] Prompt tokens (%zu): ", tokens.size());
         for (int t : tokens) fprintf(stderr, "%d ", t);
         fprintf(stderr, "\n");
+        fprintf(stderr, "[main] Prompt thinking tags injected: %s\n",
+                think_tags_in_prompt ? "yes" : "no");
         if (n_predict > max_new_tokens) {
             fprintf(stderr, "[main] Requested n_predict=%d but only %d tokens fit in ctx-size=%d after the prompt; generation will stop at the context limit\n",
                     n_predict, max_new_tokens, max_seq_len);
+        }
+    }
+
+    std::vector<std::string> string_stop_sequences;
+    if (use_chat) {
+        string_stop_sequences = {
+            "<|im_start|>user",
+            "<|im_start|>system",
+            "<|im_start|>assistant"
+        };
+    }
+    size_t max_stop_len = 0;
+    for (const std::string& s : string_stop_sequences) {
+        max_stop_len = std::max(max_stop_len, s.size());
+    }
+    const size_t stop_holdback = max_stop_len > 0 ? (max_stop_len - 1) : 0;
+    if (verbose) {
+        if (string_stop_sequences.empty()) {
+            fprintf(stderr, "[main] Active string stop sequences: (none)\n");
+        } else {
+            fprintf(stderr, "[main] Active string stop sequences (%zu):\n", string_stop_sequences.size());
+            for (const std::string& stop : string_stop_sequences) {
+                fprintf(stderr, "  - %s\n", stop.c_str());
+            }
         }
     }
 
@@ -387,10 +481,17 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
     bool first_token = true;
     int last_token = -1;
     int repeated_token_run = 0;
+    std::string termination_reason = "max tokens";
+    std::string termination_detail;
 
     // Sliding window of recently generated tokens for repetition penalty
     std::vector<int32_t> recent_tokens;
+    std::vector<int32_t> degeneration_window;
+    static constexpr int kDegenerationWindowSize = 32;
+    static constexpr int kDegenerationMaxDominantCount = 22; // >=22 tokens in a 32-token window => one token dominates
     OutputRenderer renderer;
+    std::string visible_output;
+    size_t emitted_visible_len = 0;
 
     printf("\n");
 
@@ -405,6 +506,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 
         if (logits.empty()) {
             fprintf(stderr, "\n[main] ERROR: forward() returned empty logits\n");
+            termination_reason = "error";
+            termination_detail = "empty logits";
             break;
         }
 
@@ -423,6 +526,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         }
 
         if (tokenizer.is_stop_token(next_token)) {
+            termination_reason = "token stop";
+            termination_detail = std::to_string(next_token);
             if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
             break;
         }
@@ -436,6 +541,8 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
         }
         if (repeated_token_run >= 64 ||
             (repeated_token_run >= 24 && is_single_repeated_punct_piece(decoded_piece))) {
+            termination_reason = "degeneration";
+            termination_detail = "repeated token run";
             if (verbose) {
                 fprintf(stderr, "\n[main] Degenerate repetition detected on token %d piece=\"%s\" run=%d; stopping early\n",
                         next_token, decoded_piece.c_str(), repeated_token_run);
@@ -443,10 +550,79 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
             break;
         }
 
+        degeneration_window.push_back(next_token);
+        if ((int)degeneration_window.size() > kDegenerationWindowSize) {
+            degeneration_window.erase(degeneration_window.begin());
+        }
+        if ((int)degeneration_window.size() == kDegenerationWindowSize) {
+            std::unordered_map<int32_t, int> counts;
+            int max_count = 0;
+            int dominant_token = degeneration_window.front();
+            for (int32_t tok : degeneration_window) {
+                const int c = ++counts[tok];
+                if (c > max_count) {
+                    max_count = c;
+                    dominant_token = tok;
+                }
+            }
+            if (max_count >= kDegenerationMaxDominantCount) {
+                termination_reason = "degeneration";
+                termination_detail = "window dominated by token " + std::to_string(dominant_token);
+                if (verbose) {
+                    fprintf(stderr, "\n[main] Degeneration guard: token %d dominates recent %d-token window (%d/%d); stopping early\n",
+                            dominant_token, kDegenerationWindowSize, max_count, kDegenerationWindowSize);
+                }
+                break;
+            }
+        }
+
         std::string piece = renderer.push_token(tokenizer, next_token);
         if (!piece.empty()) {
-            printf("%s", piece.c_str());
-            fflush(stdout);
+            visible_output += piece;
+            bool matched_string_stop = false;
+            size_t stop_pos = std::string::npos;
+            std::string matched_stop;
+            for (const std::string& stop : string_stop_sequences) {
+                size_t pos = visible_output.find(stop);
+                if (pos != std::string::npos && (stop_pos == std::string::npos || pos < stop_pos)) {
+                    stop_pos = pos;
+                    matched_stop = stop;
+                    matched_string_stop = true;
+                }
+            }
+
+            if (matched_string_stop) {
+                const size_t emit_until = utf8_safe_prefix_len_limit(visible_output, stop_pos);
+                if (emit_until > emitted_visible_len) {
+                    const std::string out = visible_output.substr(emitted_visible_len, emit_until - emitted_visible_len);
+                    printf("%s", out.c_str());
+                    fflush(stdout);
+                }
+                emitted_visible_len = emit_until;
+                termination_reason = "string stop";
+                termination_detail = matched_stop;
+                break;
+            }
+
+            if (has_suspicious_repeated_fragment_tail(visible_output)) {
+                termination_reason = "degeneration";
+                termination_detail = "repeated text fragment tail";
+                if (verbose) {
+                    fprintf(stderr, "\n[main] Degeneration guard: suspicious repeated text fragment tail detected; stopping early\n");
+                }
+                break;
+            }
+
+            if (visible_output.size() > stop_holdback) {
+                const size_t safe_limit = visible_output.size() - stop_holdback;
+                const size_t emit_until = utf8_safe_prefix_len_limit(visible_output, safe_limit);
+                if (emit_until > emitted_visible_len) {
+                    const std::string out = visible_output.substr(emitted_visible_len, emit_until - emitted_visible_len);
+                    printf("%s", out.c_str());
+                    fflush(stdout);
+                    emitted_visible_len = emit_until;
+                }
+            }
         }
 
         // After the first (full-prompt) pass, feed only 1 token at a time
@@ -463,13 +639,42 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer,
 
     std::string tail = renderer.finish();
     if (!tail.empty()) {
-        printf("%s", tail.c_str());
+        visible_output += tail;
+    }
+
+    if (termination_reason == "max tokens") {
+        if (n_generated >= max_new_tokens && n_generated < n_predict) {
+            termination_reason = "context limit";
+        } else if (n_generated < n_predict) {
+            termination_reason = "eos/token stop";
+        }
+    }
+
+    size_t final_emit_until = visible_output.size();
+    if (termination_reason == "string stop" && !termination_detail.empty()) {
+        size_t pos = visible_output.find(termination_detail);
+        if (pos != std::string::npos) {
+            final_emit_until = utf8_safe_prefix_len_limit(visible_output, pos);
+        }
+    }
+    if (final_emit_until > emitted_visible_len) {
+        const std::string out = visible_output.substr(emitted_visible_len, final_emit_until - emitted_visible_len);
+        printf("%s", out.c_str());
+        emitted_visible_len = final_emit_until;
     }
     printf("\n");
 
     if (verbose && n_generated >= max_new_tokens && n_generated < n_predict) {
         fprintf(stderr, "[main] Context limit reached after %d generated tokens (ctx-size=%d)\n",
                 n_generated, max_seq_len);
+    }
+    if (verbose) {
+        if (!termination_detail.empty()) {
+            fprintf(stderr, "[main] Termination reason: %s (%s)\n",
+                    termination_reason.c_str(), termination_detail.c_str());
+        } else {
+            fprintf(stderr, "[main] Termination reason: %s\n", termination_reason.c_str());
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -683,6 +888,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[main] RNG seed: %llu\n", (unsigned long long)rng_seed);
         fprintf(stderr, "[main] Sampling params: temp=%.3f top_p=%.3f top_k=%d repeat_penalty=%.3f presence_penalty=%.3f repeat_last_n=%d\n",
                 temperature, top_p, top_k, repeat_penalty, presence_penalty, repeat_last_n);
+        fprintf(stderr, "[main] Chat prompt mode: %s\n", use_chat ? "enabled" : "disabled");
         if (temperature <= 0.0f && !user_set_presence_penalty) {
             fprintf(stderr, "[main] Greedy mode: default presence penalty disabled for apples-to-apples comparison\n");
         }
