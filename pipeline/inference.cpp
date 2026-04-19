@@ -576,6 +576,13 @@ std::vector<float> InferenceEngine::exec_token_embd(
 
     std::vector<float> result((size_t)n_embd * n_tokens);
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
+    // 增加安全检查
+    for (float& f : result) {
+        if (std::isnan(f) || std::isinf(f)) {
+            fprintf(stderr, "[Inference] WARNING: Logits contain NaN/Inf! Resetting to 0.\n");
+            f = 0.0f;
+        }
+    }
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
