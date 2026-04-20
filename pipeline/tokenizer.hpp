@@ -124,6 +124,7 @@ public:
             const std::string& text = id_to_token_[i];
             if (kEogTokenPatterns.count(text) > 0) {
                 eog_ids_.insert(i);
+                printf("[Tokenizer] Recognized EOG pattern \"%s\" at token ID %d\n", text.c_str(), i);
             }
         }
 
@@ -288,10 +289,11 @@ private:
     static constexpr int32_t TOKEN_TYPE_CONTROL = 3;
     static constexpr int32_t TOKEN_TYPE_USER_DEFINED = 4;
     inline static const std::unordered_set<std::string> kEogTokenPatterns = {
-        "<|im_end|>",
         "<|endoftext|>",
-        "<|end_of_text|>",
-        "<|eot_id|>"
+        "<|im_end|>",
+        "<|fim_pad|>",
+        "<|repo_name|>",
+        "<|file_sep|>"
     };
 
     struct ChatMessage {
