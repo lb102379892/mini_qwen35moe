@@ -63,53 +63,31 @@ InferenceEngine::InferenceEngine(Qwen35moeModel& model, GGUFReader* reader, int 
     GpuMode gpu_mode) 
     : model_(model), reader_(reader), n_threads_(n_threads), max_seq_len_(max_seq_len),
     gpu_mode_(gpu_mode) {
-    backend_cpu_ = ggml_backend_cpu_init();
-    if (!backend_cpu_) {
-        fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
-        return;
+    if (gpu_mode_ != GpuMode::Full) {
+        backend_cpu_ = ggml_backend_cpu_init();
+        if (!backend_cpu_) {
+            fprintf(stderr, "[Inference] ERROR: failed to init CPU backend\n");
+            return;
+        }
+        ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
+        curr_backend_ = backend_cpu_;
     }
-    ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
 #ifdef QWEN35MOE_USE_CUDA
     if (gpu_mode_ != GpuMode::Off) {
-        ggml_backend_t temp_cuda_backend = ggml_backend_cuda_init(0); // device 0
-        if (!temp_cuda_backend) {
-            fprintf(stderr, "[Inference] WARNING: CUDA init failed, falling back to CPU\n");
+        backend_gpu_ = ggml_backend_cuda_init(0);
+        if (!backend_gpu_) {
             gpu_mode_ = GpuMode::Off;
         } else {
-            backend_gpu_ = temp_cuda_backend;
-            if (!reader_) {
-                fprintf(stderr, "[Inference] WARNING: reader is null in GPU mode, falling back to CPU\n");
-                ggml_backend_free(temp_cuda_backend);
-                backend_gpu_ = backend_cpu_;
-                gpu_mode_ = GpuMode::Off;
-            } else {
-                const bool load_ok = load_weights_to_backends();
-                if (!load_ok) {
-                    fprintf(stderr, "[Inference] WARNING: failed to load tensors directly to backends, falling back to CPU\n");
-                    ggml_backend_free(temp_cuda_backend);
-                    backend_gpu_ = backend_cpu_;
-                    gpu_mode_ = GpuMode::Off;
-                } else {
-                    use_gpu_ = true;
-                    if (gpu_mode_ == GpuMode::Full) {
-                        fprintf(stderr, "[Inference] CUDA backend ready (all tensors on GPU)\n");
-                    } else {
-                        fprintf(stderr, "[Inference] CUDA backend ready (hybrid: expert tensors on CPU)\n");
-                    }
-                }
-            }
+            curr_backend_ = backend_gpu_;
         }
     }
-#else
-    if (gpu_mode_ != GpuMode::Off) {
-        fprintf(stderr, "[Inference] WARNING: CUDA not compiled in, using CPU\n");
-        gpu_mode_ = GpuMode::Off;
-    }
 #endif
-    if (!use_gpu_) {
-        backend_gpu_ = backend_cpu_;
-        fprintf(stderr, "[Inference] CPU backend ready (%d threads)\n", n_threads_);
+
+    // 无论 GPU 开启与否，都必须调用加载函数来初始化 Tensor 的 Buffer
+    if (!load_weights_to_backends()) {
+        fprintf(stderr, "[Inference] ERROR: Failed to load weights to backends!\n");
     }
+
     init_state();
 }
 
@@ -130,12 +108,13 @@ InferenceEngine::~InferenceEngine() {
         ggml_free(cpu_weights_ctx_);
         cpu_weights_ctx_ = nullptr;
     }
-    if (backend_gpu_ && backend_gpu_ != backend_cpu_) {
+    if (backend_gpu_) {
         ggml_backend_free(backend_gpu_);
     }
     if (backend_cpu_) {
         ggml_backend_free(backend_cpu_);
     }
+    curr_backend_ = nullptr;
 }
 
 static bool is_expert_tensor_name(const char* name) {
@@ -151,11 +130,19 @@ static bool is_expert_tensor_name(const char* name) {
 }
 
 bool InferenceEngine::load_weights_to_backends() {
-    if (gpu_mode_ == GpuMode::Off) {
-        return true;
-    }
-    if (!reader_ || !reader_->is_open() || !backend_cpu_ || !backend_gpu_) {
+    if (!reader_ || !reader_->is_open()) {
         fprintf(stderr, "[Inference] ERROR: invalid state for direct backend loading\n");
+        return false;
+    }
+
+    if (gpu_mode_ != GpuMode::Full && !backend_cpu_) {
+        fprintf(stderr, "[Inference] ERROR: invalid state for direct cpu backend loading\n");
+        return false;
+    }
+
+    // 只有在 GPU 模式开启时才检查 backend_gpu_
+    if (gpu_mode_ != GpuMode::Off && !backend_gpu_) {
+        fprintf(stderr, "[Inference] ERROR: invalid state for direct gpu backend loading\n");
         return false;
     }
 
@@ -259,8 +246,8 @@ bool InferenceEngine::load_weights_to_backends() {
             return false;
         }
 
-        const bool to_gpu = (gpu_mode_ == GpuMode::Full) ||
-                            (gpu_mode_ == GpuMode::Hybrid && !is_expert_tensor_name(name));
+        const bool to_gpu = (gpu_mode_ == GpuMode::Full) || 
+            (gpu_mode_ == GpuMode::Hybrid && !is_expert_tensor_name(name));
         ggml_context* target_ctx = to_gpu ? gpu_weights_ctx_ : cpu_weights_ctx_;
         ggml_tensor* dst = ggml_new_tensor(target_ctx, ref.src->type, ggml_n_dims(ref.src), ref.src->ne);
         if (!dst) {
@@ -274,6 +261,7 @@ bool InferenceEngine::load_weights_to_backends() {
         else cpu_items.push_back(li);
     }
 
+    // 分配缓冲区 
     if (!gpu_items.empty()) {
         gpu_weights_buf_ = ggml_backend_alloc_ctx_tensors(gpu_weights_ctx_, backend_gpu_);
         if (!gpu_weights_buf_) {
@@ -399,13 +387,14 @@ void InferenceEngine::reset_state() {
 // ============================================================
 std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) {
     if (tokens.empty()) return {};
-    if (!backend_gpu_ || !backend_cpu_) return {};
+    if (!backend_gpu_ && !backend_cpu_) return {};
 
     const auto& cfg  = model_.config.qwen35moe;
     const int n_tokens   = (int)tokens.size();
     const int pos        = pos_;
     const int n_layer    = (int)cfg.block_count;
     const int n_embd     = (int)cfg.embedding_length;
+    const int n_expert = (int)cfg.expert_count;
 
     // Safecheck: don't exceed the KV cache capacity
     if (pos + n_tokens > max_seq_len_) {
@@ -466,18 +455,57 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
             fprintf(stderr, "[Inference] ERROR: layer %d missing ffn_gate_inp (gate weight tensor)\n", il);
             return {};
         }
-        const int n_expert = (int)cfg.expert_count;
-        const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
-        if (!gate_w) {
-            auto& gate_cache = moe_gate_inp_cpu_cache_[il];
-            if (gate_cache.empty()) {
-                const size_t gate_count = (size_t)n_embd * n_expert;
-                gate_cache.resize(gate_count);
-                ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_cache.data(), 0, gate_count * sizeof(float));
+        
+        // const float* gate_w = (const float*)lyr.ffn_gate_inp->data;
+        // if (!gate_w) {
+        //     auto& gate_cache = moe_gate_inp_cpu_cache_[il];
+        //     if (gate_cache.empty()) {
+        //         const size_t gate_count = (size_t)n_embd * n_expert;
+        //         gate_cache.resize(gate_count);
+        //         ggml_backend_tensor_get(lyr.ffn_gate_inp, gate_cache.data(), 0, gate_count * sizeof(float));
+        //     }
+        //     gate_w = gate_cache.data();
+        // }
+        // 获取当前层的门控权重张量
+        ggml_tensor* gate_tensor = lyr.ffn_gate_inp;
+        // 检查并填充 CPU 缓存 (只在第一次运行时执行)
+        auto& gate_cache = moe_gate_inp_cpu_cache_[il];
+        if (gate_cache.empty()) {
+            printf("-----------------------\n");
+            const size_t n_embd_expert = (size_t)n_embd * n_expert;
+            gate_cache.resize(n_embd_expert);
+            
+            if (gate_tensor->type == GGML_TYPE_F32) {
+                // 如果原本就是 F32，直接拷贝
+                printf("-----------------------1, size: %d\n", gate_cache.size());
+                ggml_backend_tensor_get(gate_tensor, gate_cache.data(), 0, n_embd_expert * sizeof(float));
+                printf("-----------------------2\n");
+            } else {
+                printf("-----------------------3\n");
+                // --- 核心修复：对量化权重进行反量化 ---
+                const ggml_type_traits* traits = ggml_get_type_traits(gate_tensor->type);
+                if (!traits || !traits->to_float) {
+                    fprintf(stderr, "[Inference] ERROR: no dequantizer for type %d\n", gate_tensor->type);
+                    return {};
+                }
+                printf("-----------------------4\n");
+
+                // 1. 获取张量的原始量化字节大小并读取
+                size_t q_nbytes = ggml_nbytes(gate_tensor);
+                std::vector<uint8_t> qdata(q_nbytes);
+                ggml_backend_tensor_get(gate_tensor, qdata.data(), 0, q_nbytes);
+                printf("-----------------------5\n");
+
+                // 2. 反量化为 float 到 gate_cache 中
+                traits->to_float(qdata.data(), gate_cache.data(), n_embd_expert);
+                printf("-----------------------6\n");
             }
-            gate_w = gate_cache.data();
         }
+
+        // 使用反量化后的 float 权重计算路由
+        const float* gate_w = gate_cache.data();
         compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
+        printf("-----------------------7\n");
 
         // 2d. MoE FFN sub-graph (selected + weights are pre-filled leaf tensors)
         std::vector<float> moe_out = exec_moe_ffn(ffn_in, il, n_tokens);
@@ -514,7 +542,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
     // CUDA get_rows currently does not support some quantized source types
     // (e.g. Q5_K). For GPU mode, fetch quantized embedding rows and
     // dequantize on CPU.
-    if (use_gpu_) {
+    if (gpu_mode_ == GpuMode::Full || gpu_mode_ == GpuMode::Hybrid) {
         const ggml_type_traits* traits = ggml_get_type_traits(embd->type);
         const ggml_to_float_t to_float = traits ? traits->to_float : nullptr;
 
@@ -558,7 +586,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
     struct ggml_tensor* out = ggml_get_rows(ctx, embd, inp);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_gpu_));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(curr_backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -572,7 +600,7 @@ std::vector<float> InferenceEngine::exec_token_embd(
             ggml_backend_tensor_set(t, tokens.data(), 0, (size_t)n_tokens * sizeof(int32_t));
     }
 
-    ggml_backend_graph_compute(backend_gpu_, gf);
+    ggml_backend_graph_compute(curr_backend_, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
@@ -650,7 +678,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
     }
     ggml_build_forward_expand(gf, attn_out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_gpu_));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(curr_backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -769,7 +797,7 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
         }
     }
 
-    ggml_backend_graph_compute(backend_gpu_, gf);
+    ggml_backend_graph_compute(curr_backend_, gf);
 
     // Read output BEFORE ggml_free (data lives in galloc buffer)
     std::vector<float> result((size_t)n_embd * n_tokens);
@@ -856,7 +884,7 @@ std::vector<float> InferenceEngine::exec_rms_norm(
     out = ggml_mul(ctx, out, norm_w);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_gpu_));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(curr_backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -869,7 +897,7 @@ std::vector<float> InferenceEngine::exec_rms_norm(
             ggml_backend_tensor_set(t, cur_data.data(), 0, (size_t)n_embd * n_tokens * sizeof(float));
     }
 
-    ggml_backend_graph_compute(backend_gpu_, gf);
+    ggml_backend_graph_compute(curr_backend_, gf);
 
     std::vector<float> result((size_t)n_embd * n_tokens);
     ggml_backend_tensor_get(out, result.data(), 0, result.size() * sizeof(float));
@@ -1103,7 +1131,7 @@ std::vector<float> InferenceEngine::exec_lm_head(
     struct ggml_tensor* logits = ggml_mul_mat(ctx, w.output, normed);
     ggml_build_forward_expand(gf, logits);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_gpu_));
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(curr_backend_));
     if (!galloc || !ggml_gallocr_alloc_graph(galloc, gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(ctx);
@@ -1119,7 +1147,7 @@ std::vector<float> InferenceEngine::exec_lm_head(
         }
     }
 
-    ggml_backend_graph_compute(backend_gpu_, gf);
+    ggml_backend_graph_compute(curr_backend_, gf);
 
     std::vector<float> result(vocab_sz);
     ggml_backend_tensor_get(logits, result.data(), 0, (size_t)vocab_sz * sizeof(float));

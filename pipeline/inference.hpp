@@ -62,13 +62,13 @@ private:
     int n_threads_;
     int max_seq_len_;
 
+    ggml_backend_t   curr_backend_  = nullptr;
     ggml_backend_t   backend_gpu_  = nullptr;
     ggml_backend_t   backend_cpu_  = nullptr;
     ggml_backend_buffer_t gpu_weights_buf_ = nullptr;
     ggml_backend_buffer_t cpu_weights_buf_ = nullptr;
     ggml_context* gpu_weights_ctx_ = nullptr;
     ggml_context* cpu_weights_ctx_ = nullptr;
-    bool             use_gpu_  = false;
     GpuMode          gpu_mode_ = GpuMode::Off;
 
     // ---------------------------------------------------------------

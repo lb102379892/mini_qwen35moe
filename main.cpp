@@ -33,6 +33,7 @@
 #include <cctype>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include "core/gguf_reader.hpp"
 #include "model/model.hpp"
 #include "model/loader.hpp"
@@ -51,17 +52,31 @@ static int sample(const std::vector<float>& logits, float temperature, float top
     // --- 改进：在 Logits 空间应用重复惩罚 ---
     // 建议 penalty 设置在 1.0 到 1.2 之间，例如 1.1f
     const float penalty = 1.1f;
-    for (int32_t tok : recent_tokens) {
-        if (tok < 0 || tok >= n) continue;
-
-        // 如果 logit > 0，缩小它（除以系数）
-        // 如果 logit <= 0，放大负值（乘以系数，使其更负）
-        if (modified_logits[tok] > 0) {
-            modified_logits[tok] /= penalty;
-        } else {
-            modified_logits[tok] *= penalty;
-        }
+    const int penalty_window = 64; // 只参考最近 64 个 token
+    // 使用 std::unordered_set 确保每个 token 只被惩罚一次
+    std::unordered_set<int32_t> seen;
+    int start_idx = std::max(0, (int)recent_tokens.size() - penalty_window);
+    for (int i = start_idx; i < (int)recent_tokens.size(); i++) {
+        seen.insert(recent_tokens[i]);
     }
+
+    for (int32_t tok : seen) {
+        if (tok < 0 || tok >= n) continue;
+        if (modified_logits[tok] > 0) modified_logits[tok] /= penalty;
+        else modified_logits[tok] *= penalty;
+    }
+
+    // for (int32_t tok : recent_tokens) {
+    //     if (tok < 0 || tok >= n) continue;
+
+    //     // 如果 logit > 0，缩小它（除以系数）
+    //     // 如果 logit <= 0，放大负值（乘以系数，使其更负）
+    //     if (modified_logits[tok] > 0) {
+    //         modified_logits[tok] /= penalty;
+    //     } else {
+    //         modified_logits[tok] *= penalty;
+    //     }
+    // }
     
     // 2. 处理贪婪搜索 (Greedy)
     if (temperature <= 0.0f) {
