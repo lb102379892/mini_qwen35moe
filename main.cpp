@@ -41,94 +41,141 @@
 #include "pipeline/tokenizer.hpp"
 #include "pipeline/inference.hpp"
 
-// Temperature + top-k + top-p sampling with optional repetition penalty
 static int sample(const std::vector<float>& logits, float temperature, float top_p, int top_k, std::mt19937& rng,
-    const std::vector<int32_t>& recent_tokens = {}) {
+    const std::vector<int32_t>& recent_tokens, BPETokenizer& tokenizer) {
+    
     const int n = (int)logits.size();
-
-    // 1. 拷贝原始 Logits
     std::vector<float> modified_logits = logits;
 
-    // --- 改进：在 Logits 空间应用重复惩罚 ---
-    // 建议 penalty 设置在 1.0 到 1.2 之间，例如 1.1f
-    const float penalty = 1.1f;
-    const int penalty_window = 64; // 只参考最近 64 个 token
-    // 使用 std::unordered_set 确保每个 token 只被惩罚一次
-    std::unordered_set<int32_t> seen;
-    int start_idx = std::max(0, (int)recent_tokens.size() - penalty_window);
-    for (int i = start_idx; i < (int)recent_tokens.size(); i++) {
-        seen.insert(recent_tokens[i]);
-    }
-
-    for (int32_t tok : seen) {
-        if (tok < 0 || tok >= n) continue;
-        if (modified_logits[tok] > 0) modified_logits[tok] /= penalty;
-        else modified_logits[tok] *= penalty;
-    }
-
-    // for (int32_t tok : recent_tokens) {
-    //     if (tok < 0 || tok >= n) continue;
-
-    //     // 如果 logit > 0，缩小它（除以系数）
-    //     // 如果 logit <= 0，放大负值（乘以系数，使其更负）
-    //     if (modified_logits[tok] > 0) {
-    //         modified_logits[tok] /= penalty;
-    //     } else {
-    //         modified_logits[tok] *= penalty;
-    //     }
-    // }
+    // ==========================================================
+    // 1. 三维复合惩罚引擎 (专治各类复读机)
+    // ==========================================================
+    const float rep_penalty   = 1.15f;  // 乘法惩罚：基础压制
+    const float freq_penalty  = 0.05f;  // 频率惩罚：出现越多，扣分越狠
+    const float pres_penalty  = 0.05f;  // 存在惩罚：只要出现过，就扣基础分
+    const int penalty_window  = 256;    // 恢复 256 的大窗口，确保它能记住很久之前说过的词
     
-    // 2. 处理贪婪搜索 (Greedy)
+    if (!recent_tokens.empty()) {
+        std::unordered_map<int32_t, int> counts;
+        int start_idx = std::max(0, (int)recent_tokens.size() - penalty_window);
+        for (int i = start_idx; i < (int)recent_tokens.size(); i++) {
+            counts[recent_tokens[i]]++;
+        }
+        
+        for (const auto& kv : counts) {
+            int32_t tok = kv.first;
+            int count = kv.second;
+            
+            if (tok < 0 || tok >= n) continue;
+            
+            // 【核心护城河】：绝对豁免 结束符、换行符(198)、空格(220)
+            if (tokenizer.is_stop_token(tok) || tok == 198 || tok == 220) {
+                continue;
+            }
+            
+            // A. 乘法压制 (Repetition Penalty)
+            if (rep_penalty > 1.0f) {
+                if (modified_logits[tok] > 0) modified_logits[tok] /= rep_penalty;
+                else modified_logits[tok] *= rep_penalty;
+            }
+            
+            // B. 减法强扣 (Frequency & Presence Penalty)
+            modified_logits[tok] -= (count * freq_penalty + pres_penalty);
+        }
+    }
+
+    // ==========================================================
+    // 2. 贪婪解码分支 (Temp <= 0)
+    // ==========================================================
     if (temperature <= 0.0f) {
         return (int)(std::max_element(modified_logits.begin(), modified_logits.end()) - modified_logits.begin());
     }
 
-    // 3. 应用温度缩放 (Temperature)
+    // ==========================================================
+    // 3. 应用 Temperature
+    // ==========================================================
     for (auto& v : modified_logits) v /= temperature;
 
-    // 4. 计算 Softmax 得到概率分布
-    float max_v = *std::max_element(modified_logits.begin(), modified_logits.end());
-    std::vector<float> probs(n);
-    double sum = 0.0;
+    // 构建 TokenData 数组用于高级采样
+    struct TokenData { int id; float logit; float p; };
+    std::vector<TokenData> cur_p;
+    cur_p.reserve(n);
+    float max_logit = -INFINITY;
     for (int i = 0; i < n; i++) {
-        probs[i] = std::exp(modified_logits[i] - max_v);
-        sum += probs[i];
-    }
-    for (auto& v : probs) v /= (float)sum;
-
-    // Build sorted indices
-    std::vector<int> idx(n);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return probs[a] > probs[b]; });
-
-    // Top-k filter
-    int k = (top_k > 0 && top_k < n) ? top_k : n;
-    if (k <= 0) k = 1;
-
-    // Top-p filter
-    const float effective_top_p = (top_p > 0.0f && top_p < 1.0f) ? top_p : 1.0f;
-    if (effective_top_p < 1.0f) {
-        float cum = 0.0f;
-        int p_cutoff = k;
-        for (int i = 0; i < k; i++) {
-            cum += probs[idx[i]];
-            if (cum >= effective_top_p) { p_cutoff = i + 1; break; }
+        cur_p.push_back({i, modified_logits[i], 0.0f});
+        if (modified_logits[i] > max_logit) {
+            max_logit = modified_logits[i];
         }
-        k = std::min(k, p_cutoff);
     }
-    if (k <= 0) k = 1;
 
-    // Sample from top-k/p
-    float total = 0.0f;
-    for (int i = 0; i < k; i++) total += probs[idx[i]];
-    std::uniform_real_distribution<float> dist(0.0f, total);
-    float r = dist(rng);
-    float c = 0.0f;
-    for (int i = 0; i < k; i++) {
-        c += probs[idx[i]];
-        if (r <= c) return idx[i];
+    // ==========================================================
+    // 4. Min-P 采样 (动态剔除长尾垃圾词汇)
+    // ==========================================================
+    const float min_p = 0.05f;
+    const float min_logit = max_logit + std::log(min_p);
+    
+    std::vector<TokenData> filtered_p;
+    for (const auto& tok : cur_p) {
+        if (tok.logit >= min_logit) {
+            filtered_p.push_back(tok);
+        }
     }
-    return idx[k - 1];
+    if (filtered_p.empty()) filtered_p.push_back(cur_p[0]); // 兜底
+
+    // ==========================================================
+    // 5. Top-K 采样
+    // ==========================================================
+    if (top_k > 0 && top_k < (int)filtered_p.size()) {
+        std::partial_sort(filtered_p.begin(), filtered_p.begin() + top_k, filtered_p.end(),
+                          [](const TokenData& a, const TokenData& b) { return a.logit > b.logit; });
+        filtered_p.resize(top_k);
+        max_logit = filtered_p[0].logit; 
+    }
+
+    // ==========================================================
+    // 6. Top-P 采样
+    // ==========================================================
+    if (top_p > 0.0f && top_p < 1.0f) {
+        std::sort(filtered_p.begin(), filtered_p.end(), [](const TokenData& a, const TokenData& b) { return a.logit > b.logit; });
+        double sum_cum = 0.0;
+        for (auto& tok : filtered_p) {
+            tok.p = std::exp(tok.logit - max_logit);
+            sum_cum += tok.p;
+        }
+        double cum = 0.0;
+        int p_cutoff = filtered_p.size();
+        for (int i = 0; i < (int)filtered_p.size(); i++) {
+            cum += filtered_p[i].p / sum_cum;
+            if (cum >= top_p) { 
+                p_cutoff = i + 1; 
+                break; 
+            }
+        }
+        filtered_p.resize(std::max(1, p_cutoff));
+    }
+
+    // ==========================================================
+    // 7. 终极 Softmax 与单趟轮盘赌采样
+    // ==========================================================
+    double final_sum = 0.0;
+    for (auto& tok : filtered_p) {
+        tok.p = std::exp(tok.logit - max_logit);
+        final_sum += tok.p;
+    }
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    double rnd = dist(rng);
+    double sum_tgt = final_sum * rnd;
+    double sum_run = 0.0;
+    
+    for (const auto& tok : filtered_p) {
+        sum_run += tok.p;
+        if (sum_run >= sum_tgt) {
+            return tok.id;
+        }
+    }
+
+    return filtered_p.back().id;
 }
 
 // ============================================================
@@ -199,7 +246,7 @@ static void generate(InferenceEngine& engine, BPETokenizer& tokenizer, const std
             break;
         }
 
-        int next_token = sample(logits, temperature, top_p, top_k, rng, recent_tokens);
+        int next_token = sample(logits, temperature, top_p, top_k, rng, recent_tokens, tokenizer);
         if (tokenizer.is_stop_token(next_token)) {
             if (verbose) fprintf(stderr, "\n[main] Stop token %d reached\n", next_token);
             break;
