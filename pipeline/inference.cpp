@@ -437,7 +437,7 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         }
 
         // 2a. attn_norm(cur) + attn/SSM → attn_out  [n_embd * n_tokens]
-        std::vector<float> attn_out = exec_attn_or_ssm(cur, il, n_tokens, pos);
+        std::vector<float> attn_out = exec_attn_or_ssm(cur, il, n_tokens, pos_);
         if (attn_out.empty()) {
             fprintf(stderr, "[Inference] ERROR: exec_attn_or_ssm failed at layer %d\n", il);
             return {};
@@ -786,9 +786,12 @@ std::vector<float> InferenceEngine::exec_attn_or_ssm(
             ggml_backend_tensor_get(sout.conv_state_out, ssm_conv_states_[si].data(), 0, sz);
         }
         if (sout.gdn_out) {
-            size_t byte_offset = (size_t)sout.n_tokens * sv_h * sizeof(float);
-            size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
-            ggml_backend_tensor_get(sout.gdn_out, ssm_recurrent_states_[si].data(), byte_offset, sz);
+            // size_t byte_offset = (size_t)sout.n_tokens * sv_h * sizeof(float);
+            // size_t sz = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
+            // ggml_backend_tensor_get(sout.gdn_out, ssm_recurrent_states_[si].data(), byte_offset, sz);
+            size_t state_byte_size = (size_t)head_v * (size_t)head_v * (size_t)dt_rank * sizeof(float);
+            size_t offset_bytes = (size_t)n_tokens * (head_v * dt_rank) * sizeof(float);
+            ggml_backend_tensor_get(sout.gdn_out, ssm_recurrent_states_[si].data(), offset_bytes, state_byte_size);
         }
         sout.gdn_out        = nullptr;
         sout.conv_state_out = nullptr;
@@ -899,6 +902,7 @@ void InferenceEngine::compute_moe_routing_cpu(
     for (int t = 0; t < n_tokens; t++) {
         const float* x = X + (size_t)t * n_embd;
 
+        // 1. 计算原始 Logits
         // router logit[e] = dot(W[:, e], x)
         // W column-major [n_embd, n_expert]: col e starts at W + e * n_embd
         for (int e = 0; e < n_expert; e++) {
@@ -909,13 +913,24 @@ void InferenceEngine::compute_moe_routing_cpu(
         }
 
         // Softmax over all experts
-        float max_l = *std::max_element(logits.begin(), logits.end());
+        // float max_l = *std::max_element(logits.begin(), logits.end());
+        // float sum_e = 0.0f;
+        // for (int e = 0; e < n_expert; e++) {
+        //     logits[e] = std::exp(logits[e] - max_l);
+        //     sum_e += logits[e];
+        // }
+        // for (int e = 0; e < n_expert; e++) logits[e] /= sum_e;
+        // 2. 数值稳定性处理：减去最大值
+        float max_l = -1e30f;
+        for (int e = 0; e < n_expert; e++) {
+            if (logits[e] > max_l) max_l = logits[e];
+        }
+
         float sum_e = 0.0f;
         for (int e = 0; e < n_expert; e++) {
-            logits[e] = std::exp(logits[e] - max_l);
+            logits[e] = std::exp(logits[e] - max_l); // 减去最大值防止溢出
             sum_e += logits[e];
         }
-        for (int e = 0; e < n_expert; e++) logits[e] /= sum_e;
 
         // Partial sort to find top-k
         std::iota(order.begin(), order.end(), 0);
