@@ -323,7 +323,7 @@ int main(int argc, char* argv[]) {
         ctx_size = model_ctx_size;
     }
 
-    InferenceEngine engine(*model, gpu_mode != GpuMode::Off ? recognizer.reader() : nullptr, n_threads, ctx_size, gpu_mode);
+    InferenceEngine engine(*model, recognizer.reader(), n_threads, ctx_size, gpu_mode);
     std::mt19937 rng(rng_seed);
     if (verbose) {
         fprintf(stderr, "[main] RNG seed: %llu\n", (unsigned long long)rng_seed);

@@ -471,41 +471,33 @@ std::vector<float> InferenceEngine::forward(const std::vector<int32_t>& tokens) 
         // 检查并填充 CPU 缓存 (只在第一次运行时执行)
         auto& gate_cache = moe_gate_inp_cpu_cache_[il];
         if (gate_cache.empty()) {
-            printf("-----------------------\n");
             const size_t n_embd_expert = (size_t)n_embd * n_expert;
             gate_cache.resize(n_embd_expert);
             
             if (gate_tensor->type == GGML_TYPE_F32) {
                 // 如果原本就是 F32，直接拷贝
-                printf("-----------------------1, size: %d\n", gate_cache.size());
                 ggml_backend_tensor_get(gate_tensor, gate_cache.data(), 0, n_embd_expert * sizeof(float));
-                printf("-----------------------2\n");
             } else {
-                printf("-----------------------3\n");
                 // --- 核心修复：对量化权重进行反量化 ---
                 const ggml_type_traits* traits = ggml_get_type_traits(gate_tensor->type);
                 if (!traits || !traits->to_float) {
                     fprintf(stderr, "[Inference] ERROR: no dequantizer for type %d\n", gate_tensor->type);
                     return {};
                 }
-                printf("-----------------------4\n");
 
                 // 1. 获取张量的原始量化字节大小并读取
                 size_t q_nbytes = ggml_nbytes(gate_tensor);
                 std::vector<uint8_t> qdata(q_nbytes);
                 ggml_backend_tensor_get(gate_tensor, qdata.data(), 0, q_nbytes);
-                printf("-----------------------5\n");
 
                 // 2. 反量化为 float 到 gate_cache 中
                 traits->to_float(qdata.data(), gate_cache.data(), n_embd_expert);
-                printf("-----------------------6\n");
             }
         }
 
         // 使用反量化后的 float 权重计算路由
         const float* gate_w = gate_cache.data();
         compute_moe_routing_cpu(gate_w, ffn_in.data(), il, n_tokens);
-        printf("-----------------------7\n");
 
         // 2d. MoE FFN sub-graph (selected + weights are pre-filled leaf tensors)
         std::vector<float> moe_out = exec_moe_ffn(ffn_in, il, n_tokens);
