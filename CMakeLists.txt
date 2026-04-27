@@ -33,10 +33,16 @@ target_link_libraries(ggml_core INTERFACE ggml)
 # test_qwen35moe — main CLI executable
 # ============================================================
 add_executable(test_qwen35moe
-    model/loader.cpp
+    api/routes.cpp
+    api/http_server.cpp
+    core/gguf_reader.cpp
+    model/gguf_mmap.cpp
+    model/metadata.cpp
+    model/weights.cpp
+    model/model.cpp
+    pipeline/tokenizer.cpp
+    pipeline/sampling.cpp
     pipeline/inference.cpp
-    pipeline/unicode-data.cpp
-    pipeline/unicode.cpp
     main.cpp
 )
 target_link_libraries(test_qwen35moe PRIVATE ggml_core pthread dl m)

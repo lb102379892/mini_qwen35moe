@@ -1,25 +1,11 @@
-// pipeline/inference.hpp
-// Qwen3.5 MoE forward pass engine — CPU, with KV cache and SSM state persistence.
-//
-// Incremental inference:
-//   - First call to forward() processes the full prompt (any length).
-//   - Subsequent calls pass a single new token; SSM states and the attention
-//     KV cache are carried across calls automatically.
-//   - Call reset_state() before each new conversation / prompt.
-//
-// Architecture: per-layer execution with CPU-side MoE routing.
-// Each transformer layer is executed as separate ggml sub-graphs.
-// MoE expert routing (softmax + top-k + normalize) is computed in pure C++
-// on the CPU; only the FFN compute uses ggml.
-//
-#ifndef QWEN35MOE_PIPELINE_INFERENCE_HPP
-#define QWEN35MOE_PIPELINE_INFERENCE_HPP
+#pragma once
 
-#include "core/gguf_reader.hpp"
-#include "model/model.hpp"
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include "model/model.h"
+#include "pipeline/sampling.h"
+#include "pipeline/tokenizer.h"
 
 // Forward declarations
 struct ggml_context;
@@ -30,17 +16,10 @@ struct ggml_backend;
 typedef struct ggml_gallocr * ggml_gallocr_t;
 typedef struct ggml_backend * ggml_backend_t;
 
-enum class GpuMode {
-    Off,
-    Hybrid,
-    Full,
-};
-
 class InferenceEngine {
 public:
     // model must outlive this object
-    explicit InferenceEngine(Qwen35moeModel& model, GGUFReader* reader = nullptr, int n_threads = 4, int max_seq_len = 2048, 
-        GpuMode gpu_mode = GpuMode::Off);
+    explicit InferenceEngine();
         
     ~InferenceEngine();
 
@@ -48,29 +27,33 @@ public:
     InferenceEngine(const InferenceEngine&) = delete;
     InferenceEngine& operator=(const InferenceEngine&) = delete;
 
-    // First call: pass the full prompt tokens → processes all of them, returns logits for the last token.
-    // Subsequent calls: pass exactly one new token → uses cached SSM/KV state, returns logits for that token.
-    std::vector<float> forward(const std::vector<int32_t>& tokens);
+    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, int max_seq_len = 2048, float top_p = -1.0f, int top_k = -1, float temperature = -1.0f, int gpu_layer = 0);
+    int32_t generate_token(const int32_t token_id);
+    std::shared_ptr<Tokenizer> tokenizer();
+    std::string last_error();
+    void set_temperature(float temperature);
+    void reset_context();
+
+private:
+
+    // Allocate / zero all persistent state buffers from model config.
+    void init_state();
 
     // Reset all cached state (SSM conv, SSM recurrent, KV cache) and position
     // counter.  Must be called before processing a new prompt.
     void reset_state();
 
+    // First call: pass the full prompt tokens → processes all of them, returns logits for the last token.
+    // Subsequent calls: pass exactly one new token → uses cached SSM/KV state, returns logits for that token.
+    std::vector<float> forward(const int32_t token_id);
+
 private:
-    Qwen35moeModel& model_;
-    GGUFReader* reader_ = nullptr;
-    int n_threads_;
-    int max_seq_len_;
-
-    ggml_backend_t   curr_backend_  = nullptr;
-    ggml_backend_t   backend_gpu_  = nullptr;
-    ggml_backend_t   backend_cpu_  = nullptr;
-    ggml_backend_buffer_t gpu_weights_buf_ = nullptr;
-    ggml_backend_buffer_t cpu_weights_buf_ = nullptr;
-    ggml_context* gpu_weights_ctx_ = nullptr;
-    ggml_context* cpu_weights_ctx_ = nullptr;
-    GpuMode          gpu_mode_ = GpuMode::Off;
-
+    int max_seq_len_ = 2048;
+    DevMode dev_mode_ = DevMode::CPU_MODE;
+    std::shared_ptr<Qwen35moeModel> model_ = nullptr;
+    std::shared_ptr<Tokenizer> tokenizer_ = nullptr;
+    std::shared_ptr<Sampler> sampler_ = nullptr;  
+    ggml_backend_t curr_backend_ = nullptr;
     // ---------------------------------------------------------------
     // Persistent incremental-inference state
     // ---------------------------------------------------------------
@@ -108,7 +91,6 @@ private:
         std::vector<float>   weights;  // normalized probs,  size: n_top_k * n_tokens
     };
     std::vector<MoERoute> moe_routes_; // [n_layer]
-    std::vector<std::vector<float>> moe_gate_inp_cpu_cache_; // [n_layer], only used in full GPU mode
 
     // ---------------------------------------------------------------
     // Temporary pointers set during sub-graph building; valid only
@@ -132,9 +114,6 @@ private:
     // Helpers
     // ---------------------------------------------------------------
 
-    // Allocate / zero all persistent state buffers from model config.
-    void init_state();
-    bool load_weights_to_backends();
 
     // Map layer index → SSM state slot (0-based among SSM layers).
     static int ssm_state_idx(int il) { return il - il / 4; }
@@ -156,7 +135,7 @@ private:
     // ---------------------------------------------------------------
 
     // Token embedding lookup: returns [n_embd * n_tokens] F32
-    std::vector<float> exec_token_embd(const std::vector<int32_t>& tokens, int n_tokens);
+    std::vector<float> exec_token_embd(const int32_t token_id);
 
     // attn_norm(cur) + attn-or-SSM sub-layer.
     // Handles KV cache / SSM state I/O internally.
@@ -180,5 +159,3 @@ private:
 
     ggml_tensor* build_ssm_layer(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* cur, int il, int n_tokens, int pos);
 };
-
-#endif // QWEN35MOE_PIPELINE_INFERENCE_HPP

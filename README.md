@@ -9,7 +9,8 @@ built on top of the bundled **ggml** library.
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake .. -DQWEN35MOE_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Debug
+cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CUDA_ARCHITECTURES=86
+cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 make -j$(nproc)
 # Binary: build/test_qwen35moe
 ```
@@ -23,9 +24,19 @@ Requires: CMake >= 3.14, C++17, Linux or macOS.
 ./test_qwen35moe \
   --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
   --prompt "你的模型是什么" \
-  --n-predict 256 \
-  --verbose
+  --temp 0 \
+  --ctx-size 1024 \
+  --threads 1
 
+curl -X POST http://localhost:6666/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "你是什么模型?"}
+    ],
+    "temperature": 0,
+    "max_tokens": 100
+  }'
 
 ./test_qwen35moe \
   --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \

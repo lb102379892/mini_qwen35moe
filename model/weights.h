@@ -45,12 +45,13 @@
 //             blk.3.ffn_up_shexp.weight	[2048, 512]	Q5_K
 //             blk.3.post_attention_norm.weight	[2048]	F32
 //             blk.3.attn_output.weight	[4096, 2048]	Q5_K
-#ifndef FUNASR_MODEL_WEIGHTS_HPP
-#define FUNASR_MODEL_WEIGHTS_HPP
+#pragma once
 
 #include <ggml.h>
 #include <vector>
 #include <cstdio>
+#include <memory>
+#include <unordered_map>
 
 // 判断某层是否为 Attention 层（每 4 层一个，index % 4 == 3）
 inline bool is_attn_layer(int idx) { return (idx % 4) == 3; }
@@ -58,67 +59,50 @@ inline bool is_attn_layer(int idx) { return (idx % 4) == 3; }
 // ============================================================
 // 模型文件中每层的权重结构
 // ============================================================
-struct Qwen35moeLayer {
-    struct ggml_tensor * attn_k          = nullptr;
-    struct ggml_tensor * attn_k_norm     = nullptr;
-    struct ggml_tensor * attn_norm       = nullptr;
-    struct ggml_tensor * attn_gate       = nullptr;
-    struct ggml_tensor * attn_qkv        = nullptr;
-    struct ggml_tensor * attn_q          = nullptr;
-    struct ggml_tensor * attn_q_norm     = nullptr;
-    struct ggml_tensor * attn_v          = nullptr;
-    
-    struct ggml_tensor * ffn_down_exps     = nullptr;
-    struct ggml_tensor * ffn_gate_exps     = nullptr;
-    struct ggml_tensor * ffn_gate_inp      = nullptr;
-    struct ggml_tensor * ffn_up_exps       = nullptr;
-  
-    struct ggml_tensor * ffn_down_shexp     = nullptr;
-    struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
-    struct ggml_tensor * ffn_gate_shexp     = nullptr;
-    struct ggml_tensor * ffn_up_shexp       = nullptr;
+enum EN_LAYER_TYPE {
+    EN_LAYER_TYPE_ATTN_K = 0,
+    EN_LAYER_TYPE_ATTN_K_NORM = 1,
+    EN_LAYER_TYPE_ATTN_NORM = 2,
+    EN_LAYER_TYPE_ATTN_GATE = 3,
+    EN_LAYER_TYPE_ATTN_QKV = 4,
+    EN_LAYER_TYPE_ATTN_Q = 5,
+    EN_LAYER_TYPE_ATTN_Q_NORM = 6,
+    EN_LAYER_TYPE_ATTN_V = 7,
+    EN_LAYER_TYPE_FFN_DOWN_EXPS = 8,
+    EN_LAYER_TYPE_FFN_GATE_EXPS = 9,
+    EN_LAYER_TYPE_FFN_GATE_INP = 10,
+    EN_LAYER_TYPE_FFN_UP_EXPS = 11,
+    EN_LAYER_TYPE_FFN_DOWN_SHEXP = 12,
+    EN_LAYER_TYPE_FFN_GATE_INP_SHEXP = 13,
+    EN_LAYER_TYPE_FFN_GATE_SHEXP = 14,
+    EN_LAYER_TYPE_FFN_UP_SHEXP = 15,
+    EN_LAYER_TYPE_SSM_A = 16,
+    EN_LAYER_TYPE_SSM_ALPHA = 17,
+    EN_LAYER_TYPE_SSM_BETA = 18,
+    EN_LAYER_TYPE_SSM_CONV1D = 19,
+    EN_LAYER_TYPE_SSM_DT = 20,
+    EN_LAYER_TYPE_SSM_NORM = 21,
+    EN_LAYER_TYPE_SSM_OUT = 22,
+    EN_LAYER_TYPE_POST_ATTENTION_NORM = 23,
+    EN_LAYER_TYPE_ATTN_OUTPUT = 24
+};
 
-    struct ggml_tensor * ssm_a              = nullptr;
-    struct ggml_tensor * ssm_alpha          = nullptr;
-    struct ggml_tensor * ssm_beta           = nullptr;
-    struct ggml_tensor * ssm_conv1d         = nullptr;
-    struct ggml_tensor * ssm_dt_b           = nullptr;
-    struct ggml_tensor * ssm_norm           = nullptr;
-    struct ggml_tensor * ssm_out            = nullptr;
-    
-    struct ggml_tensor * post_attention_norm = nullptr;
-    struct ggml_tensor * attn_output        = nullptr;
+class Qwen35moeLayer {
+public:
+    std::unordered_map<EN_LAYER_TYPE, ggml_tensor*> tensors;
 };
 
 // ============================================================
 // 完整权重
 // ============================================================
-struct Qwen35moeWeights {
-    ggml_tensor* token_embd = nullptr;
-    std::vector<Qwen35moeLayer> layers;
-    ggml_tensor* output = nullptr;
-    ggml_tensor* output_norm = nullptr;
-
-    bool is_valid() const {
-        bool layer_ok = true;
-        size_t layer_count = layers.size();
-        for (size_t i = 0; i < layer_count; i++) {
-            const Qwen35moeLayer& lyr = layers[i];
-            if (is_attn_layer(i)) {
-                bool ok = lyr.attn_q && lyr.attn_k && lyr.attn_v && lyr.attn_output;
-                if (!ok) layer_ok = false;
-            } else {
-                bool ok = lyr.attn_qkv && lyr.attn_gate && lyr.ssm_out;
-                if (!ok) layer_ok = false;
-            }
-        }
-        if (false == layer_ok) {
-            printf("[Loader] ERROR: one or more layers are missing required tensors\n");
-            return false;
-        }
-
-        return true;
-    }
+enum EN_WEIGHT_TYPE {
+    EN_WEIGHT_TYPE_TOKEN_EMBD = 0,
+    EN_WEIGHT_TYPE_OUTPUT = 1,
+    EN_WEIGHT_TYPE_OUTPUT_NORM = 2
 };
 
-#endif // FUNASR_MODEL_WEIGHTS_HPP
+class Qwen35moeWeights {
+public:
+    std::unordered_map<EN_WEIGHT_TYPE, ggml_tensor*> heads;
+    std::vector<std::shared_ptr<Qwen35moeLayer>> layers;
+};
