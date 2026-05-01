@@ -1,40 +1,64 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <random>
+#include <unordered_set>
 #include <vector>
-
-struct SamplingConfig {
-    float temperature = 0.7f;
-    int top_k = 50;
-    float top_p = 0.9f;
-    float repetition_penalty = 1.0f;
-    uint64_t seed = 0;  // 0 = random
-};
+#include <string>
 
 class Sampler {
 public:
-    Sampler() = default;
-    void init(const SamplingConfig& config);
-    void set_temperature(float temp) { config_.temperature = temp; }
+    virtual ~Sampler() = default;
 
-    // Sample one token from logits [vocab_size]
-    // Applies: repetition penalty -> temperature -> top-k -> top-p -> sample
-    int sample(float* logits, int vocab_size);
+    // Sample a token ID from logits.
+    // last_tokens: recent token history for repetition penalty.
+    // token_strs:  vocab[i] = decoded string of token i (for grammar constraints).
+    virtual int sample(std::vector<float>& logits, const std::vector<int32_t>& last_tokens) = 0;
 
-    // Track recent tokens for repetition penalty
-    void add_token(int token_id);
-    void reset();
+    // Attach a vocab pruning set (optional).
+    void set_pruned_vocab(const std::unordered_set<int32_t>* pruned_vocab);
+
+    void set_eos_token_id(int32_t id);
+
+protected:
+    void apply_vocab_pruning(std::vector<float>& logits);
+    
+protected:
+    const std::unordered_set<int32_t>* pruned_vocab_ = nullptr;
+    int32_t eos_token_id_ = -1;
+};
+
+class GreedySampler : public Sampler {
+public:
+    GreedySampler(float repetition_penalty = 1.2f, int   repetition_lookback = 32);
+
+    int sample(std::vector<float>& logits, const std::vector<int32_t>& last_tokens) override;
 
 private:
-    void apply_repetition_penalty(float* logits, int vocab_size);
-    void apply_temperature(float* logits, int vocab_size);
-    int apply_top_k(float* logits, int vocab_size);  // returns new effective size
-    int apply_top_p(float* logits, int vocab_size, int k_size);
-    int categorical_sample(const float* probs, int size);
-    void softmax(float* logits, int size);
+    void apply_repetition_penalty(std::vector<float>& logits, const std::vector<int32_t>& last_tokens);
 
-    SamplingConfig config_;
-    std::vector<int> recent_tokens_;
-    uint64_t rng_state_ = 0;
-    bool initialized_ = false;
+private:
+    float repetition_penalty_ = 0.0f;
+    int repetition_lookback_ = 0;
+};
+
+class TemperatureSampler : public Sampler {
+public:
+    TemperatureSampler(float temperature = 0.7f, 
+        float repetition_penalty = 1.1f, int repetition_lookback = 64, int top_k = 40, float top_p = 0.95f);
+
+    int sample(std::vector<float>& logits, const std::vector<int32_t>& last_tokens) override;
+
+private:
+    void apply_repetition_penalty(std::vector<float>& logits, const std::vector<int32_t>& last_tokens);
+
+private:
+    float temperature_ = 0.0f;
+    float repetition_penalty_ = 0.0f;
+    int repetition_lookback_ = 0;
+    int top_k_ = 0;
+    float top_p_ = 0.0f;
+    std::mt19937 gen_;
 };

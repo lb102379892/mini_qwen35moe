@@ -36,13 +36,16 @@ add_executable(test_qwen35moe
     api/routes.cpp
     api/http_server.cpp
     core/gguf_reader.cpp
+    graph/deltanet_state.cpp
+    graph/kv_cache_simple.cpp
+    graph/graph.cpp
     model/gguf_mmap.cpp
     model/metadata.cpp
     model/weights.cpp
     model/model.cpp
     pipeline/tokenizer.cpp
     pipeline/sampling.cpp
-    pipeline/inference.cpp
+    pipeline/chat.cpp
     main.cpp
 )
 target_link_libraries(test_qwen35moe PRIVATE ggml_core pthread dl m)

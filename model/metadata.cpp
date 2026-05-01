@@ -173,6 +173,7 @@ void TokenizerInfo::load_from_gguf(struct gguf_context* gctx) {
     ggml_merges = gguf_get_arrary_string_or(gctx, "tokenizer.ggml.merges");
     ggml_eos_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.eos_token_id", 0);
     ggml_padding_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.padding_token_id", 0);
+    ggml_bos_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.bos_token_id", 0);
     chat_template = gguf_get_str_or(gctx, "tokenizer.chat_template", "");
 }
 

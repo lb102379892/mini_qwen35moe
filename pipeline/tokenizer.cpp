@@ -1,261 +1,419 @@
 #include <algorithm>
-#include <limits>
-#include <cstdio>
-#include "tokenizer.h"
+#include <stdexcept>
+#include <sstream>
+#include <cctype>
+#include <map>
+#include <set>
+#include <iostream>
+#include <queue>       // std::priority_queue
+#include <functional>  // std::greater
+#include <vector>      // std::vector (likely already included)
+#include "pipeline/tokenizer.h"
+#include "model/metadata.h"
 
-// ---------------------------------------------------------------------------
-// GPT-2 byte-to-unicode mapping
-// ---------------------------------------------------------------------------
-// GPT-2 BPE uses a byte-to-unicode mapping where printable ASCII bytes map to
-// themselves and non-printable bytes map to higher Unicode code points.
-// This function builds the byte→char and char→byte tables.
-
-static std::string byte_to_unicode_char(uint8_t b) {
-    // GPT-2 byte-to-unicode: bijection from 256 byte values to 256 Unicode code points.
-    //
-    // Printable ASCII (33-126): map to U+0021-U+007E (same value, 1-byte UTF-8)
-    // Latin-1 supplement (161-172, 174-255): map to U+00A1-U+00AC, U+00AE-U+00FF
-    //   These are 2-byte UTF-8 sequences (U+0080-U+00FF → 0xC2/0xC3 prefix)
-    // Remapped bytes (0-32, 127-160, 173): map to U+0100-U+0143 (2-byte UTF-8)
-    //
-    // CRITICAL: Bytes 161-172 and 174-255 map to Unicode code points that require
-    // 2-byte UTF-8 encoding. Returning a raw byte (char(b)) would produce invalid
-    // UTF-8 and break BPE symbol splitting for non-ASCII input (e.g., Japanese).
-
-    if (b >= 33 && b <= 126) {
-        // ASCII printable: code point == byte value, 1-byte UTF-8
-        return std::string(1, static_cast<char>(b));
+// Gets all pairs of adjacent tokens.
+std::vector<std::pair<int32_t, int32_t>> get_pairs(const std::vector<int32_t>& tokens) {
+    std::vector<std::pair<int32_t, int32_t>> pairs;
+    if (tokens.size() < 2) return pairs;
+    pairs.reserve(tokens.size() - 1);
+    for (size_t i = 0; i < tokens.size() - 1; ++i) {
+        pairs.emplace_back(tokens[i], tokens[i+1]);
     }
-
-    // For all other bytes, compute the Unicode code point and encode as UTF-8
-    int cp;
-    if ((b >= 161 && b <= 172) || b >= 174) {
-        // Latin-1 supplement: code point == byte value (U+00A1-U+00FF)
-        cp = b;
-    } else if (b <= 32) {
-        cp = 256 + b;            // bytes 0-32 → U+0100-U+0120
-    } else if (b == 127) {
-        cp = 256 + 33;           // byte 127 → U+0121
-    } else if (b >= 128 && b <= 160) {
-        cp = 256 + 34 + (b - 128); // bytes 128-160 → U+0122-U+0142
-    } else {
-        cp = 256 + 67;           // byte 173 → U+0143
-    }
-
-    // UTF-8 encode the code point (all code points here are U+00A1-U+0143, 2-byte UTF-8)
-    char buf[4];
-    buf[0] = static_cast<char>(0xC0 | ((cp >> 6) & 0x1F));
-    buf[1] = static_cast<char>(0x80 | (cp & 0x3F));
-    buf[2] = '\0';
-    return std::string(buf, 2);
+    return pairs;
 }
 
-static std::unordered_map<std::string, uint8_t> build_unicode_to_byte() {
-    std::unordered_map<std::string, uint8_t> result;
-    for (int b = 0; b < 256; b++) {
-        std::string u = byte_to_unicode_char(static_cast<uint8_t>(b));
-        result[u] = static_cast<uint8_t>(b);
+Tokenizer::Tokenizer(const TokenizerInfo& tok_info) :tok_info_(tok_info) {
+}
+
+int Tokenizer::init() {
+    if (tok_info_.ggml_tokens.empty()) {
+        throw std::runtime_error("Invalid vocabulary: token list is empty.");
     }
+    
+    // Build token_to_id map
+    token_to_id_.reserve(tok_info_.ggml_tokens.size());
+    for (size_t i = 0; i < tok_info_.ggml_tokens.size(); ++i) {
+        token_to_id_[tok_info_.ggml_tokens[i]] = static_cast<int32_t>(i);
+    }
+    
+    // Parse merge rules and populate the optimized map
+    merges_.reserve(tok_info_.ggml_merges.size());
+    for (int i = 0; i < tok_info_.ggml_merges.size(); ++i) {
+        const std::string& merge_str = tok_info_.ggml_merges[i];
+        size_t space_pos = merge_str.find(' ');
+        if (space_pos == std::string::npos) {
+            throw std::runtime_error("Invalid merge format: " + merge_str);
+        }
+        
+        std::string first_token_str = merge_str.substr(0, space_pos);
+        std::string second_token_str = merge_str.substr(space_pos + 1);
+        auto it1 = token_to_id_.find(first_token_str);
+        auto it2 = token_to_id_.find(second_token_str);
+        if (it1 == token_to_id_.end() || it2 == token_to_id_.end()) {
+            // Skip merges with tokens not in the vocabulary
+            continue;
+        }
+        
+        std::string merged_token_str = first_token_str + second_token_str;
+        auto merged_it = token_to_id_.find(merged_token_str);
+        if (merged_it == token_to_id_.end()) {
+            throw std::runtime_error("Merged token not found in vocab: " + merged_token_str);
+        }
+        
+        merges_[{it1->second, it2->second}] = {i, merged_it->second};
+    }
+    
+    // Initialize special tokens
+    initialize_special_tokens();
+
+    // Find and set the UNK token ID
+    unk_token_id_ = -1;
+    for (size_t i = 0; i < tok_info_.ggml_token_type.size(); ++i) {
+        if (tok_info_.ggml_token_type[i] == (int)TokenType::UNKNOWN) {
+            unk_token_id_ = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    
+    // Initialize byte mapping for proper UTF-8 handling
+    initialize_byte_mapping();
+    
+    // Build a comprehensive regex for pre-tokenization
+    std::string special_token_pattern;
+    for (const auto& [token_str, token_id] : special_tokens_) {
+        if (!special_token_pattern.empty()) {
+            special_token_pattern += "|";
+        }
+        // Escape special regex characters in the token string
+        std::string escaped_token;
+        for (char c : token_str) {
+            if (std::string("()[]{}|?*+.").find(c) != std::string::npos) {
+                escaped_token += '\\';
+            }
+            escaped_token += c;
+        }
+        special_token_pattern += escaped_token;
+    }
+
+    std::string base_pattern = R"('(?:[sdmt]|ll|ve|re)| ?[a-zA-Z]+| ?[0-9]+| ?[^a-zA-Z0-9\s]+|\s+(?!\S)|\s+)";
+    pretokenization_regex_ = std::regex(
+        special_token_pattern + "|" + base_pattern,
+        std::regex_constants::ECMAScript
+    );
+
+    return 0;
+}
+
+std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
+    if (text.empty()) return {};
+    
+    // Step 1: Pre-tokenization (handles special tokens and regex splitting)
+    std::vector<std::string> pretokens = pretokenize(text);
+    
+    // Step 2: Apply BPE to each pre-token
+    std::vector<int32_t> result;
+    for (const std::string& pretoken : pretokens) {
+        std::vector<int32_t> encoded = encode_with_special_tokens(pretoken);
+        result.insert(result.end(), encoded.begin(), encoded.end());
+    }
+    
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
-
-bool Tokenizer::init(const TokenizerInfo& tokenizer_info) {
-    if (tokenizer_info.ggml_tokens.empty()) {
-        fprintf(stderr, "No vocabulary tokens in model config\n");
-        return false;
+std::string Tokenizer::decode(int32_t token_id) const {
+    if (token_id < 0 || token_id >= static_cast<int32_t>(tok_info_.ggml_tokens.size())) {
+        return "<ID_OOB>";
     }
 
-    // Build vocabulary mappings
-    id_to_token_ = tokenizer_info.ggml_tokens;
-    token_to_id_.reserve(id_to_token_.size());
-    for (size_t i = 0; i < id_to_token_.size(); ++i) {
-        token_to_id_[id_to_token_[i]] = static_cast<int>(i);
+    const std::string& token = tok_info_.ggml_tokens[token_id];
+
+    // Special tokens are returned as-is
+    if (is_special_token(token_id)) {
+        return token;
     }
 
-    // Build merge rank map
-    merge_ranks_.reserve(tokenizer_info.ggml_merges.size());
-    for (size_t i = 0; i < tokenizer_info.ggml_merges.size(); ++i) {
-        merge_ranks_[tokenizer_info.ggml_merges[i]] = static_cast<int>(i);
-    }
-
-    eos_token_id_ = tokenizer_info.ggml_eos_token_id;
-    bos_token_id_ = -1;
-
-    // Resolve chat template special tokens from vocabulary
-    auto resolve = [&](const std::string& name) -> int {
-        auto it = token_to_id_.find(name);
-        return (it != token_to_id_.end()) ? it->second : -1;
-    };
-    im_start_token_id_ = resolve("<|im_start|>");
-    im_end_token_id_ = resolve("<|im_end|>");
-
-    initialized_ = true;
-    fprintf(stderr, "Tokenizer initialized: vocab=%zu, merges=%zu, eos=%d, im_start=%d, im_end=%d\n",
-             id_to_token_.size(), merge_ranks_.size(), eos_token_id_,
-             im_start_token_id_, im_end_token_id_);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// BPE encode a single word (already converted to unicode representation)
-// ---------------------------------------------------------------------------
-
-std::vector<int> Tokenizer::bpe_encode_word(const std::string& word) const {
-    // Split word into individual characters (UTF-8 aware for the unicode-mapped bytes)
-    std::vector<std::string> symbols;
-    size_t i = 0;
-    while (i < word.size()) {
-        uint8_t c = static_cast<uint8_t>(word[i]);
-        size_t char_len = 1;
-        if ((c & 0x80) == 0) char_len = 1;
-        else if ((c & 0xE0) == 0xC0) char_len = 2;
-        else if ((c & 0xF0) == 0xE0) char_len = 3;
-        else char_len = 4;
-        if (i + char_len > word.size()) char_len = 1;
-        symbols.push_back(word.substr(i, char_len));
-        i += char_len;
-    }
-
-    if (symbols.size() <= 1) {
-        // Single character or empty — look up directly
-        auto it = token_to_id_.find(word);
-        if (it != token_to_id_.end()) {
-            return {it->second};
-        }
-        // Unknown token — return empty
-        return {};
-    }
-
-    // Iteratively merge the pair with the lowest merge rank
-    while (symbols.size() > 1) {
-        int best_rank = std::numeric_limits<int>::max();
-        size_t best_pos = std::string::npos;
-
-        for (size_t j = 0; j + 1 < symbols.size(); ++j) {
-            std::string pair = symbols[j] + " " + symbols[j + 1];
-            auto it = merge_ranks_.find(pair);
-            if (it != merge_ranks_.end() && it->second < best_rank) {
-                best_rank = it->second;
-                best_pos = j;
-            }
-        }
-
-        if (best_pos == std::string::npos) break;  // No more merges possible
-
-        // Apply the merge: combine symbols[best_pos] and symbols[best_pos+1]
-        symbols[best_pos] = symbols[best_pos] + symbols[best_pos + 1];
-        symbols.erase(symbols.begin() + static_cast<long>(best_pos) + 1);
-    }
-
-    // Convert symbols to token IDs
-    std::vector<int> ids;
-    ids.reserve(symbols.size());
-    for (const auto& sym : symbols) {
-        auto it = token_to_id_.find(sym);
-        if (it != token_to_id_.end()) {
-            ids.push_back(it->second);
-        } else {
-            fprintf(stderr, "Unknown BPE symbol: '%s'\n", sym.c_str());
-        }
-    }
-    return ids;
-}
-
-// ---------------------------------------------------------------------------
-// Encode: text → token IDs
-// ---------------------------------------------------------------------------
-
-std::vector<int> Tokenizer::encode(const std::string& text) const {
-    if (!initialized_ || text.empty()) return {};
-
-    std::vector<int> result;
-
-    // GPT-2 pre-tokenization: split text into words using a regex pattern.
-    // The pattern captures: contractions, letters, digits, non-letter/non-digit,
-    // and whitespace sequences. Each match is independently BPE-encoded.
-    //
-    // Simplified pattern (captures whitespace-prefixed words and punctuation):
-    // We convert each byte to its GPT-2 unicode representation before BPE.
-
-    // Simple word splitting: split on whitespace boundaries, keeping space as
-    // prefix (Ġ) on non-first words — matching GPT-2 convention.
-    std::vector<std::string> words;
-    std::string current_word;
-
-    for (size_t i = 0; i < text.size(); ++i) {
-        uint8_t c = static_cast<uint8_t>(text[i]);
-
-        if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
-            if (!current_word.empty()) {
-                words.push_back(current_word);
-                current_word.clear();
-            }
-            // Prefix the space character to the NEXT word (GPT-2 Ġ convention)
-            current_word = byte_to_unicode_char(c);
-        } else {
-            current_word += byte_to_unicode_char(c);
-        }
-    }
-    if (!current_word.empty()) {
-        words.push_back(current_word);
-    }
-
-    // BPE-encode each word independently
-    for (const auto& word : words) {
-        auto ids = bpe_encode_word(word);
-        result.insert(result.end(), ids.begin(), ids.end());
-    }
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Decode: token IDs → text
-// ---------------------------------------------------------------------------
-
-std::string Tokenizer::decode(const std::vector<int>& token_ids) const {
-    if (!initialized_) return "";
-
-    static const auto unicode_to_byte = build_unicode_to_byte();
-
-    std::string raw;
-    for (int id : token_ids) {
-        if (id >= 0 && id < static_cast<int>(id_to_token_.size())) {
-            raw += id_to_token_[static_cast<size_t>(id)];
-        }
-    }
-
-    // Convert GPT-2 unicode representation back to bytes
+    // Regular tokens need byte decoding.
+    // GPT-2 byte encoding maps byte values to Unicode characters, some of which
+    // are multi-byte in UTF-8 (e.g., space 0x20 → Ġ U+0120 → \xC4\xA0).
+    // We must try multi-byte lookups before single-byte.
     std::string result;
     size_t i = 0;
-    while (i < raw.size()) {
-        // Try multi-byte UTF-8 first (2-byte for the Ġ-style mapped bytes)
-        uint8_t c = static_cast<uint8_t>(raw[i]);
-        size_t char_len = 1;
-        if ((c & 0x80) == 0) char_len = 1;
-        else if ((c & 0xE0) == 0xC0) char_len = 2;
-        else if ((c & 0xF0) == 0xE0) char_len = 3;
-        else char_len = 4;
-        if (i + char_len > raw.size()) char_len = 1;
-
-        std::string u = raw.substr(i, char_len);
-        auto it = unicode_to_byte.find(u);
-        if (it != unicode_to_byte.end()) {
+    while (i < token.size()) {
+        // Try 2-byte UTF-8 sequence first (covers all GPT-2 byte mappings > 127)
+        if (i + 1 < token.size()) {
+            std::string two_byte = token.substr(i, 2);
+            auto it = byte_decoder_.find(two_byte);
+            if (it != byte_decoder_.end()) {
+                result += static_cast<char>(it->second);
+                i += 2;
+                continue;
+            }
+        }
+        // Fall back to single-byte lookup
+        std::string one_byte(1, token[i]);
+        auto it = byte_decoder_.find(one_byte);
+        if (it != byte_decoder_.end()) {
             result += static_cast<char>(it->second);
         } else {
-            // Pass through as-is (shouldn't happen with valid tokens)
-            result += u;
+            result += token[i];
         }
-        i += char_len;
+        i++;
     }
 
     return result;
 }
 
-std::string Tokenizer::decode(int token_id) const {
-    return decode(std::vector<int>{token_id});
+std::string Tokenizer::decode(const std::vector<int32_t>& token_ids) const {
+    std::string result;
+    for (int32_t token_id : token_ids) {
+        result += decode(token_id);
+    }
+    return result;
+}
+
+int32_t Tokenizer::get_special_token_id(const std::string& token_str) const {
+    auto it = special_tokens_.find(token_str);
+    if (it != special_tokens_.end()) {
+        return it->second;
+    }
+    return unk_token_id_;
+}
+
+int32_t Tokenizer::get_eos_token_id() const {
+    return tok_info_.ggml_eos_token_id;
+}
+
+const std::vector<std::string>& Tokenizer::get_vocabulary() const {
+    return tok_info_.ggml_tokens;
+}
+
+void Tokenizer::initialize_special_tokens() {
+    // Add EOS from metadata
+    special_tokens_["<|endoftext|>"] = tok_info_.ggml_eos_token_id;
+    special_token_ids_.insert(tok_info_.ggml_eos_token_id);
+
+    // Insert bos/padding only if they were actually set in metadata
+    if (tok_info_.ggml_bos_token_id > 0) {
+        special_token_ids_.insert(tok_info_.ggml_bos_token_id);
+    }
+    if (tok_info_.ggml_padding_token_id > 0) {
+        special_token_ids_.insert(tok_info_.ggml_padding_token_id);
+    }
+
+    // Look up ChatML tokens from vocabulary instead of hardcoding IDs.
+    // This works for both qwen2/3 (where they're at 151644/151645)
+    // and qwen35 (where they're at different positions in the 248K vocab).
+    const std::vector<std::string> chatml_tokens = {
+        "<|im_start|>", "<|im_end|>"
+    };
+    for (const auto& tok_str : chatml_tokens) {
+        auto it = token_to_id_.find(tok_str);
+        if (it != token_to_id_.end()) {
+            special_tokens_[tok_str] = it->second;
+            special_token_ids_.insert(it->second);
+        }
+    }
+
+    // Find all special tokens in vocabulary (CONTROL or USER_DEFINED type)
+    for (size_t i = 0; i < tok_info_.ggml_token_type.size(); ++i) {
+        if (tok_info_.ggml_token_type[i] == (int)TokenType::CONTROL ||
+            tok_info_.ggml_token_type[i] == (int)TokenType::USER_DEFINED) {
+            special_token_ids_.insert(static_cast<int32_t>(i));
+            special_tokens_[tok_info_.ggml_tokens[i]] = static_cast<int32_t>(i);
+        }
+    }
+}
+
+void Tokenizer::initialize_byte_mapping() {
+    // Standard GPT-2 byte-level mapping to unique Unicode characters.
+    std::map<int, int> byte_to_unicode_map;
+    std::set<int> printable_bytes;
+
+    // Populate with printable ASCII and some extended chars that are mapped 1-to-1
+    for (int i = 33; i <= 126; ++i) { printable_bytes.insert(i); byte_to_unicode_map[i] = i; }
+    for (int i = 161; i <= 172; ++i) { printable_bytes.insert(i); byte_to_unicode_map[i] = i; }
+    for (int i = 174; i <= 255; ++i) { printable_bytes.insert(i); byte_to_unicode_map[i] = i; }
+
+    // Assign remaining byte values to higher Unicode code points
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (printable_bytes.find(b) == printable_bytes.end()) {
+            byte_to_unicode_map[b] = 256 + n;
+            n++;
+        }
+    }
+
+    byte_encoder_.resize(256);
+    for (int b = 0; b < 256; ++b) {
+        int unicode_val = byte_to_unicode_map[b];
+        std::string& mapped_str = byte_encoder_[b];
+        
+        // Simple UTF-8 encoding for the Unicode code point
+        if (unicode_val < 128) {
+            mapped_str += static_cast<char>(unicode_val);
+        } else {
+            mapped_str += static_cast<char>(0xC0 | (unicode_val >> 6));
+            mapped_str += static_cast<char>(0x80 | (unicode_val & 0x3F));
+        }
+        
+        byte_decoder_[mapped_str] = b;
+    }
+}
+
+std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+    std::vector<std::string> tokens;
+    std::sregex_iterator iter(text.begin(), text.end(), pretokenization_regex_);
+    std::sregex_iterator end;
+
+    for (; iter != end; ++iter) {
+        std::string match = iter->str();
+        if (!match.empty()) {
+            tokens.push_back(match);
+        }
+    }
+    return tokens;
+}
+
+std::vector<int32_t> Tokenizer::apply_bpe(const std::vector<int32_t>& byte_tokens) const {
+    if (byte_tokens.size() <= 1) return byte_tokens;
+
+    const size_t n = byte_tokens.size();
+
+    // Doubly-linked list for O(1) merge operations
+    struct Node {
+        int32_t token;
+        int prev = -1;
+        int next = -1;
+        bool deleted = false;
+    };
+    
+    std::vector<Node> nodes(n);
+    for (size_t i = 0; i < n; ++i) {
+        nodes[i].token = byte_tokens[i];
+        nodes[i].prev = (i > 0) ? static_cast<int>(i - 1) : -1;
+        nodes[i].next = (i < n - 1) ? static_cast<int>(i + 1) : -1;
+    }
+    
+    // Min-heap: (rank, position) — lower rank = higher priority
+    using Entry = std::pair<int, int>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> pq;
+    
+    // Helper: get merge info for pair starting at position i
+    auto get_merge = [&](int i) -> std::pair<int, int32_t> {
+        if (i < 0 || nodes[i].next < 0) return {-1, -1};
+        auto it = merges_.find({nodes[i].token, nodes[nodes[i].next].token});
+        if (it == merges_.end()) return {-1, -1};
+        return it->second;  // {rank, merged_token}
+    };
+    
+    // Initialize queue with all mergeable pairs
+    for (size_t i = 0; i + 1 < n; ++i) {
+        auto [rank, merged] = get_merge(i);
+        if (rank >= 0) {
+            pq.push({rank, static_cast<int>(i)});
+        }
+    }
+    
+    // Process merges in rank order
+    while (!pq.empty()) {
+        auto [rank, pos] = pq.top();
+        pq.pop();
+        
+        // Skip stale entries (node deleted or pair changed)
+        if (nodes[pos].deleted) continue;
+        int next_pos = nodes[pos].next;
+        if (next_pos < 0 || nodes[next_pos].deleted) continue;
+        
+        // Verify merge is still valid (tokens may have changed)
+        auto [current_rank, merged_token] = get_merge(pos);
+        if (current_rank != rank) continue;
+        
+        // Perform merge: pos absorbs next_pos
+        nodes[pos].token = merged_token;
+        nodes[next_pos].deleted = true;
+        
+        // Update linked list
+        nodes[pos].next = nodes[next_pos].next;
+        if (nodes[next_pos].next >= 0) {
+            nodes[nodes[next_pos].next].prev = pos;
+        }
+        
+        // Enqueue new pairs formed by merge
+        if (nodes[pos].prev >= 0) {
+            auto [r, m] = get_merge(nodes[pos].prev);
+            if (r >= 0) pq.push({r, nodes[pos].prev});
+        }
+        {
+            auto [r, m] = get_merge(pos);
+            if (r >= 0) pq.push({r, pos});
+        }
+    }
+    
+    // Collect result by traversing from head
+    std::vector<int32_t> result;
+    result.reserve(n);
+    
+    // Find first non-deleted node
+    int head = 0;
+    while (head < static_cast<int>(n) && nodes[head].deleted) ++head;
+    
+    // Traverse linked list
+    for (int pos = head; pos >= 0; pos = nodes[pos].next) {
+        result.push_back(nodes[pos].token);
+    }
+    
+    return result;
+}
+
+std::vector<int32_t> Tokenizer::encode_with_special_tokens(const std::string& text) const {
+    // Check if entire text is a special token
+    auto special_it = special_tokens_.find(text);
+    if (special_it != special_tokens_.end()) {
+        return {special_it->second};
+    }
+
+    // Check cache (thread-safe read)
+    {
+        std::lock_guard<std::mutex> lock(bpe_cache_mutex_);
+        auto cache_it = bpe_cache_.find(text);
+        if (cache_it != bpe_cache_.end()) {
+            return cache_it->second;
+        }
+    }
+    
+    // Cache miss - compute BPE
+    if (text.empty()) return {};
+    
+    // Convert text to byte-level tokens
+    std::vector<int32_t> byte_tokens = encode_single_token(text);
+    
+    // Apply BPE merges
+    std::vector<int32_t> result = apply_bpe(byte_tokens);
+    
+    // Store in cache (thread-safe write)
+    {
+        std::lock_guard<std::mutex> lock(bpe_cache_mutex_);
+        bpe_cache_[text] = result;
+    }
+    
+    return result;
+}
+
+std::vector<int32_t> Tokenizer::encode_single_token(const std::string& text) const {
+    std::vector<int32_t> byte_tokens;
+    byte_tokens.reserve(text.length());
+    for (char c : text) {
+        const std::string& byte_str = byte_encoder_[static_cast<unsigned char>(c)];
+        auto token_it = token_to_id_.find(byte_str);
+        if (token_it != token_to_id_.end()) {
+            byte_tokens.push_back(token_it->second);
+        } else {
+            byte_tokens.push_back(unk_token_id_);
+        }
+    }
+    return byte_tokens;
+}
+
+bool Tokenizer::is_special_token(int32_t token_id) const {
+    return special_token_ids_.count(token_id) > 0;
 }

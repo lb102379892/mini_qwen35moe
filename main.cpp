@@ -34,7 +34,8 @@
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
-#include "pipeline/inference.h"
+#include "model/model.h"
+#include "pipeline/chat.h"
 #include "api/http_server.h"
 
 // ============================================================
@@ -138,14 +139,14 @@ int main(int argc, char* argv[]) {
 
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
 
-    InferenceEngine engine;
-    if (!engine.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer)) {
-        fprintf(stderr, "Engine initialization failed: %s\n", engine.last_error().c_str());
+    ChatEngine chat;
+    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer)) {
+        fprintf(stderr, "Engine initialization failed\n");
         return 1;
     }
 
     HttpServer server;
-    if (!server.init("0.0.0.0", 6666, &engine)) {
+    if (!server.init("0.0.0.0", 6666, &chat)) {
         fprintf(stderr, "HTTP server initialization failed: %s\n", server.last_error().c_str());
         return 1;
     }

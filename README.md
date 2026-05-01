@@ -9,9 +9,11 @@ built on top of the bundled **ggml** library.
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake .. -DQWEN35MOE_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CUDA_ARCHITECTURES=86
+cmake .. -DQWEN35MOE_CUDA=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CUDA_ARCHITECTURES=86
+cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 make -j$(nproc)
+/home/xc/3rd/cmake-3.31.11-linux-x86_64/bin/cmake
 # Binary: build/test_qwen35moe
 ```
 

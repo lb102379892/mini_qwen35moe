@@ -3,7 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
-#include "pipeline/inference.h"
+#include "pipeline/chat.h"
 
 using RequestHandler = std::function<std::string(const std::string& method, const std::string& path, const std::string& body)>;
 
@@ -18,7 +18,7 @@ public:
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    bool init(const std::string& listen_address, const int http_port, InferenceEngine* engine);
+    bool init(const std::string& listen_address, const int http_port, ChatEngine* engine);
 
     // Start listening (blocking -- call from main thread or a dedicated thread).
     void run();
@@ -37,7 +37,6 @@ private:
 
     // Route handlers
     std::string handle_chat_completions(const std::string& body);
-    void handle_chat_completions_stream(int client_fd, const std::string& body);
     std::string handle_models();
     std::string handle_health();
     std::string handle_metrics();
@@ -50,7 +49,7 @@ private:
     static float extract_json_float(const std::string& json, const std::string& key, float default_value);
     static std::string extract_last_user_content(const std::string& json);
 
-    InferenceEngine* engine_ = nullptr;
+    ChatEngine* engine_ = nullptr;
     int server_fd_ = -1;
     int port_ = 8080;
     std::string listen_address_ = "0.0.0.0";

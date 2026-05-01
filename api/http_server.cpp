@@ -6,6 +6,7 @@
 #include <ctime>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -27,6 +28,32 @@ static constexpr int kListenBacklog = 64;
 
 static constexpr int kMaxGenerateTokens = 4096;
 
+static std::string debug_escape_token_piece(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (unsigned char c : text) {
+        switch (c) {
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02X", c);
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    if (out.size() > 48) {
+        out.resize(48);
+        out += "...";
+    }
+    return out;
+}
+
 HttpServer::~HttpServer() {
     stop();
     if (server_fd_ >= 0) {
@@ -35,7 +62,7 @@ HttpServer::~HttpServer() {
     }
 }
 
-bool HttpServer::init(const std::string& listen_address, const int http_port, InferenceEngine* engine) {
+bool HttpServer::init(const std::string& listen_address, const int http_port, ChatEngine* engine) {
     if (initialized_) {
         last_error_ = "Server already initialized";
         return false;
@@ -187,9 +214,7 @@ void HttpServer::handle_connection(int client_fd) {
         }
         // Detect streaming request
         bool stream = extract_json_bool(body, "stream", false);
-        if (stream) {
-            handle_chat_completions_stream(client_fd, body);
-        } else {
+        if (!stream) {
             std::string response = handle_chat_completions(body);
             send_response(client_fd, 200, "application/json", response);
         }
@@ -203,6 +228,7 @@ void HttpServer::handle_connection(int client_fd) {
         std::string response = handle_metrics();
         send_response(client_fd, 200, "application/json", response);
     } else if (method == "GET" && (path == "/" || path == "/index.html")) {
+        printf("serve_web_ui\n");
         serve_web_ui(client_fd);
     } else {
         send_response(client_fd, 404, "application/json", R"({"error":{"message":"Not found","type":"invalid_request"}})");
@@ -288,7 +314,7 @@ void HttpServer::serve_web_ui(int client_fd) {
     // If the server becomes multi-threaded, protect with std::once_flag.
     static std::string cached_html;
     if (cached_html.empty()) {
-        const char* paths[] = { "web/index.html", "/workspace/web/index.html", nullptr };
+        const char* paths[] = { "web/index.html", "/home/xc/code/my_llama-copy-update.cpp/web/index.html", nullptr };
         for (int i = 0; paths[i]; ++i) {
             FILE* f = std::fopen(paths[i], "rb");
             if (f) {
@@ -360,132 +386,6 @@ bool HttpServer::send_all(int fd, const char* data, size_t len) {
     return true;
 }
 
-void HttpServer::send_sse_response(int client_fd, const std::string& body) {
-    // SSE header
-    std::string header =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n";
-
-    if (!send_all(client_fd, header.data(), header.size())) return;
-
-    // Extract the last user message content to use as prompt
-    std::string user_content = extract_last_user_content(body);
-    if (user_content.empty()) {
-        std::string err_chunk = "data: {\"error\":{\"message\":\"No user message found\"}}\n\n";
-        send_all(client_fd, err_chunk.data(), err_chunk.size());
-        std::string done = "data: [DONE]\n\n";
-        send_all(client_fd, done.data(), done.size());
-        return;
-    }
-
-    if (!engine_) {
-        std::string err_chunk = "data: {\"error\":{\"message\":\"Engine not available\",\"type\":\"server_error\"}}\n\n";
-        send_all(client_fd, err_chunk.data(), err_chunk.size());
-        std::string done = "data: [DONE]\n\n";
-        send_all(client_fd, done.data(), done.size());
-        return;
-    }
-
-    int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
-    if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
-    float temperature = extract_json_float(body, "temperature", -1.0f);
-
-    // Reset context for a fresh generation
-    engine_->reset_context();
-
-    // Apply per-request sampling parameters
-    if (temperature >= 0.0f) {
-        engine_->set_temperature(temperature);
-    }
-
-    const auto& tokenizer = engine_->tokenizer();
-    int eos_id = tokenizer->initialized() ? tokenizer->eos_token_id() : -1;
-
-    // Tokenize the user prompt with Qwen3.5 chat template
-    std::vector<int> prompt_tokens;
-    if (tokenizer->initialized()) {
-        // BOS token prepended to match llama.cpp behavior
-        int bos_id = tokenizer->bos_token_id();
-        if (bos_id >= 0) {
-            prompt_tokens.push_back(bos_id);
-        }
-        int im_start = tokenizer->im_start_token_id();
-        int im_end = tokenizer->im_end_token_id();
-        auto user_tokens = tokenizer->encode("user\n" + user_content);
-        auto asst_tokens = tokenizer->encode("assistant\n");
-        prompt_tokens.push_back(im_start);
-        prompt_tokens.insert(prompt_tokens.end(), user_tokens.begin(), user_tokens.end());
-        prompt_tokens.push_back(im_end);
-        auto nl_tokens = tokenizer->encode("\n");
-        prompt_tokens.insert(prompt_tokens.end(), nl_tokens.begin(), nl_tokens.end());
-        prompt_tokens.push_back(im_start);
-        prompt_tokens.insert(prompt_tokens.end(), asst_tokens.begin(), asst_tokens.end());
-        printf("Tokenized prompt: %zu tokens (with chat template)\n", prompt_tokens.size());
-    } else {
-        for (char ch : user_content)
-            prompt_tokens.push_back(static_cast<int>(static_cast<unsigned char>(ch)));
-    }
-
-    // Prefill: feed prompt tokens through the model
-    int last_prefill_result = 0;
-    for (int tok : prompt_tokens) {
-        last_prefill_result = engine_->generate_token(tok);
-        if (last_prefill_result < 0) {
-            printf("Prefill failed: %s\n", engine_->last_error().c_str());
-            break;
-        }
-    }
-
-    // Auto-regressive generation: first token is the last prefill result
-    int prev_token = last_prefill_result;
-    for (int i = 0; i < max_tokens; ++i) {
-        int token_id = engine_->generate_token(prev_token);
-        if (token_id < 0) {
-            printf("Generation failed at step %d: %s\n", i, engine_->last_error().c_str());
-            break;
-        }
-        if (token_id == eos_id) break;
-
-        // Decode token to text using BPE detokenizer
-        std::string token_str = tokenizer->initialized() ? tokenizer->decode(token_id) : std::string(1, static_cast<char>(token_id & 0x7F));
-        std::string escaped = json_escape(token_str);
-
-        long ts = static_cast<long>(std::time(nullptr));
-        std::ostringstream oss;
-        oss << "data: {\"id\":\"gen-phantom\",\"object\":\"chat.completion.chunk\","
-            << "\"created\":" << ts << ","
-            << "\"model\":\"" << kModelId << "\","
-            << "\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
-            << escaped << "\"},\"finish_reason\":null}]}\n\n";
-        std::string chunk = oss.str();
-        if (!send_all(client_fd, chunk.data(), chunk.size())) {
-            printf("Client disconnected during streaming\n");
-            return;
-        }
-
-        prev_token = token_id;
-    }
-
-    // Send final chunk with finish_reason "stop"
-    {
-        long ts = static_cast<long>(std::time(nullptr));
-        std::ostringstream oss;
-        oss << "data: {\"id\":\"gen-phantom\",\"object\":\"chat.completion.chunk\","
-            << "\"created\":" << ts << ","
-            << "\"model\":\"" << kModelId << "\","
-            << "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
-        std::string final_chunk = oss.str();
-        send_all(client_fd, final_chunk.data(), final_chunk.size());
-    }
-
-    std::string done = "data: [DONE]\n\n";
-    send_all(client_fd, done.data(), done.size());
-}
-
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -500,82 +400,7 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
     float temperature = extract_json_float(body, "temperature", -1.0f);
 
     std::string generated_text;
-    if (engine_) {
-        engine_->reset_context();
-
-        // Apply per-request sampling parameters
-        if (temperature >= 0.0f) {
-            engine_->set_temperature(temperature);
-        }
-
-        const auto& tokenizer = engine_->tokenizer();
-        int eos_id = tokenizer->initialized() ? tokenizer->eos_token_id() : -1;
-
-        // Tokenize the user prompt with Qwen3.5 chat template
-        std::vector<int> prompt_tokens;
-        if (tokenizer->initialized()) {
-            // BOS token prepended to match llama.cpp behavior
-            int bos_id = tokenizer->bos_token_id();
-            if (bos_id >= 0) {
-                prompt_tokens.push_back(bos_id);
-            }
-            // Chat template: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
-            int im_start = tokenizer->im_start_token_id();
-            int im_end = tokenizer->im_end_token_id();
-            auto user_tokens = tokenizer->encode("user\n" + user_content);
-            auto asst_tokens = tokenizer->encode("assistant\n");
-            prompt_tokens.push_back(im_start);
-            prompt_tokens.insert(prompt_tokens.end(), user_tokens.begin(), user_tokens.end());
-            prompt_tokens.push_back(im_end);
-            auto nl_tokens = tokenizer->encode("\n");
-            prompt_tokens.insert(prompt_tokens.end(), nl_tokens.begin(), nl_tokens.end());
-            prompt_tokens.push_back(im_start);
-            prompt_tokens.insert(prompt_tokens.end(), asst_tokens.begin(), asst_tokens.end());
-        } else {
-            for (char ch : user_content)
-                prompt_tokens.push_back(static_cast<int>(static_cast<unsigned char>(ch)));
-        }
-
-        // Dump prompt token IDs for debugging
-        {
-            std::string tok_str;
-            for (size_t i = 0; i < prompt_tokens.size(); i++) {
-                if (i > 0) tok_str += ", ";
-                tok_str += std::to_string(prompt_tokens[i]);
-            }
-            printf("Prompt tokens (%zu): [%s] [%s]\n", prompt_tokens.size(), tok_str.c_str(), user_content.c_str());
-        }
-
-        // Prefill: feed prompt tokens through the model
-        printf("Prefill: %zu tokens\n", prompt_tokens.size());
-        int last_prefill_result = 0;
-        for (int tok : prompt_tokens) {
-            last_prefill_result = engine_->generate_token(tok);
-            if (last_prefill_result < 0) {
-                printf("Prefill failed: %s\n", engine_->last_error().c_str());
-                break;
-            }
-        }
-
-        // Auto-regressive generation: first token is the last prefill result
-        int prev_token = last_prefill_result;
-        std::string temp = "";
-        printf("Prefill done. Last prefill result (first gen token): %d\n", last_prefill_result);
-        for (int i = 0; i < max_tokens; ++i) {
-            int token_id = engine_->generate_token(prev_token);
-            if (token_id < 0) break;
-            if (token_id == eos_id) break;
-
-            temp = tokenizer->initialized() ? tokenizer->decode(token_id) : std::string(1, static_cast<char>(token_id & 0x7F));
-            printf("%s", temp.c_str());
-            generated_text += temp;
-            prev_token = token_id;
-        }
-        printf("\n");
-    } else {
-        generated_text = "Engine not available";
-    }
-
+    engine_->run_complete(user_content, max_tokens, generated_text);
     std::string escaped_content = json_escape(generated_text);
 
     // Build OpenAI-compatible response
@@ -592,10 +417,6 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
         << "}";
 
     return oss.str();
-}
-
-void HttpServer::handle_chat_completions_stream(int client_fd, const std::string& body) {
-    send_sse_response(client_fd, body);
 }
 
 std::string HttpServer::handle_models() {

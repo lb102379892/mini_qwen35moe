@@ -2,9 +2,7 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
-#ifdef QWEN35MOE_USE_CUDA
 #include <ggml-cuda.h>
-#endif
 #include "model/model.h"
 
 static const std::unordered_map<EN_LAYER_TYPE, const char *> g_layer_tensor_names = {
@@ -61,6 +59,9 @@ Qwen35moeModel::~Qwen35moeModel() {
         ggml_free(cpu_ctx_);
         cpu_ctx_ = nullptr;
     }
+    if (sched_) {
+        ggml_backend_sched_free(sched_);
+    }
     if (backend_gpu_) {
         ggml_backend_free(backend_gpu_);
         backend_gpu_ = nullptr;
@@ -93,11 +94,10 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         printf("[Loader] Config loading failed\n");
         return false;
     }
+    if (dev_mode == DevMode::GPU_MODE)
+        gpu_layer_ = meta_->qwen35moe.block_count; // GPU模式下全部层都放在GPU上
 
-    if (dev_mode == DevMode::CPU_MODE || dev_mode == DevMode::AURO_MODE) {
-        cpu_ctx_ = reader_->ggml_ctx_;
-    }
-#ifdef QWEN35MOE_USE_CUDA
+    cpu_ctx_ = reader_->ggml_ctx_;
     if (dev_mode == DevMode::GPU_MODE || dev_mode == DevMode::AURO_MODE) {
         auto mem_size = ggml_get_mem_size(cpu_ctx_);
         ggml_init_params gpu_p = { mem_size, nullptr, true };
@@ -107,7 +107,6 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
             return false;
         }
     }
-#endif
 
     // 2: model weights
     if (!load_qwen35moe(meta_->qwen35moe.block_count)) {
@@ -115,13 +114,7 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         return false;
     }
 
-    // 3: tensor loader
-    if (!tensor_loader_->load(model_path_)) {
-        printf("[Loader] Tensor loading failed\n");
-        return false;
-    }
-    
-    if (dev_mode == DevMode::CPU_MODE || dev_mode == DevMode::AURO_MODE) {
+    {
         backend_cpu_ = ggml_backend_cpu_init();
         if (!backend_cpu_) {
             fprintf(stderr, "[Loader] ERROR: failed to init CPU backend\n");
@@ -137,23 +130,59 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
     }
     printf("success backend_cpu initialized\n");
 
-#ifdef QWEN35MOE_USE_CUDA
     if (dev_mode == DevMode::GPU_MODE || dev_mode == DevMode::AURO_MODE) {
-        backend_gpu_ = ggml_backend_cuda_init(0);
+        int gpu_id = 0;
+        backend_gpu_ = ggml_backend_cuda_init(gpu_id);
         if (!backend_gpu_) {
             fprintf(stderr, "[Loader] ERROR: failed to init GPU backend\n");
             return false;
         }
+
+        int device_count = ggml_backend_cuda_get_device_count();
+        if (device_count == 0) {
+            printf("No CUDA devices found\n");
+            return false;
+        }
+        if (gpu_id >= device_count) {
+            printf("Invalid device %d (only %d available)\n", gpu_id, device_count);
+            return false;
+        }
+
+        size_t free_mem, total_mem;
+        ggml_backend_cuda_get_device_memory(gpu_id, &free_mem, &total_mem);
+        printf("Device %d: %.2f GB free / %.2f GB total\n", gpu_id, free_mem / 1e9, total_mem / 1e9);
 
         gpu_buf_ = ggml_backend_alloc_ctx_tensors(gpu_ctx_, backend_gpu_);
         if (!gpu_buf_) {
             fprintf(stderr, "[Loader] ERROR: failed to allocate GPU weight buffer\n");
             return false;
         }
+
+        printf("GPU weights buffer: %.2f MB\n", ggml_backend_buffer_get_size(gpu_buf_) / 1e6);
     }
     printf("success backend_gpu initialized\n");
-#endif
 
+    if (backend_gpu_) {
+        ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
+        fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
+    } else {
+        ggml_backend_t backends[] = {backend_cpu_};
+        sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
+        fprintf(stderr, "Scheduler created with CPU backend only\n");
+    }
+    
+    if (!sched_) {
+        fprintf(stderr, "Failed to create backend scheduler\n");
+        return false;
+    }
+
+    // 3: tensor loader
+    if (!tensor_loader_->load(model_path_)) {
+        printf("[Loader] Tensor loading failed\n");
+        return false;
+    }
+    
     // set weights data
     if (!set_tensors_data(meta_->qwen35moe.block_count)) {
         printf("[Loader] set_tensors_data failed\n");
@@ -173,6 +202,10 @@ ggml_backend_t Qwen35moeModel::get_curr_backend() {
         return backend_gpu_;
 }
 
+ggml_backend_sched_t Qwen35moeModel::get_scheduler() const { 
+    return sched_; 
+}
+
 ggml_tensor* Qwen35moeModel::get_weight_tensor(const EN_WEIGHT_TYPE weight_type) {
     if (dev_mode_ == DevMode::CPU_MODE)
         return cpu_weights_->heads[weight_type];
@@ -189,6 +222,146 @@ ggml_tensor* Qwen35moeModel::get_weight_layer_tensor(const EN_LAYER_TYPE layer_t
     } else {
         return cpu_weights_->layers[layer_idx - gpu_layer_]->tensors[layer_type];
     }
+}
+
+struct ggml_tensor* Qwen35moeModel::get_token_embedding_weight()
+{
+    return get_weight_tensor(EN_WEIGHT_TYPE_TOKEN_EMBD);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_output_weight()
+{
+    return get_weight_tensor(EN_WEIGHT_TYPE_OUTPUT);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_output_norm_weight()
+{
+    return get_weight_tensor(EN_WEIGHT_TYPE_OUTPUT_NORM);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_k_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_K, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_k_norm_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_K_NORM, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_norm_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_NORM, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_gate_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_GATE, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_qkv_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_QKV, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_q_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_Q, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_q_norm_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_Q_NORM, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_v_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_V, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_down_exps_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_DOWN_EXPS, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_gate_exps_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_GATE_EXPS, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_gate_inp_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_GATE_INP, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_up_exps_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_UP_EXPS, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_down_shexp_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_DOWN_SHEXP, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_gate_inp_shexp_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_GATE_INP_SHEXP, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_gate_shexp_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_GATE_SHEXP, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ffn_up_shexp_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_FFN_UP_SHEXP, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_a_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_A, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_alpha_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_ALPHA, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_beta_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_BETA, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_conv1d_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_CONV1D, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_dt_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_DT, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_norm_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_NORM, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_ssm_out_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_SSM_OUT, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_post_attention_norm_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_POST_ATTENTION_NORM, layer_idx);
+}
+
+struct ggml_tensor* Qwen35moeModel::get_attn_output_weight(const int layer_idx)
+{
+    return get_weight_layer_tensor(EN_LAYER_TYPE_ATTN_OUTPUT, layer_idx);
 }
 
 bool Qwen35moeModel::load_metadata() {

@@ -116,6 +116,7 @@ public:
     std::vector<std::string> ggml_merges;
     uint32_t ggml_eos_token_id = 0;
     uint32_t ggml_padding_token_id = 0;
+    uint32_t ggml_bos_token_id = 0;
     std::string chat_template = "";
 
     void load_from_gguf(struct gguf_context* gctx);
