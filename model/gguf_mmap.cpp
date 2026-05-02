@@ -274,6 +274,12 @@ bool GGUFLoader::prase_model_file() {
                 return false;
             }
         }
+
+        alignment_idx_ = get_u32_or(GGUF_KEY_GENERAL_ALIGNMENT, GGUF_DEFAULT_ALIGNMENT);
+        if (alignment_idx_ == 0 || (alignment_idx_ & (alignment_idx_ - 1)) != 0) {
+            printf("%s: alignment %u is not a power of 2\n", __func__, alignment_idx_);
+            return false;
+        }
     }
 
     // 读取张量信息
@@ -351,6 +357,7 @@ bool GGUFLoader::prase_model_file() {
         }
     }
     data_offset_ = pos_;
+    data_offset_ = GGML_PAD(data_offset_, alignment_idx_);
 
     return true;
 }
@@ -358,7 +365,9 @@ bool GGUFLoader::prase_model_file() {
 int GGUFLoader::get_all_tensor_bytesize() {
     size_t total = 0;
     for (const auto& info : tensors_) {
-        total += info.byte_size;
+        // 内存对齐要求（通常是 32 字节）,将数值 info.byte_size 向上取整到 ctx->alignment 的最小倍数，ctx->alignment的倍数
+        size_t padded_size = GGML_PAD(info.byte_size, alignment_idx_);
+        total += padded_size;
     }
 
     return total;
@@ -368,6 +377,8 @@ bool GGUFLoader::load_tensor_data(ggml_tensor* dst) {
     auto index = tensor_index_map_[dst->name];
     auto* tensor_info = &tensors_[index];
 
+    printf("Loading tensor %s to %p, data_offset_=%lu, offset=%llu, byte_size:%lu\n", 
+        dst->name, dst, data_offset_, tensor_info->offset, tensor_info->byte_size);
     ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
     return true;
 }
@@ -448,8 +459,8 @@ void GGUFLoader::print_prase_info() const {
                 printf(", ");
             }
         }
-        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, offset=%llu\n",
-            t.type, t.type_size, t.blck_size, t.byte_size, t.offset);
+        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu\n",
+            t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset);
     }
 }
 

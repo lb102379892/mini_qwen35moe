@@ -86,6 +86,13 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         return false;
     }
 
+    // std::shared_ptr<GGUFReader> reader_ = std::make_shared<GGUFReader>();
+    // if (false == reader_->open(model_path_)) {
+    //     printf("[Loader] ERROR: failed open modelfile(%s)\n", model_path_.c_str());
+    //     return false;
+    // }
+    // print_context_info(reader_->gguf_ctx_, reader_->ggml_ctx_);
+
     // 1: metadata
     if (!load_metadata()) {
         printf("[Loader] Config loading failed\n");
@@ -181,7 +188,7 @@ bool Qwen35moeModel::init_cpu() {
     for (auto& head_iter : cpu_weights_->heads) {
         loader_->load_tensor_data(head_iter.second);
     }
-    for (auto layer_iter : cpu_weights_->layers) {
+    for (auto& layer_iter : cpu_weights_->layers) {
         for (auto& layer_info : layer_iter->tensors) {
             loader_->load_tensor_data(layer_info.second);
         }
@@ -223,7 +230,7 @@ bool Qwen35moeModel::init_gpu() {
         }
 
         auto* tensor_info = &loader_->tensors_[it->second];
-        struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+        struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
         ggml_set_name(cur, tensor_info->name.c_str());
         if (NULL != cur) {
             gpu_weights_->heads[weight_info.first] = cur;
@@ -241,7 +248,7 @@ bool Qwen35moeModel::init_gpu() {
             }
             
             auto* tensor_info = &loader_->tensors_[it->second];
-            struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+            struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
             ggml_set_name(cur, tensor_info->name.c_str());
             if (NULL != cur) {
                 layer->tensors[layer_info.first] = cur;
@@ -256,16 +263,16 @@ bool Qwen35moeModel::init_gpu() {
         return false;
     }
 
-    for (auto head_iter : gpu_weights_->heads) {
+    for (auto& head_iter : gpu_weights_->heads) {
         loader_->load_tensor_data(head_iter.second);
     }
-    for (auto layer_iter : gpu_weights_->layers) {
+    for (auto& layer_iter : gpu_weights_->layers) {
         for (auto& layer_info : layer_iter->tensors) {
             loader_->load_tensor_data(layer_info.second);
         }
     }
     
-    printf("[Loader] CPU weight loading complete\n");
+    printf("[Loader] GPU weight loading complete\n");
     return true;
 }
 
@@ -291,11 +298,6 @@ ggml_tensor* Qwen35moeModel::get_weight_layer_tensor(const EN_LAYER_TYPE layer_t
         return cpu_weights_->layers[layer_idx]->tensors[layer_type];
     if (dev_mode_ == DevMode::GPU_MODE)
         return gpu_weights_->layers[layer_idx]->tensors[layer_type];
-    if (layer_idx < gpu_layer_) {
-        return gpu_weights_->layers[layer_idx]->tensors[layer_type];
-    } else {
-        return cpu_weights_->layers[layer_idx - gpu_layer_]->tensors[layer_type];
-    }
 }
 
 struct ggml_tensor* Qwen35moeModel::get_token_embedding_weight()
@@ -444,4 +446,17 @@ bool Qwen35moeModel::load_metadata() {
 
 int Qwen35moeModel::get_ctx_size() {
     return meta_->qwen35moe.context_length;
+}
+
+void Qwen35moeModel::print_context_info(gguf_context* gguf_ctx, ggml_context* ctx_) {
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx_); cur != NULL; cur = ggml_get_next_tensor(ctx_, cur)) {
+        const char* name = ggml_get_name(cur);
+        size_t n_size = ggml_nbytes(cur);
+        ggml_type type = cur->type;
+        ggml_op op = cur->op;
+        size_t data_offs = gguf_get_tensor_offset(gguf_ctx, gguf_find_tensor(gguf_ctx, name));
+        size_t file_offs = gguf_get_data_offset(gguf_ctx) + data_offs;      
+        void* data = ggml_get_data(cur);
+        printf("Tensor: %s, size: %d, type: %d, op: %d, data_offs: %lu, file_offs: %lu, data: %p, view_src: %p\n", name, n_size, type, op, data_offs, file_offs, data, cur->view_src);
+    }
 }

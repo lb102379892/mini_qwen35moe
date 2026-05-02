@@ -205,6 +205,7 @@ private:
     bool read(T& dst) const {
         const size_t size = sizeof(dst);
         if (nbytes_remain_ < size) {
+            printf("%s: failed to read value(size:%lu)\n", __func__, size);
             return false;
         }
 
@@ -217,21 +218,26 @@ private:
     template <typename T>
     bool read(std::vector<T> & dst, const size_t n) const {
         if (n > GGUF_MAX_ARRAY_ELEMENTS) {
+            printf("%s: failed to read value(n:%lu)\n", __func__, n);
             return false;
         }
         if constexpr (std::is_same<T, std::string>::value) {
             // strings are prefixed with their length, so we need to account for that
             if (n > SIZE_MAX / sizeof(uint64_t)) {
+                printf("%s: failed to read value(n:%lu)\n", __func__, n);
                 return false;
             }
             if (nbytes_remain_ < n * sizeof(uint64_t)) {
+                printf("%s: failed to read value(n:%lu)\n", __func__, n);
                 return false;
             }
         } else {
             if (n > SIZE_MAX / sizeof(T)) {
+                printf("%s: failed to read value(n:%lu)\n", __func__, n);
                 return false;
             }
             if (nbytes_remain_ < n * sizeof(T)) {
+                printf("%s: failed to read value(n:%lu)\n", __func__, n);
                 return false;
             }
         }
@@ -241,11 +247,13 @@ private:
             if constexpr (std::is_same<T, bool>::value) {
                 bool tmp;
                 if (!read(tmp)) {
+                    printf("%s: failed to read value(i:%lu)\n", __func__, i);
                     return false;
                 }
                 dst[i] = tmp;
             } else {
                 if (!read(dst[i])) {
+                    printf("%s: failed to read value(i:%lu)\n", __func__, i);
                     return false;
                 }
             }
@@ -298,6 +306,7 @@ public:
     std::map<std::string, size_t> kv_index_map_;
     std::vector<struct tensor_info> tensors_;
     std::map<std::string, size_t> tensor_index_map_;
+    uint32_t alignment_idx_ = 0;
 
 private:
     int fd_ = -1;

@@ -61,6 +61,7 @@ public:
 private:
     bool load_metadata();
     int get_ctx_size();
+    void print_context_info(gguf_context* gguf_ctx, ggml_context* ctx_);
 
 public:
     DevMode dev_mode_ = DevMode::CPU_MODE;
