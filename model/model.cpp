@@ -77,15 +77,12 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
     dev_mode_ = dev_mode;
     n_threads_ = n_threads;
     gpu_layer_ = gpu_layer;
-    reader_ = std::make_shared<GGUFReader>();
+    loader_ = std::make_shared<GGUFLoader>();
     meta_ = std::make_shared<MetaDataInfo>();
-    if (dev_mode == DevMode::CPU_MODE || dev_mode == DevMode::AURO_MODE)
-        cpu_weights_ = std::make_shared<Qwen35moeWeights>();
-    if (dev_mode == DevMode::GPU_MODE || dev_mode == DevMode::AURO_MODE)
-        gpu_weights_ = std::make_shared<Qwen35moeWeights>();
-    tensor_loader_ = std::make_shared<GGUFMmapTensorLoader>();
-    if (false == reader_->open(model_path_)) {
-        printf("[Loader] ERROR: failed open modelfile(%s)\n", model_path_.c_str());
+
+    // 0: model file loader
+    if (!loader_->load(model_path_)) {
+        printf("[Loader] Tensor loading failed\n");
         return false;
     }
 
@@ -94,73 +91,13 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         printf("[Loader] Config loading failed\n");
         return false;
     }
-    if (dev_mode == DevMode::GPU_MODE)
-        gpu_layer_ = meta_->qwen35moe.block_count; // GPU模式下全部层都放在GPU上
 
-    cpu_ctx_ = reader_->ggml_ctx_;
-    if (dev_mode == DevMode::GPU_MODE || dev_mode == DevMode::AURO_MODE) {
-        auto mem_size = ggml_get_mem_size(cpu_ctx_);
-        ggml_init_params gpu_p = { mem_size, nullptr, true };
-        gpu_ctx_ = ggml_init(gpu_p);
-        if (!gpu_ctx_) {
-            fprintf(stderr, "[Loader] ERROR: failed to init weight contexts\n");
-            return false;
-        }
+    if (dev_mode == DevMode::CPU_MODE) {
+        init_cpu();
     }
-
-    // 2: model weights
-    if (!load_qwen35moe(meta_->qwen35moe.block_count)) {
-        printf("[Loader] Tensor loading failed\n");
-        return false;
+    else {
+        init_gpu();
     }
-
-    {
-        backend_cpu_ = ggml_backend_cpu_init();
-        if (!backend_cpu_) {
-            fprintf(stderr, "[Loader] ERROR: failed to init CPU backend\n");
-            return false;
-        }
-        ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
-
-        cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
-        if (!cpu_buf_) {
-            fprintf(stderr, "[Loader] ERROR: failed to allocate CPU weight buffer\n");
-            return false;
-        }
-    }
-    printf("success backend_cpu initialized\n");
-
-    if (dev_mode == DevMode::GPU_MODE || dev_mode == DevMode::AURO_MODE) {
-        int gpu_id = 0;
-        backend_gpu_ = ggml_backend_cuda_init(gpu_id);
-        if (!backend_gpu_) {
-            fprintf(stderr, "[Loader] ERROR: failed to init GPU backend\n");
-            return false;
-        }
-
-        int device_count = ggml_backend_cuda_get_device_count();
-        if (device_count == 0) {
-            printf("No CUDA devices found\n");
-            return false;
-        }
-        if (gpu_id >= device_count) {
-            printf("Invalid device %d (only %d available)\n", gpu_id, device_count);
-            return false;
-        }
-
-        size_t free_mem, total_mem;
-        ggml_backend_cuda_get_device_memory(gpu_id, &free_mem, &total_mem);
-        printf("Device %d: %.2f GB free / %.2f GB total\n", gpu_id, free_mem / 1e9, total_mem / 1e9);
-
-        gpu_buf_ = ggml_backend_alloc_ctx_tensors(gpu_ctx_, backend_gpu_);
-        if (!gpu_buf_) {
-            fprintf(stderr, "[Loader] ERROR: failed to allocate GPU weight buffer\n");
-            return false;
-        }
-
-        printf("GPU weights buffer: %.2f MB\n", ggml_backend_buffer_get_size(gpu_buf_) / 1e6);
-    }
-    printf("success backend_gpu initialized\n");
 
     if (backend_gpu_) {
         ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
@@ -177,21 +114,158 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         return false;
     }
 
-    // 3: tensor loader
-    if (!tensor_loader_->load(model_path_)) {
-        printf("[Loader] Tensor loading failed\n");
+    printf("==================Loading Complete!======================\n");
+    return true;
+}
+
+bool Qwen35moeModel::init_cpu() {
+    printf("\n===================Loading Qwen35moe Model to CPU=====================\n");
+    backend_cpu_ = ggml_backend_cpu_init();
+    if (!backend_cpu_) {
+        fprintf(stderr, "[Loader] ERROR: failed to init CPU backend\n");
         return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend_cpu_, n_threads_);
+
+    const size_t ctx_size = (meta_->head.tensor_count + 1) * ggml_tensor_overhead();
+    ggml_init_params cpu_p = { ctx_size, nullptr, true };
+    cpu_ctx_ = ggml_init(cpu_p);
+    if (!cpu_ctx_) {
+        fprintf(stderr, "[Loader] ERROR: failed to init weight contexts\n");
+        return false;
+    }
+
+    cpu_weights_ = std::make_shared<Qwen35moeWeights>();
+    for (auto& weight_info : g_weight_tensor_names) {
+        auto it = loader_->tensor_index_map_.find(weight_info.second);
+        if (it == loader_->tensor_index_map_.end()) {
+            fprintf(stderr, "[Loader] ERROR: failed to find tensor %s in model file\n", weight_info.second);
+            return false;
+        }
+
+        auto* tensor_info = &loader_->tensors_[it->second];
+        struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+        ggml_set_name(cur, tensor_info->name.c_str());
+        if (NULL != cur) {
+            cpu_weights_->heads[weight_info.first] = cur;
+        }
+    }
+
+    for (int layer_idx = 0; layer_idx < meta_->qwen35moe.block_count; layer_idx++) {
+        std::string prefix = "blk." + std::to_string(layer_idx);
+        std::shared_ptr<Qwen35moeLayer> layer = std::make_shared<Qwen35moeLayer>();
+        for (auto& layer_info : g_layer_tensor_names) {
+            std::string name = prefix + layer_info.second;
+            auto it = loader_->tensor_index_map_.find(name);
+            if (it == loader_->tensor_index_map_.end()) {
+                continue;
+            }
+            
+            auto* tensor_info = &loader_->tensors_[it->second];
+            struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+            ggml_set_name(cur, tensor_info->name.c_str());
+            if (NULL != cur) {
+                layer->tensors[layer_info.first] = cur;
+            }
+        }
+        cpu_weights_->layers.push_back(layer);
+    }
+
+    // 在 CPU 上分配 buffer
+    cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
+    if (!cpu_buf_) {
+        fprintf(stderr, "[Loader] ERROR: failed to allocate CPU weight buffer\n");
+        return false;
+    }
+
+    for (auto& head_iter : cpu_weights_->heads) {
+        loader_->load_tensor_data(head_iter.second);
+    }
+    for (auto layer_iter : cpu_weights_->layers) {
+        for (auto& layer_info : layer_iter->tensors) {
+            loader_->load_tensor_data(layer_info.second);
+        }
+    }
+
+    printf("[Loader] CPU weight loading complete\n");
+    return true;
+}
+
+bool Qwen35moeModel::init_gpu() {
+    printf("\n===================Loading Qwen35moe Model to GPU=====================\n");
+    backend_gpu_ = ggml_backend_init_best();
+    if (!backend_gpu_) {
+        fprintf(stderr, "[Loader] ERROR: failed to init GPU backend\n");
+        return false;
+    }
+
+    int device_count = ggml_backend_cuda_get_device_count();
+    if (device_count == 0) {
+        printf("No CUDA devices found\n");
+        return false;
+    }
+    int gpu_id = 0;
+    if (gpu_id >= device_count) {
+        printf("Invalid device %d (only %d available)\n", gpu_id, device_count);
+        return false;
+    }
+
+    size_t free_mem, total_mem;
+    ggml_backend_cuda_get_device_memory(gpu_id, &free_mem, &total_mem);
+    printf("Device %d: %.2f GB free / %.2f GB total\n", gpu_id, free_mem / 1e9, total_mem / 1e9);
+
+    gpu_weights_ = std::make_shared<Qwen35moeWeights>();
+    for (auto& weight_info : g_weight_tensor_names) {
+        auto it = loader_->tensor_index_map_.find(weight_info.second);
+        if (it == loader_->tensor_index_map_.end()) {
+            fprintf(stderr, "[Loader] ERROR: failed to find tensor %s in model file\n", weight_info.second);
+            return false;
+        }
+
+        auto* tensor_info = &loader_->tensors_[it->second];
+        struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+        ggml_set_name(cur, tensor_info->name.c_str());
+        if (NULL != cur) {
+            gpu_weights_->heads[weight_info.first] = cur;
+        }
+    }
+
+    for (int layer_idx = 0; layer_idx < meta_->qwen35moe.block_count; layer_idx++) {
+        std::string prefix = "blk." + std::to_string(layer_idx);
+        std::shared_ptr<Qwen35moeLayer> layer = std::make_shared<Qwen35moeLayer>();
+        for (auto& layer_info : g_layer_tensor_names) {
+            std::string name = prefix + layer_info.second;
+            auto it = loader_->tensor_index_map_.find(name);
+            if (it == loader_->tensor_index_map_.end()) {
+                continue;
+            }
+            
+            auto* tensor_info = &loader_->tensors_[it->second];
+            struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+            ggml_set_name(cur, tensor_info->name.c_str());
+            if (NULL != cur) {
+                layer->tensors[layer_info.first] = cur;
+            }
+        }
+        gpu_weights_->layers.push_back(layer);
+    }
+
+    gpu_buf_ = ggml_backend_alloc_ctx_tensors(gpu_ctx_, backend_gpu_);
+    if (!gpu_buf_) {
+        fprintf(stderr, "[Loader] ERROR: failed to allocate GPU weight buffer\n");
+        return false;
+    }
+
+    for (auto head_iter : gpu_weights_->heads) {
+        loader_->load_tensor_data(head_iter.second);
+    }
+    for (auto layer_iter : gpu_weights_->layers) {
+        for (auto& layer_info : layer_iter->tensors) {
+            loader_->load_tensor_data(layer_info.second);
+        }
     }
     
-    // set weights data
-    if (!set_tensors_data(meta_->qwen35moe.block_count)) {
-        printf("[Loader] set_tensors_data failed\n");
-        return false;
-    }
-
-    //print_context_info(cpu_ctx_);
-
-    printf("==================Loading Complete!======================\n");
+    printf("[Loader] CPU weight loading complete\n");
     return true;
 }
 
@@ -365,157 +439,9 @@ struct ggml_tensor* Qwen35moeModel::get_attn_output_weight(const int layer_idx)
 }
 
 bool Qwen35moeModel::load_metadata() {
-    return meta_->load_from_gguf(reader_->gguf_ctx_);
-}
-
-bool Qwen35moeModel::set_tensor_data(const size_t data_offset, ggml_tensor* tensor) {
-    auto gguf_ctx = reader_->gguf_ctx_;
-    int64_t tensor_idx = gguf_find_tensor(reader_->gguf_ctx_, tensor->name);
-
-    const size_t nbytes = ggml_nbytes(tensor);
-    const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-    const size_t file_offset = data_offset + tensor_offset;
-
-    std::vector<uint8_t> tensor_data;
-    tensor_loader_->get_tensor_data(file_offset, nbytes, tensor_data);
-    ggml_backend_tensor_set(tensor, tensor_data.data(), 0, tensor_data.size());
-
-    return true;
-}
-
-bool Qwen35moeModel::load_qwen35moe(const int layer_count) {
-    printf("[Loader] load_qwen35moe...\n");
-
-    if (dev_mode_ == DevMode::CPU_MODE) {
-        for (auto& weight : g_weight_tensor_names) {
-            struct ggml_tensor *tensor = ggml_get_tensor(cpu_ctx_, weight.second);
-            if (NULL != tensor) {
-                cpu_weights_->heads[weight.first] = tensor;
-            }
-        }
-
-        for (uint32_t i = 0; i < layer_count; ++i) {
-            std::shared_ptr<Qwen35moeLayer> layer = std::make_shared<Qwen35moeLayer>();
-            load_qwen35moe_layer(layer, i);
-            cpu_weights_->layers.push_back(layer);
-        }
-    } else {
-        for (auto& weight : g_weight_tensor_names) {
-            struct ggml_tensor *tensor = ggml_get_tensor(cpu_ctx_, weight.second);
-            if (NULL == tensor) {
-                continue;
-            }
-            ggml_tensor* new_tensor = ggml_dup_tensor(gpu_ctx_, tensor);
-            if (NULL != new_tensor) {
-                ggml_set_name(new_tensor, tensor->name);
-                gpu_weights_->heads[weight.first] = new_tensor;
-            }
-        }
-
-        for (uint32_t i = 0; i < layer_count; ++i) {
-            std::shared_ptr<Qwen35moeLayer> layer = std::make_shared<Qwen35moeLayer>();
-            load_qwen35moe_layer(layer, i);
-            if (i < gpu_layer_) {
-                gpu_weights_->layers.push_back(layer);
-            } else {
-                cpu_weights_->layers.push_back(layer);
-            }
-        }
-    }
-
-    printf("[Loader] LLM loaded tensors [OK]\n");
-    return true;
-}
-
-void Qwen35moeModel::load_qwen35moe_layer(std::shared_ptr<Qwen35moeLayer>& layer, int layer_idx) {
-    auto& layer_tensors = layer->tensors;
-    std::string prefix = "blk." + std::to_string(layer_idx);
-
-    std::string name = "";
-    for (auto& layer : g_layer_tensor_names) {
-        name = prefix + layer.second;
-        struct ggml_tensor *tensor = ggml_get_tensor(cpu_ctx_, name.c_str());
-        if (NULL == tensor) {
-            continue;
-        }
-        
-        if (dev_mode_ == DevMode::CPU_MODE || layer_idx >= gpu_layer_) {
-            layer_tensors[layer.first] = tensor;
-        } else {
-            ggml_tensor* new_tensor = ggml_dup_tensor(gpu_ctx_, tensor);
-            if (NULL != new_tensor) {
-                ggml_set_name(new_tensor, tensor->name);
-                layer_tensors[layer.first] = new_tensor;
-            }
-        }
-    }
-}
-
-bool Qwen35moeModel::set_tensors_data(const int layer_count) {
-    printf("[Loader] set_tensors_data...\n");
-
-    auto gguf_ctx = reader_->gguf_ctx_;
-    const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-
-    if (dev_mode_ == DevMode::CPU_MODE) {
-        std::shared_ptr<Qwen35moeWeights> weights = dev_mode_ == DevMode::CPU_MODE ? cpu_weights_ : gpu_weights_;
-        ggml_context* ctx = dev_mode_ == DevMode::CPU_MODE ? cpu_ctx_ : gpu_ctx_;
-
-        for (auto& weight : g_weight_tensor_names) {
-            if (weights->heads.find(weight.first) != weights->heads.end()) {
-                set_tensor_data(data_offset, weights->heads[weight.first]);
-            }
-        }
-
-        for (uint32_t i = 0; i < layer_count; ++i) {
-            set_tensors_layer_data(ctx, weights->layers[i], data_offset, i);
-        }
-    } else {
-        for (auto& weight : g_weight_tensor_names) {
-            if (gpu_weights_->heads.find(weight.first) != gpu_weights_->heads.end()) {
-                set_tensor_data(data_offset, gpu_weights_->heads[weight.first]);
-            }
-        }
-
-        for (uint32_t i = 0; i < layer_count; ++i) {
-            if (i < gpu_layer_) {
-                set_tensors_layer_data(gpu_ctx_, gpu_weights_->layers[i], data_offset, i);
-            } else {
-                set_tensors_layer_data(cpu_ctx_, cpu_weights_->layers[i - gpu_layer_], data_offset, i);
-            }
-        }
-    }
-
-    printf("[Loader] set_tensors_data [OK]\n");
-    return true;
-}
-
-bool Qwen35moeModel::set_tensors_layer_data(ggml_context* ctx, std::shared_ptr<Qwen35moeLayer>& layer, const size_t data_offset, int layer_idx) {
-    auto& layer_tensors = layer->tensors;
-
-    std::string name = "";
-    for (auto& layer : g_layer_tensor_names) {
-        if (layer_tensors.find(layer.first) != layer_tensors.end()) {
-            set_tensor_data(data_offset, layer_tensors[layer.first]);
-        }
-    }
-
-    return true;
+    return meta_->load_from_gguf(loader_.get());
 }
 
 int Qwen35moeModel::get_ctx_size() {
     return meta_->qwen35moe.context_length;
-}
-
-void Qwen35moeModel::print_context_info(ggml_context* ctx_) {
-    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx_); cur != NULL; cur = ggml_get_next_tensor(ctx_, cur)) {
-        const char* name = ggml_get_name(cur);
-        size_t n_size = ggml_nbytes(cur);
-        ggml_type type = cur->type;
-        ggml_op op = cur->op;
-        size_t offs = cur->view_offs;
-        size_t offs1 = gguf_get_data_offset(reader_->gguf_ctx_) + gguf_get_tensor_offset(reader_->gguf_ctx_, gguf_find_tensor(reader_->gguf_ctx_, name));      
-        void* data = ggml_get_data(cur);
-        printf("Tensor: %s, size: %d, type: %d, op: %d, offs: %lu, offs1: %lu, data: %p, view_src: %p\n", name, n_size, type, op, offs, offs1, data, cur->view_src);
-    }
 }

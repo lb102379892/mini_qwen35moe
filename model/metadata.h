@@ -52,6 +52,17 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include "model/gguf_mmap.h"
+
+class HeadInfo {
+public:
+    std::string magic = "";
+    uint32_t version = 0;
+    int64_t tensor_count = 0;
+    int64_t kv_count = 0;
+
+    void print() const;
+};
 
 // ============================================================
 // general 配置
@@ -59,16 +70,18 @@
 // ============================================================
 class GeneralInfo {
 public:
-    std::string type = "";
     std::string architecture = "";
-    uint32_t quantization_version = 0;
-    uint32_t file_type = 0;
+    std::string type = "";
     int32_t sampling_top_k = 0;
     float sampling_top_p = 0.0;
     float sampling_temp = 0.0;
     std::string name = "";
+    std::string finetune = "";
+    uint32_t quantization_version = 0;
+    uint32_t file_type = 0;
+    std::string size_label = "";
 
-    void load_from_gguf(struct gguf_context* gctx);
+    void load_from_gguf(GGUFLoader* load);
     void print() const;
 };
 
@@ -78,29 +91,29 @@ public:
 // ============================================================
 class Qwen35moeInfo {
 public:
+    uint32_t block_count = 0;
     uint32_t context_length = 0;
     uint32_t embedding_length = 0;
-    uint32_t block_count = 0;
-    uint32_t expert_feed_forward_length = 0;
-    uint32_t expert_shared_feed_forward_length = 0;
-    uint32_t expert_count = 0;
-    uint32_t expert_used_count = 0;
-    uint32_t full_attention_interval = 0;
     uint32_t head_count = 0;
     uint32_t head_count_kv = 0;
+    float layer_norm_rms_epsilon = 0.0;
     uint32_t key_length = 0;
     uint32_t value_length = 0;
-    float layer_norm_rms_epsilon = 0.0;
-    uint32_t dimension_count = 0;
     std::vector<int32_t> dimension_sections;
     float freq_base = 0.0;
+    uint32_t dimension_count = 0;
+    uint32_t expert_count = 0;
+    uint32_t expert_used_count = 0;
+    uint32_t expert_feed_forward_length = 0;
+    uint32_t expert_shared_feed_forward_length = 0;
     uint32_t conv_kernel = 0;
-    uint32_t inner_size = 0;
     uint32_t state_size = 0;
-    uint32_t time_step_rank = 0;
     uint32_t group_count = 0;
-
-    void load_from_gguf(struct gguf_context* gctx);
+    uint32_t time_step_rank = 0;
+    uint32_t inner_size = 0;
+    uint32_t full_attention_interval = 0;
+    
+    void load_from_gguf(GGUFLoader* load);
     void print() const;
 };
 
@@ -119,7 +132,7 @@ public:
     uint32_t ggml_bos_token_id = 0;
     std::string chat_template = "";
 
-    void load_from_gguf(struct gguf_context* gctx);
+    void load_from_gguf(GGUFLoader* load);
     void print() const;
 };
 
@@ -133,7 +146,7 @@ public:
     uint32_t entries_count = 0;
     uint32_t chunks_count = 0;
 
-    void load_from_gguf(struct gguf_context* gctx);
+    void load_from_gguf(GGUFLoader* load);
     void print() const;
 };
 
@@ -142,11 +155,12 @@ public:
 // ============================================================
 class MetaDataInfo {
 public:
+    HeadInfo head;
     GeneralInfo general;
     Qwen35moeInfo qwen35moe;
     TokenizerInfo tokenizer;
     QuantizeInfo quantize;
 
-    bool load_from_gguf(struct gguf_context* gctx);
+    bool load_from_gguf(GGUFLoader* load);
     void print() const;
 };

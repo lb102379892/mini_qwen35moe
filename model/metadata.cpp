@@ -1,180 +1,101 @@
 #include "model/metadata.h"
-#include "core/gguf_reader.h"
 
-inline int32_t gguf_get_i32_or(struct gguf_context* ctx, const char* key, int default_val) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return default_val;
-    return gguf_get_val_i32(ctx, idx);
+void HeadInfo::print() const {
+    printf("\n--- head ---\n");
+    printf(" magic:%s\n", magic.c_str());
+    printf(" version:%u\n", version);
+    printf(" tensor_count:%lld\n", tensor_count);
+    printf(" kv_count:%lld\n", kv_count);
 }
 
-inline uint32_t gguf_get_u32_or(struct gguf_context* ctx, const char* key, uint32_t default_val) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return default_val;
-    return gguf_get_val_u32(ctx, idx);
-}
-
-inline float gguf_get_f32_or(struct gguf_context* ctx, const char* key, float default_val) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return default_val;
-    return gguf_get_val_f32(ctx, idx);
-}
-
-inline std::string gguf_get_str_or(struct gguf_context* ctx, const char* key, const char* default_val) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return default_val;
-    return gguf_get_val_str(ctx, idx);
-}
-
-inline std::vector<std::string> gguf_get_arrary_string_or(struct gguf_context* ctx, const char* key) {
-    std::vector<std::string> result;
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return result;
-    int arr_n = gguf_get_arr_n(ctx, idx);
-    const enum gguf_type arr_type = gguf_get_arr_type(ctx, idx);
-    for (int j = 0; j < arr_n; j++) {
-        if (arr_type == GGUF_TYPE_STRING) {
-            result.push_back(gguf_get_arr_str(ctx, idx, j));
-        } else {
-            printf("[Config] WARNING: array type '%d' not supported\n", arr_type);
-        }
-    }
-
-    return result;
-}
-
-inline std::vector<uint32_t> gguf_get_arrary_u32_or(struct gguf_context* ctx, const char* key) {
-    std::vector<uint32_t> result;
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return result;
-    int n = gguf_get_arr_n(ctx, idx);
-    result.resize(n);
-    const uint32_t * values = (const uint32_t *)gguf_get_arr_data(ctx, idx);
-    for (int i = 0; i < n; ++i) {
-        result[i] = values[i];
-    }
-
-    return result;
-}
-
-inline std::vector<int32_t> gguf_get_arrary_i32_or(struct gguf_context* ctx, const char* key) {
-    std::vector<int32_t> result;
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) return result;
-    int n = gguf_get_arr_n(ctx, idx);
-    result.resize(n);
-    const int32_t * values = (const int32_t *)gguf_get_arr_data(ctx, idx);
-    for (int i = 0; i < n; ++i) {
-        result[i] = values[i];
-    }
-
-    return result;
-}
-
-// 必须存在的 key，找不到返回 false 并打印错误
-inline bool gguf_require_i32(struct gguf_context* ctx, const char* key, int& out) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) {
-        printf("[Config] ERROR: required key '%s' not found in GGUF\n", key);
-        return false;
-    }
-    out = gguf_get_val_i32(ctx, idx);
-    return true;
-}
-
-inline bool gguf_require_u32(struct gguf_context* ctx, const char* key, uint32_t& out) {
-    int idx = gguf_find_key(ctx, key);
-    if (idx < 0) {
-        printf("[Config] ERROR: required key '%s' not found in GGUF\n", key);
-        return false;
-    }
-    out = gguf_get_val_u32(ctx, idx);
-    return true;
-}
-
-void GeneralInfo::load_from_gguf(struct gguf_context* gctx) {
-    type = gguf_get_str_or(gctx, "general.type", "");
-    architecture = gguf_get_str_or(gctx, "general.architecture", "");
-    quantization_version = gguf_get_u32_or(gctx, "general.quantization_version", 0);
-    file_type = gguf_get_u32_or(gctx, "general.file_type", 0);
-    sampling_top_k = gguf_get_i32_or(gctx, "general.sampling.top_k", 0);
-    sampling_top_p = gguf_get_f32_or(gctx, "general.sampling.top_p", 0.0);
-    sampling_temp = gguf_get_f32_or(gctx, "general.sampling.temp", 0.0);
-    name = gguf_get_str_or(gctx, "general.name", "");
+void GeneralInfo::load_from_gguf(GGUFLoader* load) {
+    architecture = load->get_str_or("general.architecture", "");
+    type = load->get_str_or("general.type", "");
+    sampling_top_k = load->get_i32_or("general.sampling.top_k", 0);
+    sampling_top_p = load->get_f32_or("general.sampling.top_p", 0.0);
+    sampling_temp = load->get_f32_or("general.sampling.temp", 0.0);
+    name = load->get_str_or("general.name", "");
+    finetune = load->get_str_or("general.finetune", "");
+    quantization_version = load->get_u32_or("general.quantization_version", 0);
+    file_type = load->get_u32_or("general.file_type", 0);
+    size_label = load->get_str_or("general.size_label", "");
 }
 
 void GeneralInfo::print() const {
     printf("\n--- general ---\n");
-    printf(" general.type:%s\n", type.c_str());
     printf(" general.architecture:%s\n", architecture.c_str());
-    printf(" general.quantization_version:%d\n", quantization_version);
-    printf(" general.file_type:%d\n", file_type);
+    printf(" general.type:%s\n", type.c_str());
     printf(" general.sampling.top_k:%d\n", sampling_top_k);
     printf(" general.sampling.top_p:%f\n", sampling_top_p);
     printf(" general.sampling.temp:%f\n", sampling_temp);
     printf(" general.name:%s\n", name.c_str());
+    printf(" general.finetune:%s\n", finetune.c_str());
+    printf(" general.quantization_version:%d\n", quantization_version);
+    printf(" general.file_type:%d\n", file_type);
+    printf(" general.size_label:%s\n", size_label.c_str());
 }
 
-void Qwen35moeInfo::load_from_gguf(struct gguf_context* gctx) {
-    context_length = gguf_get_u32_or(gctx, "qwen35moe.context_length", 0);
-    embedding_length = gguf_get_u32_or(gctx, "qwen35moe.embedding_length", 0);
-    block_count = gguf_get_u32_or(gctx, "qwen35moe.block_count", 0);
-    expert_feed_forward_length = gguf_get_u32_or(gctx, "qwen35moe.expert_feed_forward_length", 0);
-    expert_shared_feed_forward_length = gguf_get_u32_or(gctx, "qwen35moe.expert_shared_feed_forward_length", 0);
-    expert_count = gguf_get_u32_or(gctx, "qwen35moe.expert_count", 0);
-    expert_used_count = gguf_get_u32_or(gctx, "qwen35moe.expert_used_count", 0);
-    full_attention_interval = gguf_get_u32_or(gctx, "qwen35moe.full_attention_interval", 0);
-    head_count = gguf_get_u32_or(gctx, "qwen35moe.attention.head_count" , 0);
-    head_count_kv = gguf_get_u32_or(gctx, "qwen35moe.attention.head_count_kv", 0);
-    key_length = gguf_get_u32_or(gctx, "qwen35moe.attention.key_length", 0);
-    value_length = gguf_get_u32_or(gctx, "qwen35moe.attention.value_length", 0);
-    layer_norm_rms_epsilon = gguf_get_f32_or(gctx, "qwen35moe.attention.layer_norm_rms_epsilon", 0.0);
-    dimension_count = gguf_get_u32_or(gctx, "qwen35moe.rope.dimension_count", 0);
-    dimension_sections = gguf_get_arrary_i32_or(gctx, "qwen35moe.rope.dimension_sections");
-    freq_base = gguf_get_f32_or(gctx, "qwen35moe.rope.freq_base", 0.0);
-    conv_kernel = gguf_get_u32_or(gctx, "qwen35moe.ssm.conv_kernel", 0);
-    inner_size = gguf_get_u32_or(gctx, "qwen35moe.ssm.inner_size", 0);
-    state_size = gguf_get_u32_or(gctx, "qwen35moe.ssm.state_size", 0);
-    time_step_rank = gguf_get_u32_or(gctx, "qwen35moe.ssm.time_step_rank", 0);
-    group_count = gguf_get_u32_or(gctx, "qwen35moe.ssm.group_count", 0);
+void Qwen35moeInfo::load_from_gguf(GGUFLoader* load) {
+    block_count = load->get_u32_or("qwen35moe.block_count", 0);
+    context_length = load->get_u32_or("qwen35moe.context_length", 0);
+    embedding_length = load->get_u32_or("qwen35moe.embedding_length", 0);
+    head_count = load->get_u32_or("qwen35moe.attention.head_count" , 0);
+    head_count_kv = load->get_u32_or("qwen35moe.attention.head_count_kv", 0);
+    layer_norm_rms_epsilon = load->get_f32_or("qwen35moe.attention.layer_norm_rms_epsilon", 0.0);
+    key_length = load->get_u32_or("qwen35moe.attention.key_length", 0);
+    value_length = load->get_u32_or("qwen35moe.attention.value_length", 0);
+    dimension_sections = load->get_arrary_i32_or("qwen35moe.rope.dimension_sections");
+    freq_base = load->get_f32_or("qwen35moe.rope.freq_base", 0.0);
+    dimension_count = load->get_u32_or("qwen35moe.rope.dimension_count", 0);
+    expert_count = load->get_u32_or("qwen35moe.expert_count", 0);
+    expert_used_count = load->get_u32_or("qwen35moe.expert_used_count", 0);
+    expert_feed_forward_length = load->get_u32_or("qwen35moe.expert_feed_forward_length", 0);
+    expert_shared_feed_forward_length = load->get_u32_or("qwen35moe.expert_shared_feed_forward_length", 0);
+    conv_kernel = load->get_u32_or("qwen35moe.ssm.conv_kernel", 0);
+    state_size = load->get_u32_or("qwen35moe.ssm.state_size", 0);
+    group_count = load->get_u32_or("qwen35moe.ssm.group_count", 0);
+    time_step_rank = load->get_u32_or("qwen35moe.ssm.time_step_rank", 0);
+    inner_size = load->get_u32_or("qwen35moe.ssm.inner_size", 0);
+    full_attention_interval = load->get_u32_or("qwen35moe.full_attention_interval", 0);
 }
 
 void Qwen35moeInfo::print() const {
     printf("\n--- qwen35moe ---\n");
+    printf(" qwen35moe.block_count:%d\n", block_count);
     printf(" qwen35moe.context_length:%d\n", context_length);
     printf(" qwen35moe.embedding_length:%d\n", embedding_length);
-    printf(" qwen35moe.block_count:%d\n", block_count);
-    printf(" qwen35moe.expert_feed_forward_length:%d\n", expert_feed_forward_length);
-    printf(" qwen35moe.expert_shared_feed_forward_length:%d\n", expert_shared_feed_forward_length);
-    printf(" qwen35moe.expert_count:%d\n", expert_count);
-    printf(" qwen35moe.expert_used_count:%d\n", expert_used_count);
-    printf(" qwen35moe.full_attention_interval:%d\n", full_attention_interval);
     printf(" qwen35moe.head_count:%d\n", head_count);
     printf(" qwen35moe.head_count_kv:%d\n", head_count_kv);
+    printf(" qwen35moe.layer_norm_rms_epsilon:%f\n", layer_norm_rms_epsilon);
     printf(" qwen35moe.key_length:%d\n", key_length);
     printf(" qwen35moe.value_length:%d\n", value_length);
-    printf(" qwen35moe.layer_norm_rms_epsilon:%f\n", layer_norm_rms_epsilon);
-    printf(" qwen35moe.dimension_count:%d\n", dimension_count);
     for (size_t i = 0; i < dimension_sections.size(); ++i) {
         printf(" qwen35moe.dimension_sections[%zu]:%d\n", i, dimension_sections[i]);
     }
     printf(" qwen35moe.freq_base:%f\n", freq_base);
+    printf(" qwen35moe.dimension_count:%d\n", dimension_count);
+    printf(" qwen35moe.expert_count:%d\n", expert_count);
+    printf(" qwen35moe.expert_used_count:%d\n", expert_used_count);
+    printf(" qwen35moe.expert_feed_forward_length:%d\n", expert_feed_forward_length);
+    printf(" qwen35moe.expert_shared_feed_forward_length:%d\n", expert_shared_feed_forward_length);
     printf(" qwen35moe.conv_kernel:%d\n", conv_kernel);
-    printf(" qwen35moe.inner_size:%d\n", inner_size);
     printf(" qwen35moe.state_size:%d\n", state_size);
-    printf(" qwen35moe.time_step_rank:%d\n", time_step_rank);
     printf(" qwen35moe.group_count:%d\n", group_count);
+    printf(" qwen35moe.time_step_rank:%d\n", time_step_rank);
+    printf(" qwen35moe.inner_size:%d\n", inner_size);
+    printf(" qwen35moe.full_attention_interval:%d\n", full_attention_interval);
 }
 
-void TokenizerInfo::load_from_gguf(struct gguf_context* gctx) {
-    ggml_model = gguf_get_str_or(gctx, "tokenizer.ggml.model", "");
-    ggml_pre = gguf_get_str_or(gctx, "tokenizer.ggml.pre", "");
-    ggml_tokens = gguf_get_arrary_string_or(gctx, "tokenizer.ggml.tokens");
-    ggml_token_type = gguf_get_arrary_i32_or(gctx, "tokenizer.ggml.token_type");
-    ggml_merges = gguf_get_arrary_string_or(gctx, "tokenizer.ggml.merges");
-    ggml_eos_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.eos_token_id", 0);
-    ggml_padding_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.padding_token_id", 0);
-    ggml_bos_token_id = gguf_get_u32_or(gctx, "tokenizer.ggml.bos_token_id", 0);
-    chat_template = gguf_get_str_or(gctx, "tokenizer.chat_template", "");
+void TokenizerInfo::load_from_gguf(GGUFLoader* load) {
+    ggml_model = load->get_str_or("tokenizer.ggml.model", "");
+    ggml_pre = load->get_str_or("tokenizer.ggml.pre", "");
+    ggml_tokens = load->get_arrary_string_or("tokenizer.ggml.tokens");
+    ggml_token_type = load->get_arrary_i32_or("tokenizer.ggml.token_type");
+    ggml_merges = load->get_arrary_string_or("tokenizer.ggml.merges");
+    ggml_eos_token_id = load->get_u32_or("tokenizer.ggml.eos_token_id", 0);
+    ggml_padding_token_id = load->get_u32_or("tokenizer.ggml.padding_token_id", 0);
+    ggml_bos_token_id = load->get_u32_or("tokenizer.ggml.bos_token_id", 0);
+    chat_template = load->get_str_or("tokenizer.chat_template", "");
 }
 
 void TokenizerInfo::print() const {
@@ -210,14 +131,15 @@ void TokenizerInfo::print() const {
     printf(")]\n");
     printf(" tokenizer.ggml.eos_token_id:%d\n", ggml_eos_token_id);
     printf(" tokenizer.ggml.padding_token_id:%d\n", ggml_padding_token_id);
+    printf(" tokenizer.ggml.bos_token_id:%d\n", ggml_bos_token_id);
     printf(" tokenizer.chat_template:%s\n", chat_template.c_str());
 }
 
-void QuantizeInfo::load_from_gguf(struct gguf_context* gctx) {
-    imatrix_file = gguf_get_str_or(gctx, "quantize.imatrix.file", "");
-    imatrix_dataset = gguf_get_str_or(gctx, "quantize.imatrix.dataset", "");
-    entries_count = gguf_get_u32_or(gctx, "quantize.imatrix.entries_count", 0);
-    chunks_count = gguf_get_u32_or(gctx, "quantize.imatrix.chunks_count", 0);
+void QuantizeInfo::load_from_gguf(GGUFLoader* load) {
+    imatrix_file = load->get_str_or("quantize.imatrix.file", "");
+    imatrix_dataset = load->get_str_or("quantize.imatrix.dataset", "");
+    entries_count = load->get_u32_or("quantize.imatrix.entries_count", 0);
+    chunks_count = load->get_u32_or("quantize.imatrix.chunks_count", 0);
 }
 
 void QuantizeInfo::print() const {
@@ -228,16 +150,20 @@ void QuantizeInfo::print() const {
     printf(" quantize.imatrix.chunks_count:%d\n", chunks_count);
 }
 
-bool MetaDataInfo::load_from_gguf(struct gguf_context* gctx) {
-    if (!gctx) {
-        printf("[Config] ERROR: gguf_context is null\n");
+bool MetaDataInfo::load_from_gguf(GGUFLoader* load) {
+    if (!load) {
+        printf("[Config] ERROR: GGUFLoader is null\n");
         return false;
     }
 
-    general.load_from_gguf(gctx);
-    qwen35moe.load_from_gguf(gctx);
-    tokenizer.load_from_gguf(gctx);
-    quantize.load_from_gguf(gctx);
+    head.magic = load->magic_;
+    head.version = load->version_;
+    head.tensor_count = load->n_tensors_;
+    head.kv_count = load->n_kv_;
+    general.load_from_gguf(load);
+    qwen35moe.load_from_gguf(load);
+    tokenizer.load_from_gguf(load);
+    quantize.load_from_gguf(load);
     print();
     return true;
 }
@@ -248,6 +174,7 @@ void MetaDataInfo::print() const {
     printf("  Qwen35moe Model Configuration\n");
     printf("========================================\n");
 
+    head.print();
     general.print();
     qwen35moe.print();
     tokenizer.print();
