@@ -106,21 +106,6 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         init_gpu();
     }
 
-    if (backend_gpu_) {
-        ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
-        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
-        fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
-    } else {
-        ggml_backend_t backends[] = {backend_cpu_};
-        sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
-        fprintf(stderr, "Scheduler created with CPU backend only\n");
-    }
-    
-    if (!sched_) {
-        fprintf(stderr, "Failed to create backend scheduler\n");
-        return false;
-    }
-
     printf("==================Loading Complete!======================\n");
     return true;
 }
@@ -192,15 +177,25 @@ bool Qwen35moeModel::init_cpu() {
         for (auto& layer_info : layer_iter->tensors) {
             loader_->load_tensor_data(layer_info.second);
         }
+        printf("Loaded layer %d to CPU\n", &layer_iter - &cpu_weights_->layers[0]);
     }
-
     printf("[Loader] CPU weight loading complete\n");
+
+    // ggml_backend_t backends[] = {backend_cpu_};
+    // sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
+    // if (!sched_) {
+    //     fprintf(stderr, "Failed to create backend scheduler\n");
+    //     return false;
+    // }
+    fprintf(stderr, "Scheduler created with CPU backend only\n");
+
     return true;
 }
 
 bool Qwen35moeModel::init_gpu() {
     printf("\n===================Loading Qwen35moe Model to GPU=====================\n");
-    backend_gpu_ = ggml_backend_init_best();
+    int gpu_id = 0;
+    backend_gpu_ = ggml_backend_cuda_init(gpu_id);//ggml_backend_init_best();
     if (!backend_gpu_) {
         fprintf(stderr, "[Loader] ERROR: failed to init GPU backend\n");
         return false;
@@ -211,7 +206,7 @@ bool Qwen35moeModel::init_gpu() {
         printf("No CUDA devices found\n");
         return false;
     }
-    int gpu_id = 0;
+    
     if (gpu_id >= device_count) {
         printf("Invalid device %d (only %d available)\n", gpu_id, device_count);
         return false;
@@ -220,6 +215,14 @@ bool Qwen35moeModel::init_gpu() {
     size_t free_mem, total_mem;
     ggml_backend_cuda_get_device_memory(gpu_id, &free_mem, &total_mem);
     printf("Device %d: %.2f GB free / %.2f GB total\n", gpu_id, free_mem / 1e9, total_mem / 1e9);
+
+    const size_t ctx_size = (meta_->head.tensor_count + 1) * ggml_tensor_overhead();
+    ggml_init_params gpu_p = { ctx_size, nullptr, true };
+    gpu_ctx_ = ggml_init(gpu_p);
+    if (!gpu_ctx_) {
+        fprintf(stderr, "[Loader] ERROR: failed to init weight contexts\n");
+        return false;
+    }
 
     gpu_weights_ = std::make_shared<Qwen35moeWeights>();
     for (auto& weight_info : g_weight_tensor_names) {
@@ -270,9 +273,18 @@ bool Qwen35moeModel::init_gpu() {
         for (auto& layer_info : layer_iter->tensors) {
             loader_->load_tensor_data(layer_info.second);
         }
+        printf("Loaded layer %d to GPU\n", &layer_iter - &gpu_weights_->layers[0]);
     }
-    
     printf("[Loader] GPU weight loading complete\n");
+
+    // ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+    // sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
+    // if (!sched_) {
+    //     fprintf(stderr, "Failed to create backend scheduler\n");
+    //     return false;
+    // }
+    fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
+    
     return true;
 }
 
@@ -296,7 +308,7 @@ ggml_tensor* Qwen35moeModel::get_weight_tensor(const EN_WEIGHT_TYPE weight_type)
 ggml_tensor* Qwen35moeModel::get_weight_layer_tensor(const EN_LAYER_TYPE layer_type, const int layer_idx) {
     if (dev_mode_ == DevMode::CPU_MODE)
         return cpu_weights_->layers[layer_idx]->tensors[layer_type];
-    if (dev_mode_ == DevMode::GPU_MODE)
+    else
         return gpu_weights_->layers[layer_idx]->tensors[layer_type];
 }
 

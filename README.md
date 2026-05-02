@@ -37,7 +37,17 @@ curl -X POST http://localhost:6666/v1/chat/completions \
       {"role": "user", "content": "你是什么模型?"}
     ],
     "temperature": 0,
-    "max_tokens": 100
+    "max_tokens": 512
+  }'
+
+curl -X POST http://localhost:6666/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "写个linux c++ server，要求简单的实现"}
+    ],
+    "temperature": 0,
+    "max_tokens": 1024
   }'
 
 ./test_qwen35moe \

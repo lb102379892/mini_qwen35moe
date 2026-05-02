@@ -32,7 +32,7 @@ bool GGUFLoader::load(const std::string& path) {
         return false;
     }
 
-    print_prase_info();
+    //print_prase_info();
 
     return true;
 }
@@ -377,8 +377,8 @@ bool GGUFLoader::load_tensor_data(ggml_tensor* dst) {
     auto index = tensor_index_map_[dst->name];
     auto* tensor_info = &tensors_[index];
 
-    printf("Loading tensor %s to %p, data_offset_=%lu, offset=%llu, byte_size:%lu\n", 
-        dst->name, dst, data_offset_, tensor_info->offset, tensor_info->byte_size);
+    // printf("Loading tensor %s to %p, data_offset_=%lu, offset=%llu, byte_size:%lu\n", 
+    //     dst->name, dst, data_offset_, tensor_info->offset, tensor_info->byte_size);
     ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
     return true;
 }

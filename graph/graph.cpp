@@ -502,14 +502,34 @@ void Qwen35moeForwardPass::set_batched_inputs(ggml_cgraph* gf, const std::vector
  */
 std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>& tokens, int pos, 
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
-    // 默认：整体路径（子类可以重写以支持 TQ）
-    ggml_backend_sched_reset(scheduler);
-    ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-    ggml_backend_sched_alloc_graph(scheduler, gf);
-    set_inputs(gf, tokens, pos);
-    ggml_backend_sched_graph_compute(scheduler, gf);
-    advance_cache(tokens.size(), slot_idx);
-    return get_output_logits(gf);
+    if (scheduler != nullptr) {
+        // 默认：整体路径（子类可以重写以支持 TQ）
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+        advance_cache(tokens.size(), slot_idx);
+        return get_output_logits(gf);
+    } else {
+        // 直接执行（不使用调度器）
+        printf("------ggml_gallocr_new for prefill------\n");
+        auto backend = model_->get_curr_backend();
+        printf("------ggml_gallocr_new for prefill------0\n");
+        auto buf_type = ggml_backend_get_default_buffer_type(backend);
+        printf("------ggml_gallocr_new for prefill------1\n");
+        ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
+        printf("------ggml_gallocr_new for prefill------2\n");
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        ggml_gallocr_alloc_graph(allocr_prefill, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_graph_compute(backend, gf);
+        advance_cache(tokens.size(), slot_idx);
+        auto result =  get_output_logits(gf);
+        if (allocr_prefill) 
+            ggml_gallocr_free(allocr_prefill);
+        return result;
+    }
 }
 
 uint32_t Qwen35moeForwardPass::get_cache_pos(uint32_t slot_idx) const {
