@@ -513,13 +513,9 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
         return get_output_logits(gf);
     } else {
         // 直接执行（不使用调度器）
-        printf("------ggml_gallocr_new for prefill------\n");
         auto backend = model_->get_curr_backend();
-        printf("------ggml_gallocr_new for prefill------0\n");
         auto buf_type = ggml_backend_get_default_buffer_type(backend);
-        printf("------ggml_gallocr_new for prefill------1\n");
         ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
-        printf("------ggml_gallocr_new for prefill------2\n");
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
         ggml_gallocr_alloc_graph(allocr_prefill, gf);
         set_inputs(gf, tokens, pos);

@@ -44,7 +44,7 @@ curl -X POST http://localhost:6666/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
-      {"role": "user", "content": "写个linux c++ server，要求简单的实现"}
+      {"role": "user", "content": "写个linux用c++语言实现的server示例，只要求代码"}
     ],
     "temperature": 0,
     "max_tokens": 1024

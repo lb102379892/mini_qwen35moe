@@ -43,8 +43,11 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
     std::vector<int32_t> tokens = tokenizer_->encode(prompt);
 
+    using Clock = std::chrono::steady_clock;
     const size_t n_prompt_tokens = tokens.size();
+    auto t_prefill_start = Clock::now();
     std::vector<float> logits = forward_pass->run_prefill(tokens, 0, 0, sched_);
+    auto t_prefill_end = Clock::now();
 
     size_t vocab_size = m->tokenizer.ggml_tokens.size();
     std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
@@ -59,15 +62,16 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     std::vector<int32_t> prompt_tokens_for_pld = tokens;  // Original prompt
     std::vector<int32_t> generated_tokens;
 
+    auto t_decode_start = Clock::now();
     for (int i = 0; i < max_tokens; ++i) {
         std::string decoded_token = tokenizer_->decode(next_token_id);
         if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
             break;
         }
         response += decoded_token;
-        printf("%s", decoded_token.c_str());
 
         tokens.push_back(next_token_id);
+        generated_tokens.push_back(next_token_id);
 
         // --- Normal decode path ---
         std::vector<int32_t> current_token_vec = { next_token_id };
@@ -78,7 +82,19 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         
         next_token_id = sampler_->sample(last_token_logits, tokens);
     }
-    printf("\n");
+    auto t_decode_end = Clock::now();
+    printf("response: [%s].\n", response.c_str());
+
+    auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_prefill_end - t_prefill_start).count();
+    auto decode_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(t_decode_end - t_decode_start).count();
+    const size_t n_decoded = generated_tokens.size();
+
+    double prefill_tps = (prefill_ms > 0) ? (n_prompt_tokens * 1000.0 / prefill_ms) : 0.0;
+    double decode_tps  = (decode_ms  > 0 && n_decoded > 0) ? (n_decoded * 1000.0 / decode_ms) : 0.0;
+
+    printf("[Timing] prefill=%lld ms (%ld tokens, %d t/s) decode=%lldms (%ld tokens, %d t/s)\n", 
+        prefill_ms, n_prompt_tokens, static_cast<int>(prefill_tps), decode_ms, n_decoded, static_cast<int>(decode_tps));
+
     return true;
 }
     
