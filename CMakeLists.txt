@@ -35,7 +35,6 @@ target_link_libraries(ggml_core INTERFACE ggml)
 add_executable(test_qwen35moe
     api/routes.cpp
     api/http_server.cpp
-    core/gguf_reader.cpp
     graph/deltanet_state.cpp
     graph/kv_cache_simple.cpp
     graph/graph.cpp

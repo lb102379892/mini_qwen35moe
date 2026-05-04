@@ -2,9 +2,13 @@
 
 #include <memory>
 #include <string>
+#include <ggml.h>
+#include <ggml-alloc.h>
+#include <ggml-backend.h>
+#include <ggml-cpu.h>
+#include <ggml-cuda.h>
 #include "model/metadata.h"
 #include "model/weights.h"
-#include "core/gguf_reader.h"
 #include "model/gguf_mmap.h"
 
 #ifndef QWEN_DEFAULT_GRAPH_SIZE

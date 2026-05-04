@@ -1,8 +1,3 @@
-#include <ggml.h>
-#include <ggml-alloc.h>
-#include <ggml-backend.h>
-#include <ggml-cpu.h>
-#include <ggml-cuda.h>
 #include "model/model.h"
 
 static const std::unordered_map<EN_LAYER_TYPE, const char *> g_layer_tensor_names = {
