@@ -39,7 +39,7 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
 bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response) {
     std::shared_ptr<Qwen35moeForwardPass> forward_pass = std::make_shared<Qwen35moeForwardPass>();
     auto m = model_->meta_;
-    forward_pass->init(m->qwen35moe.context_length, 1, model_);
+    forward_pass->init(max_seq_len_, 1, model_);
 
     std::vector<int32_t> tokens = tokenizer_->encode(prompt);
 

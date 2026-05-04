@@ -87,36 +87,27 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         return false;
     }
 
-    if (dev_mode == DevMode::CPU_MODE) {
-        init_cpu();
-    }
-    else {
-        init_gpu();
-    }
+    init_cpu();
+    init_gpu();
 
-    // if (nullptr == backend_gpu_) {
-    //     ggml_backend_t backends[] = {backend_cpu_};
-    //     sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
-    //     if (!sched_) {
-    //         fprintf(stderr, "Failed to create backend scheduler\n");
-    //         return false;
-    //     }
-    //     fprintf(stderr, "Scheduler created with CPU backend only\n");
-    // } else {
-    //     ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
-    //     sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
-    //     if (!sched_) {
-    //         fprintf(stderr, "Failed to create backend scheduler\n");
-    //         return false;
-    //     }
-    //     fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
-    // }
+    if (dev_mode_ == DevMode::AURO_MODE) {
+        ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
+        if (!sched_) {
+            fprintf(stderr, "Failed to create backend scheduler\n");
+            return false;
+        }
+        fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
+    }
     
     printf("==================Loading Complete!======================\n");
     return true;
 }
 
 bool Qwen35moeModel::init_cpu() {
+    if (dev_mode_ == DevMode::GPU_MODE) {
+        return false;
+    }
     printf("===================Loading Qwen35moe Model to CPU=====================\n");
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
@@ -131,6 +122,11 @@ bool Qwen35moeModel::init_cpu() {
     if (!cpu_ctx_) {
         fprintf(stderr, "[Loader] ERROR: failed to init weight contexts\n");
         return false;
+    }
+
+    if (dev_mode_ == DevMode::AURO_MODE) {
+        printf("[Loader] AURO_MODE: skipping CPU weight loading\n");
+        return true;
     }
 
     cpu_weights_ = std::make_shared<Qwen35moeWeights>();
@@ -191,6 +187,9 @@ bool Qwen35moeModel::init_cpu() {
 }
 
 bool Qwen35moeModel::init_gpu() {
+    if (dev_mode_ == DevMode::CPU_MODE) {
+        return false;
+    }
     printf("===================Loading Qwen35moe Model to GPU=====================\n");
     int gpu_id = 0;
     backend_gpu_ = ggml_backend_cuda_init(gpu_id);//ggml_backend_init_best();

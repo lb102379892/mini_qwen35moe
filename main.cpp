@@ -78,7 +78,7 @@ int main(int argc, char* argv[]) {
     float       top_p        = 0.9f;
     int         top_k        = 50;
     int         n_threads    = 1;
-    int         ctx_size     = 1024;
+    int         ctx_size     = 4096;
     int         gpu_layer    = 8;
     bool        use_chat     = true;
     bool        verbose      = true;

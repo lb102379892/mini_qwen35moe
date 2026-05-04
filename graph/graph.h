@@ -284,4 +284,7 @@ private:
     // Per-slot logical sequence position after SnapKV compaction.
     // 0 = SnapKV not active (use physical cache position).
     std::vector<uint32_t> snapkv_seq_pos_;
+
+    uint32_t context_len_ = 0;
+    uint32_t max_batch_size_ = 0;
 };

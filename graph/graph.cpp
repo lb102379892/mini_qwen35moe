@@ -43,6 +43,9 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
     model_ = model;
     auto& m = model_->meta_->qwen35moe;
 
+    context_len_ = context_len;
+    max_batch_size_ = max_batch_size;
+
     // 预分配持久化缓冲区用于存储计算图元数据
     ctx_buffer_.resize(FP_GRAPH_SIZE_METADATA);
 
@@ -73,8 +76,8 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
     const uint32_t n_embd_v = static_cast<uint32_t>(m.head_count_kv * m.value_length); // V 维度
     kv_cache_ = std::make_unique<simple_kv_cache>(
         static_cast<uint32_t>(n_kv_layers),  // KV 层数
-        context_len,                          // 上下文长度
-        max_batch_size,                       // 最大批大小
+        context_len_,                         // 上下文长度
+        max_batch_size_,                      // 最大批大小
         n_embd_k, n_embd_v,                   // K/V 维度
         GGML_TYPE_F32, GGML_TYPE_F32,         // 数据类型
         cache_backend                         // 后端设备
@@ -91,7 +94,7 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
 
     DeltaNetStateParams dn_state_hp {
         static_cast<uint32_t>(n_dn_layers),
-        max_batch_size,
+        max_batch_size_,
         head_v_dim,
         m.state_size,  // head_k_dim = 128
         num_v_heads,
@@ -146,10 +149,16 @@ void Qwen35moeForwardPass::reset_context() {
 ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx) {
     reset_context();
 
+    const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
+    if (static_cast<uint32_t>(pos) + n_tok > context_len_) {
+        throw std::runtime_error(
+            "Qwen35moeForwardPass::build_prefill_graph: input exceeds context_len_"
+        );
+    }
+
     ggml_cgraph* gf = new_graph();
 
     auto& m = model_->meta_->qwen35moe;
-    const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
     const uint32_t d_inner = m.inner_size;
     const uint32_t num_v_heads = m.time_step_rank;
     const uint32_t num_k_heads = m.group_count;
@@ -203,7 +212,7 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
                 kv_idx, n_tok, slot_idx, il, attn_q_weight, 
                 attn_q_norm_weight, attn_k_weight, attn_k_norm_weight, attn_v_weight, attn_output_weight,
                 m.key_length, m.head_count, m.head_count_kv, m.dimension_count, m.freq_base,
-                static_cast<int>(m.context_length), m.layer_norm_rms_epsilon
+                static_cast<int>(context_len_), m.layer_norm_rms_epsilon
             );
         } else {
             // DeltaNet 层：使用门控 delta 网络进行高效序列建模
@@ -340,7 +349,7 @@ ggml_cgraph* Qwen35moeForwardPass::build_decoding_graph(const std::vector<int32_
                 attn_v_weight, attn_output_weight,
                 m.key_length, m.head_count, m.head_count_kv,
                 m.dimension_count, m.freq_base,
-                static_cast<int>(m.context_length),
+                static_cast<int>(context_len_),
                 m.layer_norm_rms_epsilon
             );
         } else {

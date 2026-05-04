@@ -82,8 +82,13 @@ ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uin
 }
 
 ggml_tensor * simple_kv_cache::cpy_k(ggml_context * ctx_compute, ggml_tensor * k_cur, int32_t il, uint32_t slot_idx) {
-    const uint32_t n_tokens = k_cur->ne[2];
+    GGML_ASSERT(slot_idx < n_batch_max);
+    GGML_ASSERT(il >= 0 && static_cast<uint32_t>(il) < n_layers);
 
+    const uint32_t n_tokens = static_cast<uint32_t>(k_cur->ne[2]);
+
+    GGML_ASSERT(positions[slot_idx] + n_tokens <= n_ctx_max);
+    
     // Create view at current position: [n_embd_k, n_tokens]
     ggml_tensor * k_dst = ggml_view_2d(ctx_compute, k_cache[il],
         n_embd_k, n_tokens,
@@ -95,7 +100,12 @@ ggml_tensor * simple_kv_cache::cpy_k(ggml_context * ctx_compute, ggml_tensor * k
 }
 
 ggml_tensor * simple_kv_cache::cpy_v(ggml_context * ctx_compute, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx) {
-    const uint32_t n_tokens = v_cur->ne[2];
+    GGML_ASSERT(slot_idx < n_batch_max);
+    GGML_ASSERT(il >= 0 && static_cast<uint32_t>(il) < n_layers);
+
+    const uint32_t n_tokens = static_cast<uint32_t>(v_cur->ne[2]);
+
+    GGML_ASSERT(positions[slot_idx] + n_tokens <= n_ctx_max);
 
     // Create view at current position: [n_embd_v, n_tokens]
     ggml_tensor * v_dst = ggml_view_2d(ctx_compute, v_cache[il],
