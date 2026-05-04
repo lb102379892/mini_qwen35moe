@@ -90,14 +90,30 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
     init_cpu();
     init_gpu();
 
-    if (dev_mode_ == DevMode::AURO_MODE) {
+    if (dev_mode_ == DevMode::GPU_MODE) {
         ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
-        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, false, true);
+        if (!sched_) {
+            fprintf(stderr, "Failed to create backend scheduler\n");
+            return false;
+        }
+        fprintf(stderr, "Scheduler created with GPU backends\n");
+    } else if (dev_mode_ == DevMode::AURO_MODE) {
+        ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+        sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, true);
         if (!sched_) {
             fprintf(stderr, "Failed to create backend scheduler\n");
             return false;
         }
         fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
+    } else {
+        ggml_backend_t backends[] = {backend_cpu_};
+        sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
+        if (!sched_) {
+            fprintf(stderr, "Failed to create backend scheduler\n");
+            return false;
+        }
+        fprintf(stderr, "Scheduler created with CPU backends\n");
     }
     
     printf("==================Loading Complete!======================\n");
@@ -105,9 +121,6 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
 }
 
 bool Qwen35moeModel::init_cpu() {
-    if (dev_mode_ == DevMode::GPU_MODE) {
-        return false;
-    }
     printf("===================Loading Qwen35moe Model to CPU=====================\n");
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
@@ -124,7 +137,7 @@ bool Qwen35moeModel::init_cpu() {
         return false;
     }
 
-    if (dev_mode_ == DevMode::AURO_MODE) {
+    if (dev_mode_ == DevMode::AURO_MODE || dev_mode_ == DevMode::GPU_MODE) {
         printf("[Loader] AURO_MODE: skipping CPU weight loading\n");
         return true;
     }

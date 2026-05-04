@@ -77,7 +77,7 @@ int main(int argc, char* argv[]) {
     float       temperature  = 0.7f;
     float       top_p        = 0.9f;
     int         top_k        = 50;
-    int         n_threads    = 1;
+    int         n_threads    = 4;
     int         ctx_size     = 4096;
     int         gpu_layer    = 8;
     bool        use_chat     = true;
@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
             } else if (strcmp(mode, "auto") == 0) {
                 dev_mode = DevMode::AURO_MODE;
             } else {
-                dev_mode = DevMode::CPU_MODE;
+                dev_mode = DevMode::AURO_MODE;
             }
         }
         else if (arg("-h") || arg("--help")) {
