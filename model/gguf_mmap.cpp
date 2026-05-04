@@ -377,10 +377,12 @@ bool GGUFLoader::load_tensor_data(ggml_tensor* dst) {
     auto index = tensor_index_map_[dst->name];
     auto* tensor_info = &tensors_[index];
 
-    // printf("Loading tensor %s to %p, data_offset_=%lu, offset=%llu, byte_size:%lu\n", 
-    //     dst->name, dst, data_offset_, tensor_info->offset, tensor_info->byte_size);
     ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
     return true;
+}
+
+void GGUFLoader::get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data) {
+    std::memcpy(src_data.data(), data_ + data_offset_ + tensor->offset, tensor->byte_size);
 }
 
 bool GGUFLoader::read(bool & dst) const {

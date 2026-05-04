@@ -86,13 +86,6 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         return false;
     }
 
-    // std::shared_ptr<GGUFReader> reader_ = std::make_shared<GGUFReader>();
-    // if (false == reader_->open(model_path_)) {
-    //     printf("[Loader] ERROR: failed open modelfile(%s)\n", model_path_.c_str());
-    //     return false;
-    // }
-    // print_context_info(reader_->gguf_ctx_, reader_->ggml_ctx_);
-
     // 1: metadata
     if (!load_metadata()) {
         printf("[Loader] Config loading failed\n");
@@ -106,12 +99,30 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
         init_gpu();
     }
 
+    // if (nullptr == backend_gpu_) {
+    //     ggml_backend_t backends[] = {backend_cpu_};
+    //     sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
+    //     if (!sched_) {
+    //         fprintf(stderr, "Failed to create backend scheduler\n");
+    //         return false;
+    //     }
+    //     fprintf(stderr, "Scheduler created with CPU backend only\n");
+    // } else {
+    //     ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
+    //     sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
+    //     if (!sched_) {
+    //         fprintf(stderr, "Failed to create backend scheduler\n");
+    //         return false;
+    //     }
+    //     fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
+    // }
+    
     printf("==================Loading Complete!======================\n");
     return true;
 }
 
 bool Qwen35moeModel::init_cpu() {
-    printf("\n===================Loading Qwen35moe Model to CPU=====================\n");
+    printf("===================Loading Qwen35moe Model to CPU=====================\n");
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
         fprintf(stderr, "[Loader] ERROR: failed to init CPU backend\n");
@@ -181,19 +192,11 @@ bool Qwen35moeModel::init_cpu() {
     }
     printf("[Loader] CPU weight loading complete\n");
 
-    // ggml_backend_t backends[] = {backend_cpu_};
-    // sched_ = ggml_backend_sched_new(backends, nullptr, 1, QWEN_DEFAULT_GRAPH_SIZE, false, false);
-    // if (!sched_) {
-    //     fprintf(stderr, "Failed to create backend scheduler\n");
-    //     return false;
-    // }
-    fprintf(stderr, "Scheduler created with CPU backend only\n");
-
     return true;
 }
 
 bool Qwen35moeModel::init_gpu() {
-    printf("\n===================Loading Qwen35moe Model to GPU=====================\n");
+    printf("===================Loading Qwen35moe Model to GPU=====================\n");
     int gpu_id = 0;
     backend_gpu_ = ggml_backend_cuda_init(gpu_id);//ggml_backend_init_best();
     if (!backend_gpu_) {
@@ -232,8 +235,13 @@ bool Qwen35moeModel::init_gpu() {
             return false;
         }
 
+        struct ggml_tensor* cur = nullptr;
         auto* tensor_info = &loader_->tensors_[it->second];
-        struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+        if (weight_info.first == EN_WEIGHT_TYPE_TOKEN_EMBD) {
+            cur = ggml_new_tensor_2d(gpu_ctx_, GGML_TYPE_F16, tensor_info->dims[0], tensor_info->dims[1]);
+        } else {
+            cur = ggml_new_tensor(gpu_ctx_, tensor_info->type, tensor_info->n_dims, tensor_info->dims);
+        }
         ggml_set_name(cur, tensor_info->name.c_str());
         if (NULL != cur) {
             gpu_weights_->heads[weight_info.first] = cur;
@@ -267,7 +275,11 @@ bool Qwen35moeModel::init_gpu() {
     }
 
     for (auto& head_iter : gpu_weights_->heads) {
-        loader_->load_tensor_data(head_iter.second);
+        if (head_iter.first == EN_WEIGHT_TYPE_TOKEN_EMBD) {
+            dequant_set(head_iter.second);
+        } else {
+            loader_->load_tensor_data(head_iter.second);
+        }
     }
     for (auto& layer_iter : gpu_weights_->layers) {
         for (auto& layer_info : layer_iter->tensors) {
@@ -276,14 +288,6 @@ bool Qwen35moeModel::init_gpu() {
         printf("Loaded layer %d to GPU\n", &layer_iter - &gpu_weights_->layers[0]);
     }
     printf("[Loader] GPU weight loading complete\n");
-
-    // ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
-    // sched_ = ggml_backend_sched_new(backends, nullptr, 2, QWEN_DEFAULT_GRAPH_SIZE, true, false);
-    // if (!sched_) {
-    //     fprintf(stderr, "Failed to create backend scheduler\n");
-    //     return false;
-    // }
-    fprintf(stderr, "Scheduler created with CPU + GPU backends\n");
     
     return true;
 }
@@ -458,6 +462,40 @@ bool Qwen35moeModel::load_metadata() {
 
 int Qwen35moeModel::get_ctx_size() {
     return meta_->qwen35moe.context_length;
+}
+
+void Qwen35moeModel::dequant_set(ggml_tensor* dst) {
+    if (!dst) 
+        return;
+
+    auto it = loader_->tensor_index_map_.find(dst->name);
+    if (it == loader_->tensor_index_map_.end()) {
+        return;
+    }
+    
+    auto* tensor = &loader_->tensors_[it->second];
+
+    const int64_t ncols = tensor->dims[0];
+    int64_t nrows = tensor->dims[1];
+    for (int64_t i = 2; i < tensor->n_dims; ++i) {
+        nrows *= tensor->dims[i];
+    }
+    const auto* tr = ggml_get_type_traits(tensor->type);
+
+    std::vector<uint8_t> src_data(tensor->byte_size);
+    loader_->get_tensor_data(tensor, src_data);
+
+    std::vector<float> row32(ncols);
+    std::vector<ggml_fp16_t> row16(ncols);
+    for (int64_t r = 0; r < nrows; ++r) {
+        const uint8_t * rp = src_data.data() + r * tensor->type_size*(ncols/tensor->blck_size);
+        for (int64_t c = 0; c < ncols; c += tensor->blck_size) {
+            tr->to_float(rp + (c / tensor->blck_size) * tensor->type_size, row32.data() + c, tensor->blck_size);
+        }
+        for (int64_t i = 0; i < ncols; ++i)
+            row16[i] = ggml_fp32_to_fp16(row32[i]);
+        ggml_backend_tensor_set(dst, row16.data(), (size_t)r * dst->nb[1], (size_t)ncols * sizeof(ggml_fp16_t));
+    }
 }
 
 void Qwen35moeModel::print_context_info(gguf_context* gguf_ctx, ggml_context* ctx_) {

@@ -61,6 +61,7 @@ public:
 private:
     bool load_metadata();
     int get_ctx_size();
+    void dequant_set(ggml_tensor* dst);
     void print_context_info(gguf_context* gguf_ctx, ggml_context* ctx_);
 
 public:

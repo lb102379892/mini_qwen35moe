@@ -188,6 +188,7 @@ public:
     bool load(const std::string& path);
     int get_all_tensor_bytesize();
     bool load_tensor_data(ggml_tensor* dst);
+    void get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data);
 
     int32_t get_i32_or(const char* key, int default_val);
     uint32_t get_u32_or(const char* key, uint32_t default_val);
