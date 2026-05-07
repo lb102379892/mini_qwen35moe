@@ -38,6 +38,8 @@ add_executable(test_qwen35moe
     graph/deltanet_state.cpp
     graph/kv_cache_simple.cpp
     graph/graph.cpp
+    graph/turboquant.cpp
+    model/common.cpp
     model/gguf_mmap.cpp
     model/metadata.cpp
     model/weights.cpp

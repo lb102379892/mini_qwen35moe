@@ -18,7 +18,7 @@
 enum class DevMode {
     CPU_MODE,
     GPU_MODE,
-    AURO_MODE,
+    AUTO_MODE,
 };
 
 class Qwen35moeModel {
@@ -26,13 +26,11 @@ public:
     Qwen35moeModel();
     ~Qwen35moeModel();
 
-    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, int gpu_layer = 0);
-    bool init_cpu();
-    bool init_gpu();
+    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, size_t gpu_layer = 0);
     ggml_backend_t get_curr_backend();
     ggml_backend_sched_t get_scheduler() const;
     ggml_tensor* get_weight_tensor(const EN_WEIGHT_TYPE weight_type);
-    ggml_tensor* get_weight_layer_tensor(const EN_LAYER_TYPE layer_type, const int layer_idx);
+    ggml_tensor* get_weight_layer_tensor(const EN_WEIGHT_TYPE layer_type, const int layer_idx);
     struct ggml_tensor* get_token_embedding_weight();
     struct ggml_tensor* get_output_weight();
     struct ggml_tensor* get_output_norm_weight();
@@ -63,6 +61,11 @@ public:
     struct ggml_tensor* get_attn_output_weight(const int layer_idx);
 
 private:
+    bool init_cpu();
+    bool init_gpu();
+    bool init_auto_cpu(std::vector<struct tensor_info>::iterator& enditer);
+    bool init_auto_gpu(size_t& free_mem);
+
     bool load_metadata();
     int get_ctx_size();
     void dequant_set(ggml_tensor* dst);
@@ -76,7 +79,7 @@ public:
     std::shared_ptr<Qwen35moeWeights> cpu_weights_ = nullptr;
 
     int n_threads_ = 1;
-    int gpu_layer_ = 0;
+    size_t gpu_layer_ = 0;
     ggml_backend_t backend_gpu_ = nullptr;
     ggml_backend_t backend_cpu_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;

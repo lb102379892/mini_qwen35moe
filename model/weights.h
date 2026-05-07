@@ -51,58 +51,21 @@
 #include <vector>
 #include <cstdio>
 #include <memory>
+#include <string>
+#include <set>
 #include <unordered_map>
+#include "common.h"
 
 // 判断某层是否为 Attention 层（每 4 层一个，index % 4 == 3）
 inline bool is_attn_layer(int idx) { return (idx % 4) == 3; }
 
-// ============================================================
-// 模型文件中每层的权重结构
-// ============================================================
-enum EN_LAYER_TYPE {
-    EN_LAYER_TYPE_ATTN_K = 0,
-    EN_LAYER_TYPE_ATTN_K_NORM = 1,
-    EN_LAYER_TYPE_ATTN_NORM = 2,
-    EN_LAYER_TYPE_ATTN_GATE = 3,
-    EN_LAYER_TYPE_ATTN_QKV = 4,
-    EN_LAYER_TYPE_ATTN_Q = 5,
-    EN_LAYER_TYPE_ATTN_Q_NORM = 6,
-    EN_LAYER_TYPE_ATTN_V = 7,
-    EN_LAYER_TYPE_FFN_DOWN_EXPS = 8,
-    EN_LAYER_TYPE_FFN_GATE_EXPS = 9,
-    EN_LAYER_TYPE_FFN_GATE_INP = 10,
-    EN_LAYER_TYPE_FFN_UP_EXPS = 11,
-    EN_LAYER_TYPE_FFN_DOWN_SHEXP = 12,
-    EN_LAYER_TYPE_FFN_GATE_INP_SHEXP = 13,
-    EN_LAYER_TYPE_FFN_GATE_SHEXP = 14,
-    EN_LAYER_TYPE_FFN_UP_SHEXP = 15,
-    EN_LAYER_TYPE_SSM_A = 16,
-    EN_LAYER_TYPE_SSM_ALPHA = 17,
-    EN_LAYER_TYPE_SSM_BETA = 18,
-    EN_LAYER_TYPE_SSM_CONV1D = 19,
-    EN_LAYER_TYPE_SSM_DT = 20,
-    EN_LAYER_TYPE_SSM_NORM = 21,
-    EN_LAYER_TYPE_SSM_OUT = 22,
-    EN_LAYER_TYPE_POST_ATTENTION_NORM = 23,
-    EN_LAYER_TYPE_ATTN_OUTPUT = 24
-};
-
 class Qwen35moeLayer {
 public:
-    std::unordered_map<EN_LAYER_TYPE, ggml_tensor*> tensors;
-};
-
-// ============================================================
-// 完整权重
-// ============================================================
-enum EN_WEIGHT_TYPE {
-    EN_WEIGHT_TYPE_TOKEN_EMBD = 0,
-    EN_WEIGHT_TYPE_OUTPUT = 1,
-    EN_WEIGHT_TYPE_OUTPUT_NORM = 2
+    std::unordered_map<EN_WEIGHT_TYPE, ggml_tensor*> tensors;
 };
 
 class Qwen35moeWeights {
 public:
     std::unordered_map<EN_WEIGHT_TYPE, ggml_tensor*> heads;
-    std::vector<std::shared_ptr<Qwen35moeLayer>> layers;
+    std::unordered_map<int, std::shared_ptr<Qwen35moeLayer>> layers;
 };

@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <ggml.h>
 #include <gguf.h>
+#include "common.h"
 
 #define GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
 #define GGUF_MAX_ARRAY_ELEMENTS (1024*1024*1024)
@@ -178,6 +179,12 @@ struct tensor_info {
 
     // 张量数据在文件中的偏移量
     uint64_t offset = 0;
+
+    // 张量所属层索引，-1 表示不属于任何层
+    int layer_idx = -1;
+
+    // 张量权重类型
+    EN_WEIGHT_TYPE weight_type = EN_WEIGHT_TYPE_COUNT;
 };
 
 class GGUFLoader {
@@ -186,8 +193,11 @@ public:
     ~GGUFLoader();
 
     bool load(const std::string& path);
-    int get_all_tensor_bytesize();
-    bool load_tensor_data(ggml_tensor* dst);
+    void unload();
+    size_t get_all_tensor_bytesize();
+    size_t get_tensor_bytesize(const tensor_info& tensor);
+    bool load_tensor_head_data(ggml_tensor* dst);
+    bool load_tensor_layer_data(ggml_tensor* dst);
     void get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data);
 
     int32_t get_i32_or(const char* key, int default_val);
@@ -305,8 +315,9 @@ public:
     size_t data_offset_ = 0;
     std::vector<struct kv_info> kv_;
     std::map<std::string, size_t> kv_index_map_;
-    std::vector<struct tensor_info> tensors_;
-    std::map<std::string, size_t> tensor_index_map_;
+    std::vector<struct tensor_info> tensors_layer_;
+    std::map<std::string, size_t> tensor_layer_index_map_;
+    std::map<std::string, struct tensor_info> tensors_head_;
     uint32_t alignment_idx_ = 0;
 
 private:

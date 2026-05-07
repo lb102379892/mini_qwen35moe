@@ -7,7 +7,7 @@ ChatEngine::ChatEngine() {
 ChatEngine::~ChatEngine() {
 }
 
-bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, int gpu_layer) {
+bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer) {
     dev_mode_ = dev_mode;
     max_seq_len_= max_seq_len;
 

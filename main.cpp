@@ -79,7 +79,7 @@ int main(int argc, char* argv[]) {
     int         top_k        = 50;
     int         n_threads    = 4;
     int         ctx_size     = 4096;
-    int         gpu_layer    = 8;
+    size_t      gpu_layer    = 0;
     bool        use_chat     = true;
     bool        verbose      = true;
     bool        repl_mode    = false;
@@ -114,9 +114,9 @@ int main(int argc, char* argv[]) {
             } else if (strcmp(mode, "gpu") == 0) {
                 dev_mode = DevMode::GPU_MODE;
             } else if (strcmp(mode, "auto") == 0) {
-                dev_mode = DevMode::AURO_MODE;
+                dev_mode = DevMode::AUTO_MODE;
             } else {
-                dev_mode = DevMode::AURO_MODE;
+                dev_mode = DevMode::AUTO_MODE;
             }
         }
         else if (arg("-h") || arg("--help")) {

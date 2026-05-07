@@ -5,20 +5,23 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
+#include <string>
+#include <set>
 #include <ggml.h>
 #include <ggml-backend.h>
 #include "gguf_mmap.h"
+
+std::set<std::string> g_tensor_head_name_list = {
+    WEIGHT_TOKEN_EMBD_NAME,
+    WEIGHT_OUTPUT_NAME,
+    WEIGHT_OUTPUT_NORM_NAME
+};
 
 GGUFLoader::GGUFLoader() {
 }
 
 GGUFLoader::~GGUFLoader() {
-    if (mmap_base_ && mmap_base_ != MAP_FAILED) {
-        munmap(mmap_base_, mmap_size_);
-    }
-    if (fd_ >= 0) {
-        close(fd_);
-    }
+    unload();
 }
 
 bool GGUFLoader::load(const std::string& path) {
@@ -35,6 +38,15 @@ bool GGUFLoader::load(const std::string& path) {
     //print_prase_info();
 
     return true;
+}
+
+void GGUFLoader::unload() {
+    if (mmap_base_ && mmap_base_ != MAP_FAILED) {
+        munmap(mmap_base_, mmap_size_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
 }
 
 int32_t GGUFLoader::get_i32_or(const char* key, int default_val) {
@@ -352,8 +364,28 @@ bool GGUFLoader::prase_model_file() {
                 return false;
             }
 
-            tensors_.push_back(info);
-            tensor_index_map_[info.name] = tensors_.size() - 1;
+            if (g_tensor_head_name_list.find(info.name) != g_tensor_head_name_list.end()) {
+                info.layer_idx = -1;
+                auto iter = g_tensor_head_names.find(info.name);
+                if (iter != g_tensor_head_names.end()) {
+                    info.weight_type = iter->second;
+                }
+                tensors_head_[info.name] = info;
+            } else {
+                info.layer_idx = extractNumber(info.name);
+                if (info.layer_idx < 0) {
+                    printf("%s: failed to extract layer index from tensor name '%s'\n", __func__, info.name.c_str());
+                    return false;
+                }
+                auto aftername = getAfterNumber(info.name);
+                auto iter = g_tensor_layer_names.find(aftername);
+                if (iter != g_tensor_layer_names.end()) {
+                    info.weight_type = iter->second;
+                }
+                tensors_layer_.push_back(info);
+                tensor_layer_index_map_[info.name] = tensors_layer_.size() - 1;
+            }
+            
         }
     }
     data_offset_ = pos_;
@@ -362,20 +394,40 @@ bool GGUFLoader::prase_model_file() {
     return true;
 }
 
-int GGUFLoader::get_all_tensor_bytesize() {
+size_t GGUFLoader::get_all_tensor_bytesize() {
     size_t total = 0;
-    for (const auto& info : tensors_) {
-        // 内存对齐要求（通常是 32 字节）,将数值 info.byte_size 向上取整到 ctx->alignment 的最小倍数，ctx->alignment的倍数
-        size_t padded_size = GGML_PAD(info.byte_size, alignment_idx_);
-        total += padded_size;
+    for (const auto& info : tensors_layer_) {
+        total += get_tensor_bytesize(info);
+    }
+    for (const auto& info : tensors_head_) {
+        total += get_tensor_bytesize(info.second);
     }
 
     return total;
 }
 
-bool GGUFLoader::load_tensor_data(ggml_tensor* dst) {
-    auto index = tensor_index_map_[dst->name];
-    auto* tensor_info = &tensors_[index];
+size_t GGUFLoader::get_tensor_bytesize(const tensor_info& tensor) {
+    size_t total = 0;
+    const size_t ggml_tensor_struct_size = sizeof(ggml_tensor);
+
+    // 内存对齐要求（通常是 32 字节）,将数值 info.byte_size 向上取整到 ctx->alignment 的最小倍数，ctx->alignment的倍数
+    size_t padded_size = GGML_PAD(tensor.byte_size, alignment_idx_);
+    total += padded_size + ggml_tensor_struct_size;
+    total = GGML_PAD(total, alignment_idx_);
+
+    return total;
+}
+
+bool GGUFLoader::load_tensor_head_data(ggml_tensor* dst) {
+    auto* tensor_info = &tensors_head_[dst->name];
+
+    ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
+    return true;
+}
+
+bool GGUFLoader::load_tensor_layer_data(ggml_tensor* dst) {
+    auto index = tensor_layer_index_map_[dst->name];
+    auto* tensor_info = &tensors_layer_[index];
 
     ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
     return true;
@@ -452,8 +504,20 @@ void GGUFLoader::print_prase_info() const {
         printf("kv[%zu]: key='%s', type=%s, is_array=%d\n", i, kv.key.c_str(), gguf_type_name(kv.type), kv.is_array);
     }
 
-    for (size_t i = 0; i < tensors_.size(); ++i) {
-        const auto& t = tensors_[i];
+    for (auto& info : tensors_head_) {
+        const auto& t = info.second;
+        printf("tensor: name='%s', n_dims=%u, dims=[", t.name.c_str(), t.n_dims);
+        for (uint32_t d = 0; d < t.n_dims; ++d) {
+            printf("%lld", t.dims[d]);
+            if (d < t.n_dims - 1) {
+                printf(", ");
+            }
+        }
+        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu, layer_idx=%d, weight_type=%d\n",
+            t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset, t.layer_idx, t.weight_type);
+    }
+    for (size_t i = 0; i < tensors_layer_.size(); ++i) {
+        const auto& t = tensors_layer_[i];
         printf("tensor[%zu]: name='%s', n_dims=%u, dims=[", i, t.name.c_str(), t.n_dims);
         for (uint32_t d = 0; d < t.n_dims; ++d) {
             printf("%lld", t.dims[d]);
@@ -461,8 +525,8 @@ void GGUFLoader::print_prase_info() const {
                 printf(", ");
             }
         }
-        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu\n",
-            t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset);
+        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu, layer_idx=%d, weight_type=%d\n",
+            t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset, t.layer_idx, t.weight_type);
     }
 }
 
