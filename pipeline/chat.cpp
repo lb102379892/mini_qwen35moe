@@ -1,7 +1,12 @@
 #include "pipeline/chat.h"
 
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 ChatEngine::ChatEngine() {
+    std::random_device rd;
+    gpu_sampling_rng_ = std::mt19937(rd());
 }
 
 ChatEngine::~ChatEngine() {
@@ -10,6 +15,10 @@ ChatEngine::~ChatEngine() {
 bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer, bool flash_attention) {
     dev_mode_ = dev_mode;
     max_seq_len_= max_seq_len;
+    top_p_ = top_p;
+    top_k_ = top_k;
+    temperature_ = temperature;
+    use_gpu_topk_sampling_ = (dev_mode_ != DevMode::CPU_MODE && temperature_ > 0.0f && top_k_ > 0);
 
     ggml_backend_load_all();
 
@@ -35,11 +44,64 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
 
     forward_pass_ = std::make_shared<Qwen35moeForwardPass>();
     forward_pass_->init(max_seq_len_, 1, model_);
+    if (use_gpu_topk_sampling_) {
+        forward_pass_->configure_device_sampling(top_k_, temperature_);
+    }
     if (flash_attention) {
         forward_pass_->set_flash_attention_enabled(true);
     }
 
     return true;
+}
+
+int ChatEngine::sample_from_topk_candidates(const TopKSampleCandidates& candidates, float top_p) {
+    if (candidates.token_ids.empty() || candidates.token_ids.size() != candidates.logits.size()) {
+        throw std::runtime_error("Invalid top-k candidates");
+    }
+
+    std::vector<std::pair<int32_t, float>> sorted;
+    sorted.reserve(candidates.token_ids.size());
+    for (size_t i = 0; i < candidates.token_ids.size(); ++i) {
+        sorted.emplace_back(candidates.token_ids[i], candidates.logits[i]);
+    }
+
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+
+    if (top_p > 0.0f && top_p < 1.0f && sorted.size() > 1) {
+        const float max_l = sorted[0].second;
+        float sum_exp = 0.0f;
+        for (const auto& p : sorted) {
+            sum_exp += std::exp(p.second - max_l);
+        }
+        float cum = 0.0f;
+        size_t cutoff = sorted.size();
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            cum += std::exp(sorted[i].second - max_l) / sum_exp;
+            if (cum >= top_p) {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        sorted.resize(cutoff);
+    }
+
+    const float max_l = sorted[0].second;
+    float sum_exp = 0.0f;
+    std::vector<float> probs;
+    probs.reserve(sorted.size());
+    for (const auto& p : sorted) {
+        const float e = std::exp(p.second - max_l);
+        probs.push_back(e);
+        sum_exp += e;
+    }
+    for (float& p : probs) {
+        p /= sum_exp;
+    }
+
+    std::discrete_distribution<> dist(probs.begin(), probs.end());
+    return sorted[dist(gpu_sampling_rng_)].first;
 }
 
 bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response) {
@@ -51,12 +113,24 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     using Clock = std::chrono::steady_clock;
     const size_t n_prompt_tokens = tokens.size();
     auto t_prefill_start = Clock::now();
-    std::vector<float> logits = forward_pass_->run_prefill(tokens, 0, 0, sched_);
+    std::vector<float> logits;
+    TopKSampleCandidates prefill_candidates;
+    if (use_gpu_topk_sampling_) {
+        prefill_candidates = forward_pass_->run_prefill_topk(tokens, 0, 0, sched_);
+    } else {
+        logits = forward_pass_->run_prefill(tokens, 0, 0, sched_);
+    }
     auto t_prefill_end = Clock::now();
 
     size_t vocab_size = m->tokenizer.ggml_tokens.size();
-    std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
-    int next_token_id = sampler_->sample(last_token_logits, tokens);
+    std::vector<float> last_token_logits;
+    int next_token_id = 0;
+    if (use_gpu_topk_sampling_) {
+        next_token_id = sample_from_topk_candidates(prefill_candidates, top_p_);
+    } else {
+        last_token_logits.assign(logits.end() - vocab_size, logits.end());
+        next_token_id = sampler_->sample(last_token_logits, tokens);
+    }
 
     // Decode phase
     const int32_t eos_token_id = m->tokenizer.ggml_eos_token_id;
@@ -81,10 +155,14 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         // --- Normal decode path ---
         int current_pos = forward_pass_->get_cache_pos(0); // Slot 0
 
-        std::vector<float> token_logits = forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
-        last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
-        
-        next_token_id = sampler_->sample(last_token_logits, tokens);
+        if (use_gpu_topk_sampling_) {
+            TopKSampleCandidates decode_candidates = forward_pass_->run_decode_cached_topk(next_token_id, current_pos, 0, sched_);
+            next_token_id = sample_from_topk_candidates(decode_candidates, top_p_);
+        } else {
+            std::vector<float> token_logits = forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
+            last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
+            next_token_id = sampler_->sample(last_token_logits, tokens);
+        }
     }
     auto t_decode_end = Clock::now();
     printf("response: [%s].\n", response.c_str());
