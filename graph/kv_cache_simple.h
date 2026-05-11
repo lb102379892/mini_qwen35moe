@@ -85,6 +85,8 @@ private:
     // Persistent cache tensors (allocated in buf)
     std::vector<ggml_tensor*> k_cache;  // One per layer
     std::vector<ggml_tensor*> v_cache;  // One per layer
+    std::vector<uint8_t> scratch_buffer_;
+    std::unique_ptr<ggml_context, void(*)(ggml_context*)> scratch_ctx;
 
     void init_cache();
 };

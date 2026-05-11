@@ -146,6 +146,9 @@ void Qwen35moeForwardPass::reset_context() {
     }
     cached_decode_graph_ = nullptr;
     cached_decode_graph_allocated_ = false;
+    cached_decode_mask_tensors_.clear();
+    cached_decode_mask_f32_.clear();
+    cached_decode_mask_f16_.clear();
     struct ggml_init_params params = {
         .mem_size   = ctx_buffer_.size(),
         .mem_buffer = ctx_buffer_.data(),
@@ -190,6 +193,18 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     std::vector<int32_t> dummy_tokens(1, 0);
     cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(context_len_ - 1), slot_idx);
     cached_decode_slot_ = slot_idx;
+    cached_decode_mask_tensors_.clear();
+    for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
+        if (!is_full_attention_layer(il)) {
+            continue;
+        }
+        char name[32];
+        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
+        ggml_tensor* kq_mask = ggml_graph_get_tensor(cached_decode_graph_, name);
+        if (kq_mask) {
+            cached_decode_mask_tensors_.push_back(kq_mask);
+        }
+    }
 
     if (kv_cache_) {
         kv_cache_->set_pos(saved_pos, slot_idx);
@@ -245,41 +260,65 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
     // scratch_pos 是上下文缓冲区的最后一个位置，用于特殊用途（如 KV 缓存优化）
     const uint32_t scratch_pos = context_len_ - 1;
 
-    // 遍历所有 Transformer 层
-    for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
-        // 跳过 DeltaNet 层，只处理 Full Attention 层
-        if (!is_full_attention_layer(il)) {
+    if (cached_decode_mask_tensors_.empty()) {
+        for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
+            if (!is_full_attention_layer(il)) {
+                continue;
+            }
+            char name[32];
+            std::snprintf(name, sizeof(name), "kq_mask.%u", il);
+            ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
+            if (kq_mask) {
+                cached_decode_mask_tensors_.push_back(kq_mask);
+            }
+        }
+    }
+
+    uint32_t prepared_n_kv = 0;
+    bool f16_ready = false;
+    for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
+        if (!kq_mask) {
             continue;
         }
 
-        // 构建该层掩码张量的名称（格式："kq_mask.0", "kq_mask.1", ...）
-        char name[32];
-        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
-        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
-        if (!kq_mask) {
-            continue;  // 该层没有掩码，跳过
+        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
+        if (prepared_n_kv != n_kv) {
+            cached_decode_mask_f32_.assign(n_kv, -INFINITY);
+            const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
+            for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
+                cached_decode_mask_f32_[j] = 0.0f;
+            }
+            if (scratch_pos < n_kv) {
+                cached_decode_mask_f32_[scratch_pos] = 0.0f;
+            }
+            prepared_n_kv = n_kv;
+            f16_ready = false;
         }
 
-        // 获取掩码的长度（等于 KV 缓存的容量）
-        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
-        
-        // 初始化掩码：所有位置设为 -INF（不可关注）
-        std::vector<float> mask(n_kv, -INFINITY);
-        
-        // 计算有效历史位置范围：[0, pos-1]
-        // 当前 token 只能关注之前的 token（因果性约束）
-        const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
-        for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
-            mask[j] = 0.0f;  // 有效位置设为 0
+        if (kq_mask->type == GGML_TYPE_F16) {
+            if (!f16_ready) {
+                cached_decode_mask_f16_.resize(cached_decode_mask_f32_.size());
+                ggml_fp32_to_fp16_row(
+                    cached_decode_mask_f32_.data(),
+                    cached_decode_mask_f16_.data(),
+                    static_cast<int64_t>(cached_decode_mask_f32_.size())
+                );
+                f16_ready = true;
+            }
+            ggml_backend_tensor_set(
+                kq_mask,
+                cached_decode_mask_f16_.data(),
+                0,
+                cached_decode_mask_f16_.size() * sizeof(ggml_fp16_t)
+            );
+        } else {
+            ggml_backend_tensor_set(
+                kq_mask,
+                cached_decode_mask_f32_.data(),
+                0,
+                cached_decode_mask_f32_.size() * sizeof(float)
+            );
         }
-        
-        // 特殊处理：将 scratch_pos 也设为有效（用于 KV 缓存的临时存储）
-        if (scratch_pos < n_kv) {
-            mask[scratch_pos] = 0.0f;
-        }
-        
-        // 将构建好的掩码写入张量
-        set_mask_data(kq_mask, mask);
     }
 }
 
