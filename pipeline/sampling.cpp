@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
@@ -87,13 +88,20 @@ int TemperatureSampler::sample(std::vector<float>& logits, const std::vector<int
         logits[i] /= temperature_;
 
     std::vector<std::pair<int, float>> sorted;
+    const size_t candidate_count = (top_k_ > 0 && top_k_ < static_cast<int>(vocab_size))
+        ? static_cast<size_t>(top_k_)
+        : vocab_size;
     sorted.reserve(vocab_size);
     for (size_t i = 0; i < vocab_size; ++i)
         sorted.emplace_back(static_cast<int>(i), logits[i]);
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    if (top_k_ > 0 && top_k_ < static_cast<int>(vocab_size))
-        sorted.resize(top_k_);
+    auto by_logit_desc = [](const auto& a, const auto& b) { return a.second > b.second; };
+    if (candidate_count < vocab_size) {
+        auto kth = sorted.begin() + static_cast<std::ptrdiff_t>(candidate_count);
+        std::nth_element(sorted.begin(), kth, sorted.end(), by_logit_desc);
+        sorted.resize(candidate_count);
+    }
+    std::sort(sorted.begin(), sorted.end(), by_logit_desc);
 
     if (top_p_ > 0.0f && top_p_ < 1.0f) {
         const float max_l = sorted[0].second;

@@ -10,6 +10,7 @@ option(QWEN35MOE_CUDA "Enable CUDA GPU support" OFF)
 if(QWEN35MOE_CUDA)
     enable_language(CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
     add_compile_definitions(QWEN35MOE_USE_CUDA)
 endif()
 
@@ -50,4 +51,3 @@ add_executable(test_qwen35moe
     main.cpp
 )
 target_link_libraries(test_qwen35moe PRIVATE ggml_core pthread dl m)
-

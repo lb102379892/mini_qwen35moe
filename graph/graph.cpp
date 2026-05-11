@@ -9,6 +9,24 @@
  * 4. MoE 层：混合专家前馈网络
  */
 #include "graph/graph.h"
+#include <cstdlib>
+
+namespace {
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> mask_f16(mask.size());
+        ggml_fp32_to_fp16_row(mask.data(), mask_f16.data(), static_cast<int64_t>(mask.size()));
+        ggml_backend_tensor_set(tensor, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+        return;
+    }
+    ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(float));
+}
+}
 
 /**
  * @brief 构造函数：初始化 Qwen35moeForwardPass 对象
@@ -41,6 +59,7 @@ Qwen35moeForwardPass::~Qwen35moeForwardPass() {
  */
 int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model) {
     model_ = model;
+    use_flash_attention_ = env_flag_enabled("QWEN35MOE_FLASH_ATTN");
     auto& m = model_->meta_->qwen35moe;
 
     context_len_ = context_len;
@@ -79,7 +98,7 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
         context_len_,                         // 上下文长度
         max_batch_size_,                      // 最大批大小
         n_embd_k, n_embd_v,                   // K/V 维度
-        GGML_TYPE_F32, GGML_TYPE_F32,         // 数据类型
+        GGML_TYPE_F16, GGML_TYPE_F16,         // 数据类型
         cache_backend                         // 后端设备
     );
 
@@ -107,6 +126,10 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
     return 0;
 }
 
+void Qwen35moeForwardPass::set_flash_attention_enabled(bool enabled) {
+    use_flash_attention_ = enabled;
+}
+
 /**
  * @brief 重置 ggml 上下文
  * 
@@ -116,12 +139,143 @@ void Qwen35moeForwardPass::reset_context() {
     if (ctx_) {
         ggml_free(ctx_);
     }
+    cached_decode_graph_ = nullptr;
+    cached_decode_graph_allocated_ = false;
     struct ggml_init_params params = {
         .mem_size   = ctx_buffer_.size(),
         .mem_buffer = ctx_buffer_.data(),
         .no_alloc   = true, 
     };
     ctx_ = ggml_init(params);
+}
+
+void Qwen35moeForwardPass::reset_sequence(uint32_t slot_idx) {
+    if (slot_idx >= max_batch_size_) {
+        throw std::runtime_error("Qwen35moeForwardPass::reset_sequence: slot_idx out of range");
+    }
+    if (kv_cache_) {
+        kv_cache_->clear_slot(slot_idx);
+    }
+    if (dn_state_) {
+        dn_state_->clear_slot(slot_idx);
+    }
+    if (slot_idx < snapkv_seq_pos_.size()) {
+        snapkv_seq_pos_[slot_idx] = 0;
+    }
+}
+
+void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx) {
+    if (scheduler == nullptr) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: scheduler is null");
+    }
+    if (context_len_ == 0 || slot_idx >= max_batch_size_) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: invalid slot or context length");
+    }
+
+    const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
+    const uint32_t saved_snap = slot_idx < snapkv_seq_pos_.size() ? snapkv_seq_pos_[slot_idx] : 0;
+
+    if (kv_cache_) {
+        kv_cache_->set_pos(context_len_ - 1, slot_idx);
+    }
+    if (slot_idx < snapkv_seq_pos_.size()) {
+        snapkv_seq_pos_[slot_idx] = 0;
+    }
+
+    std::vector<int32_t> dummy_tokens(1, 0);
+    cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(context_len_ - 1), slot_idx);
+    cached_decode_slot_ = slot_idx;
+
+    if (kv_cache_) {
+        kv_cache_->set_pos(saved_pos, slot_idx);
+    }
+    if (slot_idx < snapkv_seq_pos_.size()) {
+        snapkv_seq_pos_[slot_idx] = saved_snap;
+    }
+
+    ggml_backend_sched_reset(scheduler);
+    if (!ggml_backend_sched_alloc_graph(scheduler, cached_decode_graph_)) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: failed to allocate graph");
+    }
+    cached_decode_graph_allocated_ = true;
+}
+
+/**
+ * @brief 设置缓存解码图的输入数据（图复用模式）
+ * 
+ * 该函数用于解码阶段（Decode），在预构建的计算图上更新输入数据，实现图复用。
+ * 相比于每次解码都重建图，这种方式可以显著减少 CPU 开销，提高 GPU 利用率。
+ * 
+ * @param gf 预构建的解码计算图（由 build_cached_decode_graph 创建）
+ * @param token 当前要解码的单个 token ID
+ * @param pos 当前 token 在序列中的位置（从 0 开始）
+ * 
+ * @throws std::runtime_error 如果图中缺少必要的输入张量
+ * 
+ * 实现步骤：
+ * 1. 更新 token 输入张量
+ * 2. 更新位置输入张量
+ * 3. 动态更新注意力掩码（确保因果性）
+ */
+void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos) {
+    // ==================== 步骤1：更新 Token 输入 ====================
+    // 从计算图中获取名为 "tokens" 的输入张量
+    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
+    if (!tok_t) {
+        throw std::runtime_error("qwen36: 'tokens' tensor missing from cached decode graph");
+    }
+    // 将当前 token ID 写入张量（解码阶段每次只处理一个 token）
+    ggml_backend_tensor_set(tok_t, &token, 0, sizeof(int32_t));
+
+    // ==================== 步骤2：更新位置输入 ====================
+    // 从计算图中获取名为 "inp_pos" 的位置张量
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos");
+    if (!pos_t) {
+        throw std::runtime_error("qwen36: 'inp_pos' tensor missing from cached decode graph");
+    }
+    // 将当前位置写入张量
+    ggml_backend_tensor_set(pos_t, &pos, 0, sizeof(int32_t));
+
+    // ==================== 步骤3：动态更新注意力掩码 ====================
+    // scratch_pos 是上下文缓冲区的最后一个位置，用于特殊用途（如 KV 缓存优化）
+    const uint32_t scratch_pos = context_len_ - 1;
+
+    // 遍历所有 Transformer 层
+    for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
+        // 跳过 DeltaNet 层，只处理 Full Attention 层
+        if (!is_full_attention_layer(il)) {
+            continue;
+        }
+
+        // 构建该层掩码张量的名称（格式："kq_mask.0", "kq_mask.1", ...）
+        char name[32];
+        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
+        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
+        if (!kq_mask) {
+            continue;  // 该层没有掩码，跳过
+        }
+
+        // 获取掩码的长度（等于 KV 缓存的容量）
+        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
+        
+        // 初始化掩码：所有位置设为 -INF（不可关注）
+        std::vector<float> mask(n_kv, -INFINITY);
+        
+        // 计算有效历史位置范围：[0, pos-1]
+        // 当前 token 只能关注之前的 token（因果性约束）
+        const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
+        for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
+            mask[j] = 0.0f;  // 有效位置设为 0
+        }
+        
+        // 特殊处理：将 scratch_pos 也设为有效（用于 KV 缓存的临时存储）
+        if (scratch_pos < n_kv) {
+            mask[scratch_pos] = 0.0f;
+        }
+        
+        // 将构建好的掩码写入张量
+        set_mask_data(kq_mask, mask);
+    }
 }
 
 /**
@@ -311,7 +465,7 @@ ggml_cgraph* Qwen35moeForwardPass::build_decoding_graph(const std::vector<int32_
     const uint32_t n_kv_len = max_physical + 1;  // +1 用于即将写入的 token
     
     // 创建 KV mask: [n_kv_len, 1, 1, n_batch]
-    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, n_kv_len, 1, 1, n_batch);
+    ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, use_flash_attention_ ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv_len, 1, 1, n_batch);
     ggml_set_input(kq_mask);
     set_tensor_name(kq_mask, "kq_mask_b");
     ggml_build_forward_expand(gf, kq_mask);
@@ -431,7 +585,7 @@ void Qwen35moeForwardPass::set_inputs(ggml_cgraph* gf, const std::vector<int32_t
             for (uint32_t j = 0; j < n_kv; ++j)
                 mask[t * n_kv + j] = (j <= q_pos) ? 0.0f : -INFINITY;
         }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
+        set_mask_data(kq_mask, mask);
     }
 }
 
@@ -473,7 +627,7 @@ void Qwen35moeForwardPass::set_batched_inputs(ggml_cgraph* gf, const std::vector
             for (uint32_t j = 0; j <= q_pos && j < n_kv; ++j)
                 mask[b * n_kv + j] = 0.0f;  // 允许关注当前位置之前的 token
         }
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
+        set_mask_data(kq_mask, mask);
     }
 
     // 4. 设置 Gather indices [n_batch * n_kv_len]
@@ -515,7 +669,9 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
         // 默认：整体路径（子类可以重写以支持 TQ）
         ggml_backend_sched_reset(scheduler);
         ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-        ggml_backend_sched_alloc_graph(scheduler, gf);
+        if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+            throw std::runtime_error("Qwen35moeForwardPass::run_prefill: failed to allocate graph");
+        }
         set_inputs(gf, tokens, pos);
         ggml_backend_sched_graph_compute(scheduler, gf);
         advance_cache(tokens.size(), slot_idx);
@@ -535,6 +691,29 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
             ggml_gallocr_free(allocr_prefill);
         return result;
     }
+}
+
+std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int pos,
+    uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    if (scheduler == nullptr) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, scheduler);
+    }
+    if (static_cast<uint32_t>(pos) >= context_len_) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
+    }
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx || !cached_decode_graph_allocated_) {
+        prepare_cached_decode_graph(scheduler, slot_idx);
+    }
+
+    set_cached_decode_inputs(cached_decode_graph_, token, pos);
+    ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
+
+    if (kv_cache_) {
+        kv_cache_->copy_pos(context_len_ - 1, static_cast<uint32_t>(pos), slot_idx);
+    }
+    advance_cache(1, slot_idx);
+    return get_output_logits(cached_decode_graph_);
 }
 
 uint32_t Qwen35moeForwardPass::get_cache_pos(uint32_t slot_idx) const {
@@ -871,6 +1050,22 @@ ggml_tensor* Qwen35moeForwardPass::build_attn_mha(
     set_tensor_name(q, "q_permuted", il);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     set_tensor_name(k, "k_permuted", il);
+
+    if (use_flash_attention_ && kq_mask && kq_mask->type == GGML_TYPE_F16) {
+        ggml_tensor* v_fa = ggml_permute(ctx, v, 0, 2, 1, 3);
+        set_tensor_name(v_fa, "v_flash", il);
+
+        ggml_tensor* kqv = ggml_flash_attn_ext(ctx, q, k, v_fa, kq_mask, kq_scale, 0.0f, 0.0f);
+        set_tensor_name(kqv, "kqv_flash", il);
+        if (sinks) {
+            ggml_flash_attn_ext_add_sinks(kqv, sinks);
+        }
+
+        ggml_tensor* cur = ggml_cont_2d(ctx, kqv, kqv->ne[0] * kqv->ne[1], kqv->ne[2] * kqv->ne[3]);
+        set_tensor_name(cur, "attn_flash_recombined", il);
+        return cur;
+    }
+
     v = ggml_permute(ctx, v, 1, 2, 0, 3);
     set_tensor_name(v, "v_permuted", il);
     v = ggml_cont(ctx, v);  // 确保连续内存
@@ -1025,16 +1220,15 @@ ggml_tensor* Qwen35moeForwardPass::build_gated_attention(
     ggml_tensor* k_full = kv_cache->get_k(ctx, kv_cache_layer, n_kv, slot_idx);
     ggml_tensor* v_full = kv_cache->get_v(ctx, kv_cache_layer, n_kv, slot_idx);
 
-    const int n_embd_kv = n_head_kv * n_embd_head;
     ggml_tensor* k_view = ggml_view_3d(ctx, k_full,
         n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
+        n_embd_head * k_full->nb[0], k_full->nb[1], 0);
     ggml_tensor* v_view = ggml_view_3d(ctx, v_full,
         n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
+        n_embd_head * v_full->nb[0], v_full->nb[1], 0);
 
     // 创建因果掩码
-    ggml_tensor* kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+    ggml_tensor* kq_mask = ggml_new_tensor_2d(ctx, use_flash_attention_ ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, n_tokens);
     set_tensor_name(kq_mask, "kq_mask", il);
     ggml_build_forward_expand(gf, kq_mask);
 
@@ -1181,15 +1375,15 @@ ggml_tensor* Qwen35moeForwardPass::build_gated_batched_attention(
 
     ggml_tensor* k_view = ggml_view_4d(ctx, k_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_k    * sizeof(float),
-        n_embd_k    * n_kv_len * sizeof(float), 0
+        n_embd_head * k_gathered->nb[0],
+        k_gathered->nb[1],
+        k_gathered->nb[2], 0
     );
     ggml_tensor* v_view = ggml_view_4d(ctx, v_gathered,
         n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_v    * sizeof(float),
-        n_embd_v    * n_kv_len * sizeof(float), 0
+        n_embd_head * v_gathered->nb[0],
+        v_gathered->nb[1],
+        v_gathered->nb[2], 0
     );
 
     // H. 注意力计算

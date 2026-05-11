@@ -37,6 +37,7 @@ public:
     void clear_all();
     void set_pos(uint32_t p, uint32_t slot_idx = 0);
     uint32_t get_pos(uint32_t slot_idx = 0) const { return positions[slot_idx]; }
+    void copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot_idx = 0);
 
     // O(1) head-pointer truncation: discard everything after pos.
     // KV data is not zeroed; next writes will overwrite it.

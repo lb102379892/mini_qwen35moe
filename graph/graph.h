@@ -36,6 +36,8 @@ public:
     int init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model);
 
     void reset_context();
+    void reset_sequence(uint32_t slot_idx = 0);
+    void set_flash_attention_enabled(bool enabled);
 
     // ── Graph building ───────────────────────────────────────────────────────
     ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0);
@@ -48,6 +50,8 @@ public:
         const std::vector<uint32_t>& slots, const std::vector<int32_t>&  positions);
 
     std::vector<float> run_prefill(const std::vector<int32_t>& tokens, int pos, 
+        uint32_t slot_idx, ggml_backend_sched_t scheduler);
+    std::vector<float> run_decode_cached(int32_t token, int pos,
         uint32_t slot_idx, ggml_backend_sched_t scheduler);
 
     uint32_t get_cache_pos(uint32_t slot_idx) const;
@@ -264,6 +268,8 @@ private:
     uint32_t get_physical_cache_pos(uint32_t slot_idx) const;
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx);
+    void prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx);
+    void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
     std::vector<float> get_output_logits(ggml_cgraph* gf);
@@ -287,4 +293,8 @@ private:
 
     uint32_t context_len_ = 0;
     uint32_t max_batch_size_ = 0;
+    ggml_cgraph* cached_decode_graph_ = nullptr;
+    bool cached_decode_graph_allocated_ = false;
+    uint32_t cached_decode_slot_ = 0;
+    bool use_flash_attention_ = false;
 };

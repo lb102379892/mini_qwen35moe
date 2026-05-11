@@ -7,7 +7,7 @@ ChatEngine::ChatEngine() {
 ChatEngine::~ChatEngine() {
 }
 
-bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer) {
+bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer, bool flash_attention) {
     dev_mode_ = dev_mode;
     max_seq_len_= max_seq_len;
 
@@ -33,20 +33,25 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
     sampler_->set_eos_token_id(model_->meta_->tokenizer.ggml_eos_token_id);
     sched_ = model_->get_scheduler();
 
+    forward_pass_ = std::make_shared<Qwen35moeForwardPass>();
+    forward_pass_->init(max_seq_len_, 1, model_);
+    if (flash_attention) {
+        forward_pass_->set_flash_attention_enabled(true);
+    }
+
     return true;
 }
 
 bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response) {
-    std::shared_ptr<Qwen35moeForwardPass> forward_pass = std::make_shared<Qwen35moeForwardPass>();
     auto m = model_->meta_;
-    forward_pass->init(max_seq_len_, 1, model_);
+    forward_pass_->reset_sequence(0);
 
     std::vector<int32_t> tokens = tokenizer_->encode(prompt);
 
     using Clock = std::chrono::steady_clock;
     const size_t n_prompt_tokens = tokens.size();
     auto t_prefill_start = Clock::now();
-    std::vector<float> logits = forward_pass->run_prefill(tokens, 0, 0, sched_);
+    std::vector<float> logits = forward_pass_->run_prefill(tokens, 0, 0, sched_);
     auto t_prefill_end = Clock::now();
 
     size_t vocab_size = m->tokenizer.ggml_tokens.size();
@@ -74,10 +79,9 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         generated_tokens.push_back(next_token_id);
 
         // --- Normal decode path ---
-        std::vector<int32_t> current_token_vec = { next_token_id };
-        int current_pos = forward_pass->get_cache_pos(0); // Slot 0
+        int current_pos = forward_pass_->get_cache_pos(0); // Slot 0
 
-        std::vector<float> token_logits = forward_pass->run_prefill(current_token_vec, current_pos, 0, sched_);
+        std::vector<float> token_logits = forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
         last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
         
         next_token_id = sampler_->sample(last_token_logits, tokens);

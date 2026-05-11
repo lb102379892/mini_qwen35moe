@@ -57,6 +57,7 @@ static void print_usage(const char* prog) {
         "  --no-chat                Pass prompt verbatim (no chat template)\n"
         "  --verbose                Show tokenization and timing info\n"
         "  --gpu-mode      <mode>   GPU mode: off|hybrid|full (default: off)\n"
+        "  --flash-attn             Use ggml_flash_attn_ext for attention\n"
         "\n"
         "Example:\n"
         "  %s --model model.gguf --prompt \"Hello!\" --ctx-size 128 --temp 0.7\n",
@@ -83,6 +84,7 @@ int main(int argc, char* argv[]) {
     bool        use_chat     = true;
     bool        verbose      = true;
     bool        repl_mode    = false;
+    bool        flash_attention = false;
     DevMode     dev_mode     = DevMode::CPU_MODE;
     uint64_t    rng_seed     = 79977733;
 
@@ -106,6 +108,7 @@ int main(int argc, char* argv[]) {
         else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
+        else if (arg("--flash-attn")) flash_attention = true;
         else if (arg("--gpu-layer"))   gpu_layer     = atoi(next("--gpu-layer"));
         else if (arg("--dev-mode")) {
             const char* mode = next("--dev-mode");
@@ -140,7 +143,7 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
 
     ChatEngine chat;
-    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer)) {
+    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention)) {
         fprintf(stderr, "Engine initialization failed\n");
         return 1;
     }
