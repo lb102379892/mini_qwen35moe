@@ -2011,7 +2011,11 @@ void Qwen35moeForwardPass::build_output_head(ggml_cgraph* gf, ggml_tensor* cur) 
     ggml_build_forward_expand(gf, cur);
 
     if (sampling_top_k_ > 0 && sampling_temperature_ > 0.0f) {
-        ggml_tensor* scaled_logits = ggml_scale(ctx_, cur, 1.0f / sampling_temperature_);
+        const float inv_temp = 1.0f / sampling_temperature_;
+        if (!std::isfinite(inv_temp)) {
+            throw std::runtime_error("invalid sampling temperature for device-side scaling");
+        }
+        ggml_tensor* scaled_logits = ggml_scale(ctx_, cur, inv_temp);
         set_tensor_name(scaled_logits, "logits_scaled");
         ggml_build_forward_expand(gf, scaled_logits);
 
@@ -2153,7 +2157,9 @@ TopKSampleCandidates Qwen35moeForwardPass::get_output_topk_candidates(ggml_cgrap
     for (uint32_t i = 0; i < k; ++i) {
         const int32_t token_id = result.token_ids[i];
         if (token_id < 0 || token_id >= logits->ne[0]) {
-            throw std::runtime_error("invalid top-k token index");
+            throw std::runtime_error(
+                "invalid top-k token index: " + std::to_string(token_id) +
+                ", valid range: [0, " + std::to_string(logits->ne[0]) + ")");
         }
         float value = 0.0f;
         const size_t logit_offset = logits_col_offset + static_cast<size_t>(token_id) * sizeof(float);
