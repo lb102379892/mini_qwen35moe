@@ -1,5 +1,9 @@
 #include "graph/kv_cache_simple.h"
 
+namespace {
+constexpr size_t KV_COPY_SCRATCH_BUFFER_SIZE = 1024 * 1024; // Stores temporary view metadata for per-layer KV copy views.
+}
+
 simple_kv_cache::simple_kv_cache(
     uint32_t n_layers, uint32_t n_ctx_max, uint32_t n_batch_max,
     uint32_t n_embd_k, uint32_t n_embd_v, ggml_type type_k,
@@ -12,7 +16,7 @@ simple_kv_cache::simple_kv_cache(
     positions.resize(n_batch_max, 0);
     init_cache();
 
-    scratch_buffer_.resize(1024 * 1024);
+    scratch_buffer_.resize(KV_COPY_SCRATCH_BUFFER_SIZE);
     struct ggml_init_params scratch_params = {
         .mem_size   = scratch_buffer_.size(),
         .mem_buffer = scratch_buffer_.data(),

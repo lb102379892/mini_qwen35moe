@@ -9,6 +9,7 @@
  * 4. MoE 层：混合专家前馈网络
  */
 #include "graph/graph.h"
+#include <algorithm>
 #include <cstdlib>
 
 namespace {
@@ -277,13 +278,10 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
     uint32_t prepared_n_kv = 0;
     bool f16_ready = false;
     for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
-        if (!kq_mask) {
-            continue;
-        }
-
         const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
         if (prepared_n_kv != n_kv) {
-            cached_decode_mask_f32_.assign(n_kv, -INFINITY);
+            cached_decode_mask_f32_.resize(n_kv);
+            std::fill(cached_decode_mask_f32_.begin(), cached_decode_mask_f32_.end(), -INFINITY);
             const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
             for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
                 cached_decode_mask_f32_[j] = 0.0f;
