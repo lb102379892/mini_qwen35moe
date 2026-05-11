@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <cstdio>
 
 ChatEngine::ChatEngine() {
     std::random_device rd;
@@ -141,9 +142,20 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     std::vector<int32_t> prompt_tokens_for_pld = tokens;  // Original prompt
     std::vector<int32_t> generated_tokens;
 
+    double decode_tok_decode_ms = 0.0;
+    double decode_forward_ms = 0.0;
+    double decode_sample_ms = 0.0;
+    double decode_logits_copy_ms = 0.0;
+    size_t perf_steps = 0;
+
     auto t_decode_start = Clock::now();
     for (int i = 0; i < max_tokens; ++i) {
+        auto t0 = Clock::now();
         std::string decoded_token = tokenizer_->decode(next_token_id);
+        auto t1 = Clock::now();
+
+        decode_tok_decode_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
         if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
             break;
         }
@@ -156,13 +168,51 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         int current_pos = forward_pass_->get_cache_pos(0); // Slot 0
 
         if (use_gpu_topk_sampling_) {
-            TopKSampleCandidates decode_candidates = forward_pass_->run_decode_cached_topk(next_token_id, current_pos, 0, sched_);
+            auto t2 = Clock::now();
+            TopKSampleCandidates decode_candidates =
+                forward_pass_->run_decode_cached_topk(next_token_id, current_pos, 0, sched_);
+            auto t3 = Clock::now();
+
             next_token_id = sample_from_topk_candidates(decode_candidates, top_p_);
+            auto t4 = Clock::now();
+
+            decode_forward_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+            decode_sample_ms += std::chrono::duration<double, std::milli>(t4 - t3).count();
+
+            if (i < 8 || ((i + 1) % 64 == 0)) {
+                std::printf("[PERF][decode step=%d pos=%d][gpu-topk] forward=%.3f ms sample_cpu=%.3f ms k=%zu\n",
+                    i, current_pos,
+                    std::chrono::duration<double, std::milli>(t3 - t2).count(),
+                    std::chrono::duration<double, std::milli>(t4 - t3).count(),
+                    decode_candidates.token_ids.size());
+            }
         } else {
-            std::vector<float> token_logits = forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
+            auto t2 = Clock::now();
+            std::vector<float> token_logits =
+                forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
+            auto t3 = Clock::now();
+
             last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
+            auto t4 = Clock::now();
+
             next_token_id = sampler_->sample(last_token_logits, tokens);
+            auto t5 = Clock::now();
+
+            decode_forward_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+            decode_logits_copy_ms += std::chrono::duration<double, std::milli>(t4 - t3).count();
+            decode_sample_ms += std::chrono::duration<double, std::milli>(t5 - t4).count();
+
+            if (i < 8 || ((i + 1) % 64 == 0)) {
+                std::printf("[PERF][decode step=%d pos=%d][cpu-sample] forward=%.3f ms logits_copy=%.3f ms sample=%.3f ms vocab=%zu\n",
+                    i, current_pos,
+                    std::chrono::duration<double, std::milli>(t3 - t2).count(),
+                    std::chrono::duration<double, std::milli>(t4 - t3).count(),
+                    std::chrono::duration<double, std::milli>(t5 - t4).count(),
+                    vocab_size);
+            }
         }
+
+        perf_steps++;
     }
     auto t_decode_end = Clock::now();
     printf("response: [%s].\n", response.c_str());
@@ -177,6 +227,16 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     printf("[Timing] prefill=%lld ms (%ld tokens, %d t/s) decode=%lldms (%ld tokens, %d t/s)\n", 
         prefill_ms, n_prompt_tokens, static_cast<int>(prefill_tps), decode_ms, n_decoded, static_cast<int>(decode_tps));
 
+    if (perf_steps > 0) {
+        std::printf(
+            "[PERF][decode-summary] steps=%zu tok_decode=%.3f ms/step forward=%.3f ms/step logits_copy=%.3f ms/step sample=%.3f ms/step\n",
+            perf_steps,
+            decode_tok_decode_ms / perf_steps,
+            decode_forward_ms / perf_steps,
+            decode_logits_copy_ms / perf_steps,
+            decode_sample_ms / perf_steps
+        );
+    }
+
     return true;
 }
-    
