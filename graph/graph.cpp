@@ -130,6 +130,11 @@ void Qwen35moeForwardPass::set_flash_attention_enabled(bool enabled) {
     use_flash_attention_ = enabled;
 }
 
+void Qwen35moeForwardPass::configure_device_sampling(int top_k, float temperature) {
+    sampling_top_k_ = top_k;
+    sampling_temperature_ = temperature;
+}
+
 /**
  * @brief 重置 ggml 上下文
  * 
@@ -693,6 +698,42 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
     }
 }
 
+TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<int32_t>& tokens, int pos,
+    uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: device sampling not configured");
+    }
+    if (tokens.empty()) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: empty token input");
+    }
+
+    if (scheduler != nullptr) {
+        ggml_backend_sched_reset(scheduler);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+            throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: failed to allocate graph");
+        }
+        set_inputs(gf, tokens, pos);
+        ggml_backend_sched_graph_compute(scheduler, gf);
+        advance_cache(tokens.size(), slot_idx);
+        return get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+    } else {
+        auto backend = model_->get_curr_backend();
+        auto buf_type = ggml_backend_get_default_buffer_type(backend);
+        ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
+        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+        ggml_gallocr_alloc_graph(allocr_prefill, gf);
+        set_inputs(gf, tokens, pos);
+        ggml_backend_graph_compute(backend, gf);
+        advance_cache(tokens.size(), slot_idx);
+        auto result = get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+        if (allocr_prefill) {
+            ggml_gallocr_free(allocr_prefill);
+        }
+        return result;
+    }
+}
+
 std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int pos,
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
     if (scheduler == nullptr) {
@@ -714,6 +755,32 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     }
     advance_cache(1, slot_idx);
     return get_output_logits(cached_decode_graph_);
+}
+
+TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token, int pos,
+    uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: device sampling not configured");
+    }
+    if (scheduler == nullptr) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
+    }
+    if (static_cast<uint32_t>(pos) >= context_len_) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
+    }
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx || !cached_decode_graph_allocated_) {
+        prepare_cached_decode_graph(scheduler, slot_idx);
+    }
+
+    set_cached_decode_inputs(cached_decode_graph_, token, pos);
+    ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
+
+    if (kv_cache_) {
+        kv_cache_->copy_pos(context_len_ - 1, static_cast<uint32_t>(pos), slot_idx);
+    }
+    advance_cache(1, slot_idx);
+    return get_output_topk_candidates(cached_decode_graph_, 0);
 }
 
 uint32_t Qwen35moeForwardPass::get_cache_pos(uint32_t slot_idx) const {
@@ -1942,6 +2009,23 @@ void Qwen35moeForwardPass::build_output_head(ggml_cgraph* gf, ggml_tensor* cur) 
     }
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
+
+    if (sampling_top_k_ > 0 && sampling_temperature_ > 0.0f) {
+        ggml_tensor* scaled_logits = ggml_scale(ctx_, cur, 1.0f / sampling_temperature_);
+        set_tensor_name(scaled_logits, "logits_scaled");
+        ggml_build_forward_expand(gf, scaled_logits);
+
+        const int64_t n_vocab = scaled_logits->ne[0];
+        int64_t k = sampling_top_k_;
+        if (k > n_vocab) {
+            k = n_vocab;
+        }
+        if (k > 0) {
+            ggml_tensor* topk_indices = ggml_top_k(ctx_, scaled_logits, static_cast<int32_t>(k));
+            set_tensor_name(topk_indices, "sample_topk_idx");
+            ggml_build_forward_expand(gf, topk_indices);
+        }
+    }
 }
 
 /**
@@ -2038,4 +2122,44 @@ std::vector<float> Qwen35moeForwardPass::get_output_logits(ggml_cgraph* gf) {
     ggml_backend_tensor_get(logits, logits_result.data(), 0, logits_size);
     
     return logits_result;
+}
+
+TopKSampleCandidates Qwen35moeForwardPass::get_output_topk_candidates(ggml_cgraph* gf, uint32_t token_col) {
+    ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits_scaled");
+    if (!logits) {
+        throw std::runtime_error("logits_scaled tensor not found in graph");
+    }
+    ggml_tensor* topk_idx = ggml_graph_get_tensor(gf, "sample_topk_idx");
+    if (!topk_idx) {
+        throw std::runtime_error("sample_topk_idx tensor not found in graph");
+    }
+    if (topk_idx->type != GGML_TYPE_I32) {
+        throw std::runtime_error("sample_topk_idx tensor type mismatch");
+    }
+    if (token_col >= static_cast<uint32_t>(topk_idx->ne[1])) {
+        throw std::runtime_error("token column out of range for sample_topk_idx");
+    }
+
+    const uint32_t k = static_cast<uint32_t>(topk_idx->ne[0]);
+    TopKSampleCandidates result;
+    result.token_ids.resize(k);
+    result.logits.resize(k);
+
+    const size_t idx_offset = static_cast<size_t>(token_col) * topk_idx->nb[1];
+    const size_t idx_bytes = static_cast<size_t>(k) * sizeof(int32_t);
+    ggml_backend_tensor_get(topk_idx, result.token_ids.data(), idx_offset, idx_bytes);
+
+    const size_t logits_col_offset = static_cast<size_t>(token_col) * logits->nb[1];
+    for (uint32_t i = 0; i < k; ++i) {
+        const int32_t token_id = result.token_ids[i];
+        if (token_id < 0 || token_id >= logits->ne[0]) {
+            throw std::runtime_error("invalid top-k token index");
+        }
+        float value = 0.0f;
+        const size_t logit_offset = logits_col_offset + static_cast<size_t>(token_id) * sizeof(float);
+        ggml_backend_tensor_get(logits, &value, logit_offset, sizeof(float));
+        result.logits[i] = value;
+    }
+
+    return result;
 }

@@ -28,6 +28,11 @@ struct DecodeArgs {
     std::vector<uint32_t> slots;  // sequence slot per batch element
 };
 
+struct TopKSampleCandidates {
+    std::vector<int32_t> token_ids;
+    std::vector<float> logits;
+};
+
 class Qwen35moeForwardPass {
 public:
     Qwen35moeForwardPass();
@@ -53,6 +58,11 @@ public:
         uint32_t slot_idx, ggml_backend_sched_t scheduler);
     std::vector<float> run_decode_cached(int32_t token, int pos,
         uint32_t slot_idx, ggml_backend_sched_t scheduler);
+    TopKSampleCandidates run_prefill_topk(const std::vector<int32_t>& tokens, int pos,
+        uint32_t slot_idx, ggml_backend_sched_t scheduler);
+    TopKSampleCandidates run_decode_cached_topk(int32_t token, int pos,
+        uint32_t slot_idx, ggml_backend_sched_t scheduler);
+    void configure_device_sampling(int top_k, float temperature);
 
     uint32_t get_cache_pos(uint32_t slot_idx) const;
 
@@ -273,6 +283,7 @@ private:
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
     std::vector<float> get_output_logits(ggml_cgraph* gf);
+    TopKSampleCandidates get_output_topk_candidates(ggml_cgraph* gf, uint32_t token_col);
 
 private:
     std::vector<uint8_t> ctx_buffer_;
@@ -297,4 +308,6 @@ private:
     bool cached_decode_graph_allocated_ = false;
     uint32_t cached_decode_slot_ = 0;
     bool use_flash_attention_ = false;
+    int sampling_top_k_ = 0;
+    float sampling_temperature_ = 0.0f;
 };
