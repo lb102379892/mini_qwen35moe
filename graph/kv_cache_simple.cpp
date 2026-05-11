@@ -1,5 +1,9 @@
 #include "graph/kv_cache_simple.h"
 
+namespace {
+constexpr size_t KV_COPY_SCRATCH_BUFFER_SIZE = 1024 * 1024; // Stores temporary view metadata for per-layer KV copy views.
+}
+
 simple_kv_cache::simple_kv_cache(
     uint32_t n_layers, uint32_t n_ctx_max, uint32_t n_batch_max,
     uint32_t n_embd_k, uint32_t n_embd_v, ggml_type type_k,
@@ -7,10 +11,19 @@ simple_kv_cache::simple_kv_cache(
 ) : n_layers(n_layers), n_ctx_max(n_ctx_max), n_batch_max(n_batch_max),
     n_embd_k(n_embd_k), n_embd_v(n_embd_v), type_k(type_k),
     type_v(type_v), backend(backend), buf(nullptr, ggml_backend_buffer_free),
-    ctx(nullptr, ggml_free) {
+    ctx(nullptr, ggml_free), scratch_ctx(nullptr, ggml_free) {
     
     positions.resize(n_batch_max, 0);
     init_cache();
+
+    scratch_buffer_.resize(KV_COPY_SCRATCH_BUFFER_SIZE);
+    struct ggml_init_params scratch_params = {
+        .mem_size   = scratch_buffer_.size(),
+        .mem_buffer = scratch_buffer_.data(),
+        .no_alloc   = true,
+    };
+    scratch_ctx.reset(ggml_init(scratch_params));
+    GGML_ASSERT(scratch_ctx);
 }
 
 void simple_kv_cache::init_cache() {
@@ -143,33 +156,27 @@ void simple_kv_cache::copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot
         return;
     }
 
-    std::vector<uint8_t> scratch_buf(1024 * 1024);
-    struct ggml_init_params params = {
-        .mem_size   = scratch_buf.size(),
-        .mem_buffer = scratch_buf.data(),
-        .no_alloc   = true,
-    };
-    ggml_context* scratch_ctx = ggml_init(params);
+    GGML_ASSERT(scratch_ctx);
+    ggml_reset(scratch_ctx.get());
+    ggml_context* scratch = scratch_ctx.get();
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor* k_src = ggml_view_2d(scratch_ctx, k_cache[il], n_embd_k, 1,
+        ggml_tensor* k_src = ggml_view_2d(scratch, k_cache[il], n_embd_k, 1,
             k_cache[il]->nb[1], slot_idx * k_cache[il]->nb[2] + src_pos * k_cache[il]->nb[1]);
-        ggml_tensor* k_dst = ggml_view_2d(scratch_ctx, k_cache[il], n_embd_k, 1,
+        ggml_tensor* k_dst = ggml_view_2d(scratch, k_cache[il], n_embd_k, 1,
             k_cache[il]->nb[1], slot_idx * k_cache[il]->nb[2] + dst_pos * k_cache[il]->nb[1]);
         k_src->buffer = k_cache[il]->buffer;
         k_dst->buffer = k_cache[il]->buffer;
         ggml_backend_tensor_copy(k_src, k_dst);
 
-        ggml_tensor* v_src = ggml_view_2d(scratch_ctx, v_cache[il], n_embd_v, 1,
+        ggml_tensor* v_src = ggml_view_2d(scratch, v_cache[il], n_embd_v, 1,
             v_cache[il]->nb[1], slot_idx * v_cache[il]->nb[2] + src_pos * v_cache[il]->nb[1]);
-        ggml_tensor* v_dst = ggml_view_2d(scratch_ctx, v_cache[il], n_embd_v, 1,
+        ggml_tensor* v_dst = ggml_view_2d(scratch, v_cache[il], n_embd_v, 1,
             v_cache[il]->nb[1], slot_idx * v_cache[il]->nb[2] + dst_pos * v_cache[il]->nb[1]);
         v_src->buffer = v_cache[il]->buffer;
         v_dst->buffer = v_cache[il]->buffer;
         ggml_backend_tensor_copy(v_src, v_dst);
     }
-
-    ggml_free(scratch_ctx);
 }
 
 void simple_kv_cache::compact(uint32_t slot_idx, const std::vector<uint32_t>& retained_positions) {
@@ -223,24 +230,19 @@ void simple_kv_cache::clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t 
     GGML_ASSERT(dst_slot < n_batch_max);
     GGML_ASSERT(n_tokens <= n_ctx_max);
 
-    // Scratch context for temporary views - freed at end of function
-    std::vector<uint8_t> scratch_buf(1024 * 1024);
-    struct ggml_init_params params = {
-        .mem_size   = scratch_buf.size(),
-        .mem_buffer = scratch_buf.data(),
-        .no_alloc   = true,
-    };
-    ggml_context* scratch_ctx = ggml_init(params);
+    GGML_ASSERT(scratch_ctx);
+    ggml_reset(scratch_ctx.get());
+    ggml_context* scratch = scratch_ctx.get();
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor * k_src = ggml_view_2d(scratch_ctx, k_cache[il], n_embd_k, n_tokens, k_cache[il]->nb[1], src_slot * k_cache[il]->nb[2]);
-        ggml_tensor * k_dst = ggml_view_2d(scratch_ctx, k_cache[il], n_embd_k, n_tokens, k_cache[il]->nb[1], dst_slot * k_cache[il]->nb[2]);
+        ggml_tensor * k_src = ggml_view_2d(scratch, k_cache[il], n_embd_k, n_tokens, k_cache[il]->nb[1], src_slot * k_cache[il]->nb[2]);
+        ggml_tensor * k_dst = ggml_view_2d(scratch, k_cache[il], n_embd_k, n_tokens, k_cache[il]->nb[1], dst_slot * k_cache[il]->nb[2]);
         
         k_src->buffer = k_cache[il]->buffer;
         k_dst->buffer = k_cache[il]->buffer;
 
-        ggml_tensor * v_src = ggml_view_2d(scratch_ctx, v_cache[il], n_embd_v, n_tokens, v_cache[il]->nb[1], src_slot * v_cache[il]->nb[2]);
-        ggml_tensor * v_dst = ggml_view_2d(scratch_ctx, v_cache[il], n_embd_v, n_tokens, v_cache[il]->nb[1], dst_slot * v_cache[il]->nb[2]);
+        ggml_tensor * v_src = ggml_view_2d(scratch, v_cache[il], n_embd_v, n_tokens, v_cache[il]->nb[1], src_slot * v_cache[il]->nb[2]);
+        ggml_tensor * v_dst = ggml_view_2d(scratch, v_cache[il], n_embd_v, n_tokens, v_cache[il]->nb[1], dst_slot * v_cache[il]->nb[2]);
 
         v_src->buffer = v_cache[il]->buffer;
         v_dst->buffer = v_cache[il]->buffer;
@@ -248,8 +250,7 @@ void simple_kv_cache::clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t 
         ggml_backend_tensor_copy(k_src, k_dst);
         ggml_backend_tensor_copy(v_src, v_dst);
     }
-    
-    ggml_free(scratch_ctx);
+
     positions[dst_slot] = n_tokens;
 }
 

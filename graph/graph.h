@@ -307,6 +307,9 @@ private:
     ggml_cgraph* cached_decode_graph_ = nullptr;
     bool cached_decode_graph_allocated_ = false;
     uint32_t cached_decode_slot_ = 0;
+    std::vector<ggml_tensor*> cached_decode_mask_tensors_;
+    std::vector<float> cached_decode_mask_f32_;
+    std::vector<ggml_fp16_t> cached_decode_mask_f16_;
     bool use_flash_attention_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
