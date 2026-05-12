@@ -45,7 +45,14 @@ public:
     void set_flash_attention_enabled(bool enabled);
 
     // ── Graph building ───────────────────────────────────────────────────────
-    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0);
+    // fixed_decode_kv_len: when > 0, forces attention K/V and mask tensors to
+    // this fixed length instead of the dynamic cache_pos+n_tokens.  Pass
+    // kv_capacity here when building a reused cached-decode graph so that the
+    // tensor shapes stay constant across all decode steps, preventing CUDA
+    // graph warmup resets caused by shape drift.
+    ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos,
+                                     uint32_t slot_idx = 0,
+                                     uint32_t fixed_decode_kv_len = 0);
     ggml_cgraph* build_decoding_graph(const std::vector<int32_t>& tokens, const std::vector<uint32_t>& slots, const std::vector<int32_t>&  positions);
 
     // ── Input setting ────────────────────────────────────────────────────────
@@ -134,6 +141,10 @@ private:
     // Prefill / single-slot gated attention.
     // Takes raw normed input cur; performs Q/K/V projections, Q/K norms, partial
     // RoPE, KV cache write + full-history MHA, then sigmoid gating + output proj.
+    //
+    // fixed_kv_len: when > 0, overrides the dynamic (cache_pos + n_tokens) KV
+    // length so that K/V views and the mask tensor have a constant shape.
+    // Used by prepare_cached_decode_graph to stabilise the CUDA graph capture.
     ggml_tensor* build_gated_attention(
         ggml_context*    ctx,
         ggml_cgraph*     gf,
@@ -156,7 +167,8 @@ private:
         int              n_rot,
         float            freq_base,
         int              context_length,
-        float            rms_norm_eps
+        float            rms_norm_eps,
+        uint32_t         fixed_kv_len = 0
     );
 
     // Batched decode variant of build_gated_attention: same projections/norms/gating,
