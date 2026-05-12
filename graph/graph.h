@@ -278,7 +278,7 @@ private:
     uint32_t get_physical_cache_pos(uint32_t slot_idx) const;
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx);
-    void prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx);
+    void prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx, uint32_t kv_capacity);
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
@@ -307,6 +307,8 @@ private:
     ggml_cgraph* cached_decode_graph_ = nullptr;
     bool cached_decode_graph_allocated_ = false;
     uint32_t cached_decode_slot_ = 0;
+    uint32_t cached_decode_kv_capacity_ = 0;
+    uint32_t cached_decode_scratch_pos_ = 0;
     std::vector<ggml_tensor*> cached_decode_mask_tensors_;
     std::vector<float> cached_decode_mask_f32_;
     std::vector<ggml_fp16_t> cached_decode_mask_f16_;

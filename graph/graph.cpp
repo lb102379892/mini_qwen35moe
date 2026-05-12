@@ -18,6 +18,15 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
+uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
+    constexpr uint32_t min_capacity = 64;
+    uint32_t capacity = min_capacity;
+    while (capacity < required && capacity < context_len) {
+        capacity *= 2;
+    }
+    return std::min(capacity, context_len);
+}
+
 void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
     if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> mask_f16(mask.size());
@@ -147,6 +156,8 @@ void Qwen35moeForwardPass::reset_context() {
     }
     cached_decode_graph_ = nullptr;
     cached_decode_graph_allocated_ = false;
+    cached_decode_kv_capacity_ = 0;
+    cached_decode_scratch_pos_ = 0;
     cached_decode_mask_tensors_.clear();
     cached_decode_mask_f32_.clear();
     cached_decode_mask_f16_.clear();
@@ -173,27 +184,30 @@ void Qwen35moeForwardPass::reset_sequence(uint32_t slot_idx) {
     }
 }
 
-void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx) {
+void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx, uint32_t kv_capacity) {
     if (scheduler == nullptr) {
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: scheduler is null");
     }
-    if (context_len_ == 0 || slot_idx >= max_batch_size_) {
+    if (context_len_ == 0 || slot_idx >= max_batch_size_ || kv_capacity == 0 || kv_capacity > context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: invalid slot or context length");
     }
 
     const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     const uint32_t saved_snap = slot_idx < snapkv_seq_pos_.size() ? snapkv_seq_pos_[slot_idx] : 0;
+    const uint32_t scratch_pos = kv_capacity - 1;
 
     if (kv_cache_) {
-        kv_cache_->set_pos(context_len_ - 1, slot_idx);
+        kv_cache_->set_pos(scratch_pos, slot_idx);
     }
     if (slot_idx < snapkv_seq_pos_.size()) {
         snapkv_seq_pos_[slot_idx] = 0;
     }
 
     std::vector<int32_t> dummy_tokens(1, 0);
-    cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(context_len_ - 1), slot_idx);
+    cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(scratch_pos), slot_idx);
     cached_decode_slot_ = slot_idx;
+    cached_decode_kv_capacity_ = kv_capacity;
+    cached_decode_scratch_pos_ = scratch_pos;
     cached_decode_mask_tensors_.clear();
     for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
         if (!is_full_attention_layer(il)) {
@@ -259,7 +273,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
 
     // ==================== 步骤3：动态更新注意力掩码 ====================
     // scratch_pos 是上下文缓冲区的最后一个位置，用于特殊用途（如 KV 缓存优化）
-    const uint32_t scratch_pos = context_len_ - 1;
+    const uint32_t scratch_pos = cached_decode_scratch_pos_;
 
     if (cached_decode_mask_tensors_.empty()) {
         for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
@@ -780,15 +794,17 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
-    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx || !cached_decode_graph_allocated_) {
-        prepare_cached_decode_graph(scheduler, slot_idx);
+    const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
+        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
 
     if (kv_cache_) {
-        kv_cache_->copy_pos(context_len_ - 1, static_cast<uint32_t>(pos), slot_idx);
+        kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
     }
     advance_cache(1, slot_idx);
     return get_output_logits(cached_decode_graph_);
@@ -806,15 +822,17 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
-    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx || !cached_decode_graph_allocated_) {
-        prepare_cached_decode_graph(scheduler, slot_idx);
+    const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
+        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
 
     if (kv_cache_) {
-        kv_cache_->copy_pos(context_len_ - 1, static_cast<uint32_t>(pos), slot_idx);
+        kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
     }
     advance_cache(1, slot_idx);
     return get_output_topk_candidates(cached_decode_graph_, 0);
