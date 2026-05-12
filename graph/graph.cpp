@@ -10,7 +10,6 @@
  */
 #include "graph/graph.h"
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 
 namespace {
@@ -19,36 +18,24 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-// Set QWEN35MOE_DEBUG_DECODE=1 to enable concise decode-graph diagnostics on
-// stderr.  Evaluated once at first use to keep hot-path overhead negligible.
-bool debug_decode_enabled() {
-    static bool val = env_flag_enabled("QWEN35MOE_DEBUG_DECODE");
-    return val;
+uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
+    constexpr uint32_t min_capacity = 64;
+    required = std::min(required, context_len);
+    uint32_t capacity = min_capacity;
+    while (capacity < required) {
+        capacity *= 2;
+    }
+    return std::min(capacity, context_len);
 }
 
-void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask, std::vector<ggml_fp16_t>* reusable_f16_buffer = nullptr) {
+void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
     if (tensor->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> local_mask_f16;
-        std::vector<ggml_fp16_t>& mask_f16_buffer = reusable_f16_buffer ? *reusable_f16_buffer : local_mask_f16;
-        mask_f16_buffer.resize(mask.size());
-        ggml_fp32_to_fp16_row(mask.data(), mask_f16_buffer.data(), static_cast<int64_t>(mask.size()));
-        ggml_backend_tensor_set(tensor, mask_f16_buffer.data(), 0, mask_f16_buffer.size() * sizeof(ggml_fp16_t));
+        std::vector<ggml_fp16_t> mask_f16(mask.size());
+        ggml_fp32_to_fp16_row(mask.data(), mask_f16.data(), static_cast<int64_t>(mask.size()));
+        ggml_backend_tensor_set(tensor, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
         return;
     }
     ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(float));
-}
-
-void set_mask_patch_data(ggml_tensor* tensor, uint32_t offset_elems, const float* mask_values,
-                         uint32_t count, std::vector<ggml_fp16_t>& reusable_f16_buffer) {
-    const size_t byte_offset = static_cast<size_t>(offset_elems) *
-        (tensor->type == GGML_TYPE_F16 ? sizeof(ggml_fp16_t) : sizeof(float));
-    if (tensor->type == GGML_TYPE_F16) {
-        reusable_f16_buffer.resize(count);
-        ggml_fp32_to_fp16_row(mask_values, reusable_f16_buffer.data(), static_cast<int64_t>(count));
-        ggml_backend_tensor_set(tensor, reusable_f16_buffer.data(), byte_offset, count * sizeof(ggml_fp16_t));
-        return;
-    }
-    ggml_backend_tensor_set(tensor, mask_values, byte_offset, count * sizeof(float));
 }
 }
 
@@ -215,11 +202,6 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: kv_capacity exceeds context_len_");
     }
 
-    if (debug_decode_enabled()) {
-        fprintf(stderr, "[DECODE_GRAPH] prepare_cached_decode_graph: slot=%u kv_capacity=%u context_len=%u prev_capacity=%u\n",
-                slot_idx, kv_capacity, context_len_, cached_decode_kv_capacity_);
-    }
-
     const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     const uint32_t saved_snap = slot_idx < snapkv_seq_pos_.size() ? snapkv_seq_pos_[slot_idx] : 0;
     const uint32_t scratch_pos = kv_capacity - 1;
@@ -232,17 +214,10 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     }
 
     std::vector<int32_t> dummy_tokens(1, 0);
-    // Pass kv_capacity as fixed_decode_kv_len so the attention K/V views and
-    // mask tensor are created with a constant shape (kv_capacity), independent
-    // of the live kv_cache position.  This prevents CUDA graph capture from
-    // being invalidated by tensor-shape changes across decode steps.
-    cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(scratch_pos), slot_idx, kv_capacity);
+    cached_decode_graph_ = build_prefill_graph(dummy_tokens, static_cast<int>(scratch_pos), slot_idx);
     cached_decode_slot_ = slot_idx;
     cached_decode_kv_capacity_ = kv_capacity;
     cached_decode_scratch_pos_ = scratch_pos;
-    cached_decode_last_pos_ = -1;
-    cached_decode_tokens_tensor_ = ggml_graph_get_tensor(cached_decode_graph_, "tokens");
-    cached_decode_pos_tensor_ = ggml_graph_get_tensor(cached_decode_graph_, "inp_pos");
     cached_decode_mask_tensors_.clear();
     for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
         if (!is_full_attention_layer(il)) {
@@ -268,11 +243,6 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: failed to allocate graph");
     }
     cached_decode_graph_allocated_ = true;
-
-    if (debug_decode_enabled()) {
-        fprintf(stderr, "[DECODE_GRAPH] prepare_cached_decode_graph: done. scratch_pos=%u mask_tensors=%zu\n",
-                scratch_pos, cached_decode_mask_tensors_.size());
-    }
 }
 
 /**
@@ -295,7 +265,7 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
 void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos) {
     // ==================== 步骤1：更新 Token 输入 ====================
     // 从计算图中获取名为 "tokens" 的输入张量
-    ggml_tensor* tok_t = cached_decode_tokens_tensor_ ? cached_decode_tokens_tensor_ : ggml_graph_get_tensor(gf, "tokens");
+    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
     if (!tok_t) {
         throw std::runtime_error("qwen36: 'tokens' tensor missing from cached decode graph");
     }
@@ -304,7 +274,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
 
     // ==================== 步骤2：更新位置输入 ====================
     // 从计算图中获取名为 "inp_pos" 的位置张量
-    ggml_tensor* pos_t = cached_decode_pos_tensor_ ? cached_decode_pos_tensor_ : ggml_graph_get_tensor(gf, "inp_pos");
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos");
     if (!pos_t) {
         throw std::runtime_error("qwen36: 'inp_pos' tensor missing from cached decode graph");
     }
@@ -316,59 +286,62 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
     const uint32_t scratch_pos = cached_decode_scratch_pos_;
 
     if (cached_decode_mask_tensors_.empty()) {
-        return;
-    }
-
-    const uint32_t n_kv = static_cast<uint32_t>(cached_decode_mask_tensors_.front()->ne[0]);
-    if (cached_decode_mask_f32_.size() != n_kv) {
-        cached_decode_mask_f32_.assign(n_kv, -INFINITY);
-        if (scratch_pos < n_kv) {
-            cached_decode_mask_f32_[scratch_pos] = 0.0f;
-        }
-        for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
-            set_mask_data(kq_mask, cached_decode_mask_f32_, &cached_decode_mask_f16_);
-        }
-        cached_decode_last_pos_ = -1;
-    }
-
-    bool full_rebuild = false;
-    if (cached_decode_last_pos_ < 0 || pos < cached_decode_last_pos_) {
-        full_rebuild = true;
-    }
-
-    if (full_rebuild) {
-        std::fill(cached_decode_mask_f32_.begin(), cached_decode_mask_f32_.end(), -INFINITY);
-        const uint32_t valid_prev = pos > 0 ? std::min<uint32_t>(static_cast<uint32_t>(pos), n_kv) : 0;
-        for (uint32_t j = 0; j < valid_prev; ++j) {
-            cached_decode_mask_f32_[j] = 0.0f;
-        }
-        if (scratch_pos < n_kv) {
-            cached_decode_mask_f32_[scratch_pos] = 0.0f;
-        }
-        for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
-            set_mask_data(kq_mask, cached_decode_mask_f32_, &cached_decode_mask_f16_);
-        }
-    } else {
-        if (cached_decode_last_pos_ < 0) {
-            throw std::runtime_error("qwen36: cached decode mask state invalid");
-        }
-        uint32_t patch_begin = static_cast<uint32_t>(cached_decode_last_pos_) + 1;
-        uint32_t patch_end = std::min<uint32_t>(static_cast<uint32_t>(pos), n_kv);
-        if (patch_begin < patch_end) {
-            std::fill(cached_decode_mask_f32_.begin() + patch_begin, cached_decode_mask_f32_.begin() + patch_end, 0.0f);
-            const uint32_t patch_len = patch_end - patch_begin;
-            for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
-                set_mask_patch_data(
-                    kq_mask,
-                    patch_begin,
-                    cached_decode_mask_f32_.data() + patch_begin,
-                    patch_len,
-                    cached_decode_mask_patch_f16_
-                );
+        for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
+            if (!is_full_attention_layer(il)) {
+                continue;
+            }
+            char name[32];
+            std::snprintf(name, sizeof(name), "kq_mask.%u", il);
+            ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
+            if (kq_mask) {
+                cached_decode_mask_tensors_.push_back(kq_mask);
             }
         }
     }
-    cached_decode_last_pos_ = pos;
+
+    uint32_t prepared_n_kv = 0;
+    bool f16_ready = false;
+    for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
+        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
+        if (prepared_n_kv != n_kv) {
+            cached_decode_mask_f32_.resize(n_kv);
+            std::fill(cached_decode_mask_f32_.begin(), cached_decode_mask_f32_.end(), -INFINITY);
+            const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
+            for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
+                cached_decode_mask_f32_[j] = 0.0f;
+            }
+            if (scratch_pos < n_kv) {
+                cached_decode_mask_f32_[scratch_pos] = 0.0f;
+            }
+            prepared_n_kv = n_kv;
+            f16_ready = false;
+        }
+
+        if (kq_mask->type == GGML_TYPE_F16) {
+            if (!f16_ready) {
+                cached_decode_mask_f16_.resize(cached_decode_mask_f32_.size());
+                ggml_fp32_to_fp16_row(
+                    cached_decode_mask_f32_.data(),
+                    cached_decode_mask_f16_.data(),
+                    static_cast<int64_t>(cached_decode_mask_f32_.size())
+                );
+                f16_ready = true;
+            }
+            ggml_backend_tensor_set(
+                kq_mask,
+                cached_decode_mask_f16_.data(),
+                0,
+                cached_decode_mask_f16_.size() * sizeof(ggml_fp16_t)
+            );
+        } else {
+            ggml_backend_tensor_set(
+                kq_mask,
+                cached_decode_mask_f32_.data(),
+                0,
+                cached_decode_mask_f32_.size() * sizeof(float)
+            );
+        }
+    }
 }
 
 /**
@@ -393,7 +366,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
  *    - 残差连接
  * 4. 最终归一化 + LM Head
  */
-ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx, uint32_t fixed_decode_kv_len) {
+ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx) {
     reset_context();
 
     const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
@@ -459,8 +432,7 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
                 kv_idx, n_tok, slot_idx, il, attn_q_weight, 
                 attn_q_norm_weight, attn_k_weight, attn_k_norm_weight, attn_v_weight, attn_output_weight,
                 m.key_length, m.head_count, m.head_count_kv, m.dimension_count, m.freq_base,
-                static_cast<int>(context_len_), m.layer_norm_rms_epsilon,
-                fixed_decode_kv_len
+                static_cast<int>(context_len_), m.layer_norm_rms_epsilon
             );
         } else {
             // DeltaNet 层：使用门控 delta 网络进行高效序列建模
@@ -832,20 +804,10 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
-    // Keep decode graph capture stable by using one fixed KV capacity for the slot.
-    // This trades extra mask/graph memory for fewer CUDA graph warmup resets.
-    const bool need_prepare = (cached_decode_graph_ == nullptr ||
-                               cached_decode_slot_ != slot_idx ||
-                               !cached_decode_graph_allocated_);
-    if (debug_decode_enabled()) {
-        fprintf(stderr, "[DECODE_GRAPH] run_decode_cached: slot=%u pos=%d need_prepare=%d"
-                " graph=%p allocated=%d capacity=%u\n",
-                slot_idx, pos, (int)need_prepare,
-                (void*)cached_decode_graph_, (int)cached_decode_graph_allocated_,
-                cached_decode_kv_capacity_);
-    }
-    if (need_prepare) {
-        prepare_cached_decode_graph(scheduler, slot_idx, context_len_);
+    const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
+        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -870,20 +832,10 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
-    // Keep decode graph capture stable by using one fixed KV capacity for the slot.
-    // This trades extra mask/graph memory for fewer CUDA graph warmup resets.
-    const bool need_prepare = (cached_decode_graph_ == nullptr ||
-                               cached_decode_slot_ != slot_idx ||
-                               !cached_decode_graph_allocated_);
-    if (debug_decode_enabled()) {
-        fprintf(stderr, "[DECODE_GRAPH] run_decode_cached_topk: slot=%u pos=%d need_prepare=%d"
-                " graph=%p allocated=%d capacity=%u\n",
-                slot_idx, pos, (int)need_prepare,
-                (void*)cached_decode_graph_, (int)cached_decode_graph_allocated_,
-                cached_decode_kv_capacity_);
-    }
-    if (need_prepare) {
-        prepare_cached_decode_graph(scheduler, slot_idx, context_len_);
+    const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
+    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
+        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -1058,33 +1010,14 @@ ggml_tensor* Qwen35moeForwardPass::build_moe_layer(
     ggml_tensor* weighted = ggml_mul(ctx, exp_down_out, w_expanded);
     set_tensor_name(weighted, "moe_weighted", il);
 
-    // 在 top_k 维度上求和 → [n_embd, n_tokens].
-    // Use a balanced binary reduction tree to minimise sequential add depth:
-    // for top_k=4: (e[0]+e[1]) + (e[2]+e[3]) has depth 2 vs depth 3 for a
-    // linear chain.  This potentially allows more GPU parallelism.
-    ggml_tensor* routed_out;
-    {
-        std::vector<ggml_tensor*> partials;
-        partials.reserve(top_k);
-        for (int k = 0; k < top_k; ++k) {
-            partials.push_back(ggml_view_2d(ctx, weighted,
-                n_embd, n_tokens, weighted->nb[2],
-                static_cast<size_t>(k) * weighted->nb[1]
-            ));
-        }
-        while (partials.size() > 1) {
-            std::vector<ggml_tensor*> next;
-            next.reserve((partials.size() + 1) / 2);
-            const int n = static_cast<int>(partials.size());
-            for (int i = 0; i + 1 < n; i += 2) {
-                next.push_back(ggml_add(ctx, partials[i], partials[i + 1]));
-            }
-            if (n % 2 == 1) {
-                next.push_back(partials.back());
-            }
-            partials = std::move(next);
-        }
-        routed_out = partials[0];
+    // 在 top_k 维度上求和 → [n_embd, n_tokens]
+    ggml_tensor* routed_out = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], 0);
+    for (int k = 1; k < top_k; ++k) {
+        ggml_tensor* expert_k = ggml_view_2d(ctx, weighted,
+            n_embd, n_tokens, weighted->nb[2],
+            static_cast<size_t>(k) * weighted->nb[1]
+        );
+        routed_out = ggml_add(ctx, routed_out, expert_k);
     }
     set_tensor_name(routed_out, "moe_routed_out", il);
 
@@ -1355,8 +1288,7 @@ ggml_tensor* Qwen35moeForwardPass::build_gated_attention(
     int              n_rot,
     float            freq_base,
     int              context_length,
-    float            rms_norm_eps,
-    uint32_t         fixed_kv_len
+    float            rms_norm_eps
 )
 {
     // A. 联合 Q+Gate 投影
@@ -1408,18 +1340,9 @@ ggml_tensor* Qwen35moeForwardPass::build_gated_attention(
         1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
     // F. KV 缓存写入 + 完整历史读取
-    const float    kq_scale   = 1.0f / sqrtf(float(n_embd_head));
-    const uint32_t cache_pos  = kv_cache->get_pos(slot_idx);
-    const uint32_t dynamic_kv = cache_pos + n_tokens;
-    // When fixed_kv_len > 0 (cached-decode-graph build), use that constant
-    // length so K/V views and the mask tensor always have the same shape.
-    // This prevents CUDA graph capture from failing due to attention shape drift.
-    const uint32_t n_kv = (fixed_kv_len > 0) ? fixed_kv_len : dynamic_kv;
-
-    if (n_tokens == 1 && debug_decode_enabled()) {
-        fprintf(stderr, "[ATTN_DECODE] layer=%d slot=%u cache_pos=%u dynamic_kv=%u n_kv=%u fixed_kv_len=%u\n",
-                il, slot_idx, cache_pos, dynamic_kv, n_kv, fixed_kv_len);
-    }
+    const float    kq_scale  = 1.0f / sqrtf(float(n_embd_head));
+    const uint32_t cache_pos = kv_cache->get_pos(slot_idx);
+    const uint32_t n_kv      = cache_pos + n_tokens;
 
     // 写入 KV 缓存
     ggml_build_forward_expand(gf, kv_cache->cpy_k(ctx, Kcur, kv_cache_layer, slot_idx));
