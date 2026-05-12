@@ -1075,10 +1075,11 @@ ggml_tensor* Qwen35moeForwardPass::build_moe_layer(
         while (partials.size() > 1) {
             std::vector<ggml_tensor*> next;
             next.reserve((partials.size() + 1) / 2);
-            for (int i = 0; i + 1 < static_cast<int>(partials.size()); i += 2) {
+            const int n = static_cast<int>(partials.size());
+            for (int i = 0; i + 1 < n; i += 2) {
                 next.push_back(ggml_add(ctx, partials[i], partials[i + 1]));
             }
-            if (partials.size() % 2 == 1) {
+            if (n % 2 == 1) {
                 next.push_back(partials.back());
             }
             partials = std::move(next);
@@ -1415,7 +1416,7 @@ ggml_tensor* Qwen35moeForwardPass::build_gated_attention(
     // This prevents CUDA graph capture from failing due to attention shape drift.
     const uint32_t n_kv = (fixed_kv_len > 0) ? fixed_kv_len : dynamic_kv;
 
-    if (debug_decode_enabled() && n_tokens == 1) {
+    if (n_tokens == 1 && debug_decode_enabled()) {
         fprintf(stderr, "[ATTN_DECODE] layer=%d slot=%u cache_pos=%u dynamic_kv=%u n_kv=%u fixed_kv_len=%u\n",
                 il, slot_idx, cache_pos, dynamic_kv, n_kv, fixed_kv_len);
     }
