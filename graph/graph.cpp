@@ -22,7 +22,7 @@ uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
     constexpr uint32_t min_capacity = 64;
     required = std::min(required, context_len);
     uint32_t capacity = min_capacity;
-    while (capacity < required && capacity < context_len) {
+    while (capacity < required) {
         capacity *= 2;
     }
     return std::min(capacity, context_len);
@@ -189,8 +189,17 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     if (scheduler == nullptr) {
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: scheduler is null");
     }
-    if (context_len_ == 0 || slot_idx >= max_batch_size_ || kv_capacity == 0 || kv_capacity > context_len_) {
-        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: invalid slot, context length, or kv_capacity");
+    if (context_len_ == 0) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: context length is zero");
+    }
+    if (slot_idx >= max_batch_size_) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: slot_idx out of range");
+    }
+    if (kv_capacity == 0) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: kv_capacity cannot be zero");
+    }
+    if (kv_capacity > context_len_) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: kv_capacity exceeds context_len_");
     }
 
     const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
