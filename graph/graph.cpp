@@ -18,26 +18,26 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask, std::vector<ggml_fp16_t>* fp16_scratch = nullptr) {
+void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask, std::vector<ggml_fp16_t>* reusable_f16_buffer = nullptr) {
     if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> local_mask_f16;
-        std::vector<ggml_fp16_t>& out = fp16_scratch ? *fp16_scratch : local_mask_f16;
-        out.resize(mask.size());
-        ggml_fp32_to_fp16_row(mask.data(), out.data(), static_cast<int64_t>(mask.size()));
-        ggml_backend_tensor_set(tensor, out.data(), 0, out.size() * sizeof(ggml_fp16_t));
+        std::vector<ggml_fp16_t>& mask_f16_buffer = reusable_f16_buffer ? *reusable_f16_buffer : local_mask_f16;
+        mask_f16_buffer.resize(mask.size());
+        ggml_fp32_to_fp16_row(mask.data(), mask_f16_buffer.data(), static_cast<int64_t>(mask.size()));
+        ggml_backend_tensor_set(tensor, mask_f16_buffer.data(), 0, mask_f16_buffer.size() * sizeof(ggml_fp16_t));
         return;
     }
     ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(float));
 }
 
 void set_mask_patch_data(ggml_tensor* tensor, uint32_t offset_elems, const float* mask_values,
-                         uint32_t count, std::vector<ggml_fp16_t>& fp16_scratch) {
+                         uint32_t count, std::vector<ggml_fp16_t>& reusable_f16_buffer) {
     const size_t byte_offset = static_cast<size_t>(offset_elems) *
         (tensor->type == GGML_TYPE_F16 ? sizeof(ggml_fp16_t) : sizeof(float));
     if (tensor->type == GGML_TYPE_F16) {
-        fp16_scratch.resize(count);
-        ggml_fp32_to_fp16_row(mask_values, fp16_scratch.data(), static_cast<int64_t>(count));
-        ggml_backend_tensor_set(tensor, fp16_scratch.data(), byte_offset, count * sizeof(ggml_fp16_t));
+        reusable_f16_buffer.resize(count);
+        ggml_fp32_to_fp16_row(mask_values, reusable_f16_buffer.data(), static_cast<int64_t>(count));
+        ggml_backend_tensor_set(tensor, reusable_f16_buffer.data(), byte_offset, count * sizeof(ggml_fp16_t));
         return;
     }
     ggml_backend_tensor_set(tensor, mask_values, byte_offset, count * sizeof(float));
@@ -310,7 +310,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
     }
 
     bool full_rebuild = false;
-    if (cached_decode_last_pos_ < 0 || pos <= cached_decode_last_pos_) {
+    if (cached_decode_last_pos_ < 0 || pos < cached_decode_last_pos_) {
         full_rebuild = true;
     }
 
@@ -327,7 +327,10 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
             set_mask_data(kq_mask, cached_decode_mask_f32_, &cached_decode_mask_f16_);
         }
     } else {
-        uint32_t patch_begin = static_cast<uint32_t>(cached_decode_last_pos_);
+        if (cached_decode_last_pos_ < 0) {
+            throw std::runtime_error("qwen36: cached decode mask state invalid");
+        }
+        uint32_t patch_begin = static_cast<uint32_t>(cached_decode_last_pos_) + 1;
         uint32_t patch_end = std::min<uint32_t>(static_cast<uint32_t>(pos), n_kv);
         if (patch_begin < patch_end) {
             std::fill(cached_decode_mask_f32_.begin() + patch_begin, cached_decode_mask_f32_.begin() + patch_end, 0.0f);
