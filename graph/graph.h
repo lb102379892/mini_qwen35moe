@@ -309,9 +309,13 @@ private:
     uint32_t cached_decode_slot_ = 0;
     uint32_t cached_decode_kv_capacity_ = 0;
     uint32_t cached_decode_scratch_pos_ = 0;
+    int cached_decode_last_pos_ = -1;
+    ggml_tensor* cached_decode_tokens_tensor_ = nullptr;
+    ggml_tensor* cached_decode_pos_tensor_ = nullptr;
     std::vector<ggml_tensor*> cached_decode_mask_tensors_;
     std::vector<float> cached_decode_mask_f32_;
     std::vector<ggml_fp16_t> cached_decode_mask_f16_;
+    std::vector<ggml_fp16_t> cached_decode_mask_patch_f16_;
     bool use_flash_attention_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
