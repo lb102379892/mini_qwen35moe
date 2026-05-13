@@ -399,10 +399,6 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
         prompt = "<|im_start|>user\n" + user_content + "<|im_end|>\n<|im_start|>assistant\n";
     }
 
-    if (prompt.empty()) {
-        return R"({"error":{"message":"No user message found","type":"invalid_request"}})";
-    }
-
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
     float temperature = extract_json_float(body, "temperature", -1.0f);
