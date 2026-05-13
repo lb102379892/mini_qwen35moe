@@ -725,13 +725,14 @@ std::string HttpServer::build_chatml_prompt(const std::string& json) {
     if (!enable_thinking &&
         last_user_content_start != std::string::npos &&
         last_user_content_end != std::string::npos) {
-        const std::string user_content = prompt.substr(
-            last_user_content_start,
-            last_user_content_end - last_user_content_start
-        );
-        if (user_content.find("/think") == std::string::npos &&
-            user_content.find("/no_think") == std::string::npos) {
-            const bool ends_with_newline = !user_content.empty() && user_content.back() == '\n';
+        const size_t think_pos = prompt.find("/think", last_user_content_start);
+        const size_t no_think_pos = prompt.find("/no_think", last_user_content_start);
+        const bool has_think = (think_pos != std::string::npos && think_pos < last_user_content_end);
+        const bool has_no_think = (no_think_pos != std::string::npos && no_think_pos < last_user_content_end);
+        if (!has_think && !has_no_think) {
+            const bool ends_with_newline =
+                last_user_content_end > last_user_content_start &&
+                prompt[last_user_content_end - 1] == '\n';
             prompt.insert(last_user_content_end, ends_with_newline ? "/no_think" : "\n/no_think");
         }
     }
