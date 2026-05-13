@@ -673,13 +673,8 @@ std::string HttpServer::build_code_only_prompt(const std::string& user_content) 
 }
 
 std::string HttpServer::extract_code_only_output(const std::string& generated_text) {
-    size_t fence = generated_text.find("```");
-    if (fence == std::string::npos) {
-        return generated_text;
-    }
-
     std::string out;
-    size_t pos = fence;
+    size_t pos = 0;
     while (true) {
         size_t open = generated_text.find("```", pos);
         if (open == std::string::npos) break;
