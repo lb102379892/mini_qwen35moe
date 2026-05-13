@@ -18,7 +18,7 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-uint32_t decode_cache_capacity(uint32_t context_len, uint32_t /*n_ubatch*/, uint32_t required_kv) {
+uint32_t decode_cache_capacity(uint32_t context_len, uint32_t required_kv) {
     if (context_len == 0) {
         return 0;
     }
@@ -31,6 +31,8 @@ uint32_t decode_cache_capacity(uint32_t context_len, uint32_t /*n_ubatch*/, uint
     }
 
     // Avoid too-frequent graph rebuilds for very short prompts.
+    // 64 keeps graph recapture frequency low for short prompts while still
+    // avoiding large over-allocation (e.g. 512/1024) at early decode steps.
     const uint32_t kMinDecodeCapacity = 64;
     if (capacity < kMinDecodeCapacity) {
         capacity = std::min(kMinDecodeCapacity, context_len);
@@ -925,7 +927,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, n_ubatch_tokens_, required_kv));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, required_kv));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -953,7 +955,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, n_ubatch_tokens_, required_kv));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, required_kv));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
