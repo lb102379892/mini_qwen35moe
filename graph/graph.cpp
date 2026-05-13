@@ -18,8 +18,7 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
-    (void) required;
+uint32_t decode_cache_capacity(uint32_t context_len) {
     return context_len;
 }
 
@@ -298,6 +297,8 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
 
     uint32_t prepared_n_kv = 0;
     bool f16_ready = false;
+    // Cached decode advances one token per step, so mask expansion is expected
+    // to be strictly sequential (pos == last_pos + 1).
     const bool can_incremental =
         cached_decode_last_mask_pos_ >= 0 && pos == cached_decode_last_mask_pos_ + 1;
 
@@ -318,9 +319,11 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
                     cached_decode_mask_f32_[scratch_pos] = 0.0f;
                 }
             } else {
-                const uint32_t newly_visible = static_cast<uint32_t>(pos - 1);
-                if (newly_visible < n_kv) {
-                    cached_decode_mask_f32_[newly_visible] = 0.0f;
+                if (pos > 0) {
+                    const uint32_t visible_prev_pos = static_cast<uint32_t>(pos - 1);
+                    if (visible_prev_pos < n_kv) {
+                        cached_decode_mask_f32_[visible_prev_pos] = 0.0f;
+                    }
                 }
             }
             prepared_n_kv = n_kv;
@@ -818,7 +821,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -846,7 +849,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
