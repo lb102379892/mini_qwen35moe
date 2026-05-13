@@ -18,8 +18,19 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-uint32_t decode_cache_capacity(uint32_t context_len) {
-    return context_len;
+uint32_t decode_cache_capacity(uint32_t context_len, uint32_t n_ubatch, uint32_t required_kv) {
+    if (context_len == 0) {
+        return 0;
+    }
+    uint32_t capacity = n_ubatch > 0 ? std::min(n_ubatch, context_len) : context_len;
+    while (capacity < required_kv && capacity < context_len) {
+        if (capacity > context_len / 2) {
+            capacity = context_len;
+        } else {
+            capacity *= 2;
+        }
+    }
+    return std::max(capacity, required_kv);
 }
 
 void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
@@ -62,13 +73,15 @@ Qwen35moeForwardPass::~Qwen35moeForwardPass() {
  * 3. 创建 KV 缓存（用于 Full Attention 层）
  * 4. 创建 DeltaNet 状态（用于 DeltaNet 层）
  */
-int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model) {
+int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model, uint32_t n_batch, uint32_t n_ubatch) {
     model_ = model;
     use_flash_attention_ = env_flag_enabled("QWEN35MOE_FLASH_ATTN");
     auto& m = model_->meta_->qwen35moe;
 
     context_len_ = context_len;
     max_batch_size_ = max_batch_size;
+    n_batch_tokens_ = n_batch > 0 ? std::min(n_batch, context_len_) : context_len_;
+    n_ubatch_tokens_ = n_ubatch > 0 ? std::min(n_ubatch, n_batch_tokens_) : n_batch_tokens_;
 
     // 预分配持久化缓冲区用于存储计算图元数据
     ctx_buffer_.resize(FP_GRAPH_SIZE_METADATA);
@@ -155,6 +168,8 @@ void Qwen35moeForwardPass::reset_context() {
     cached_decode_scratch_pos_ = 0;
     cached_decode_last_mask_pos_ = -1;
     cached_decode_mask_tensors_.clear();
+    cached_decode_tokens_tensor_ = nullptr;
+    cached_decode_pos_tensor_ = nullptr;
     cached_decode_mask_f32_.clear();
     cached_decode_mask_f16_.clear();
     struct ggml_init_params params = {
@@ -214,6 +229,11 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     cached_decode_kv_capacity_ = kv_capacity;
     cached_decode_scratch_pos_ = scratch_pos;
     cached_decode_last_mask_pos_ = -1;
+    cached_decode_tokens_tensor_ = ggml_graph_get_tensor(cached_decode_graph_, "tokens");
+    cached_decode_pos_tensor_ = ggml_graph_get_tensor(cached_decode_graph_, "inp_pos");
+    if (!cached_decode_tokens_tensor_ || !cached_decode_pos_tensor_) {
+        throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: missing cached decode input tensors");
+    }
     cached_decode_mask_tensors_.clear();
     for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
         if (!is_full_attention_layer(il)) {
@@ -259,20 +279,21 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
  * 3. 动态更新注意力掩码（确保因果性）
  */
 void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos) {
+    (void)gf;
     // ==================== 步骤1：更新 Token 输入 ====================
     // 从计算图中获取名为 "tokens" 的输入张量
-    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
+    ggml_tensor* tok_t = cached_decode_tokens_tensor_;
     if (!tok_t) {
-        throw std::runtime_error("qwen36: 'tokens' tensor missing from cached decode graph");
+        throw std::runtime_error("qwen35moe: 'tokens' tensor missing from cached decode graph");
     }
     // 将当前 token ID 写入张量（解码阶段每次只处理一个 token）
     ggml_backend_tensor_set(tok_t, &token, 0, sizeof(int32_t));
 
     // ==================== 步骤2：更新位置输入 ====================
     // 从计算图中获取名为 "inp_pos" 的位置张量
-    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos");
+    ggml_tensor* pos_t = cached_decode_pos_tensor_;
     if (!pos_t) {
-        throw std::runtime_error("qwen36: 'inp_pos' tensor missing from cached decode graph");
+        throw std::runtime_error("qwen35moe: 'inp_pos' tensor missing from cached decode graph");
     }
     // 将当前位置写入张量
     ggml_backend_tensor_set(pos_t, &pos, 0, sizeof(int32_t));
@@ -282,17 +303,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
     const uint32_t scratch_pos = cached_decode_scratch_pos_;
 
     if (cached_decode_mask_tensors_.empty()) {
-        for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
-            if (!is_full_attention_layer(il)) {
-                continue;
-            }
-            char name[32];
-            std::snprintf(name, sizeof(name), "kq_mask.%u", il);
-            ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
-            if (kq_mask) {
-                cached_decode_mask_tensors_.push_back(kq_mask);
-            }
-        }
+        throw std::runtime_error("qwen35moe: cached decode masks missing from cached decode graph");
     }
 
     uint32_t prepared_n_kv = 0;
@@ -745,28 +756,77 @@ void Qwen35moeForwardPass::set_batched_inputs(ggml_cgraph* gf, const std::vector
  */
 std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>& tokens, int pos, 
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
     if (scheduler != nullptr) {
-        // 默认：整体路径（子类可以重写以支持 TQ）
-        ggml_backend_sched_reset(scheduler);
-        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-        if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
-            throw std::runtime_error("Qwen35moeForwardPass::run_prefill: failed to allocate graph");
+        if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
+            // 默认：整体路径（子类可以重写以支持 TQ）
+            ggml_backend_sched_reset(scheduler);
+            ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+            if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+                throw std::runtime_error("Qwen35moeForwardPass::run_prefill: failed to allocate graph");
+            }
+            set_inputs(gf, tokens, pos);
+            ggml_backend_sched_graph_compute(scheduler, gf);
+            advance_cache(tokens.size(), slot_idx);
+            return get_output_logits(gf);
         }
-        set_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
-        advance_cache(tokens.size(), slot_idx);
-        return get_output_logits(gf);
+
+        std::vector<float> all_logits;
+        const size_t vocab_size = model_->meta_->tokenizer.ggml_tokens.size();
+        if (vocab_size > 0) {
+            all_logits.reserve(tokens.size() * vocab_size);
+        }
+        for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
+            const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
+            std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + start + chunk_size);
+            const int chunk_pos = pos + static_cast<int>(start);
+
+            ggml_backend_sched_reset(scheduler);
+            ggml_cgraph* gf = build_prefill_graph(chunk_tokens, chunk_pos, slot_idx);
+            if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+                throw std::runtime_error("Qwen35moeForwardPass::run_prefill: failed to allocate graph");
+            }
+            set_inputs(gf, chunk_tokens, chunk_pos);
+            ggml_backend_sched_graph_compute(scheduler, gf);
+            advance_cache(chunk_size, slot_idx);
+
+            std::vector<float> chunk_logits = get_output_logits(gf);
+            all_logits.insert(all_logits.end(), chunk_logits.begin(), chunk_logits.end());
+        }
+        return all_logits;
     } else {
         // 直接执行（不使用调度器）
         auto backend = model_->get_curr_backend();
         auto buf_type = ggml_backend_get_default_buffer_type(backend);
         ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
-        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-        ggml_gallocr_alloc_graph(allocr_prefill, gf);
-        set_inputs(gf, tokens, pos);
-        ggml_backend_graph_compute(backend, gf);
-        advance_cache(tokens.size(), slot_idx);
-        auto result =  get_output_logits(gf);
+        std::vector<float> result;
+        const size_t vocab_size = model_->meta_->tokenizer.ggml_tokens.size();
+        if (vocab_size > 0) {
+            result.reserve(tokens.size() * vocab_size);
+        }
+        if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
+            ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+            ggml_gallocr_alloc_graph(allocr_prefill, gf);
+            set_inputs(gf, tokens, pos);
+            ggml_backend_graph_compute(backend, gf);
+            advance_cache(tokens.size(), slot_idx);
+            result = get_output_logits(gf);
+        } else {
+            for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
+                const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
+                std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + start + chunk_size);
+                const int chunk_pos = pos + static_cast<int>(start);
+
+                ggml_cgraph* gf = build_prefill_graph(chunk_tokens, chunk_pos, slot_idx);
+                ggml_gallocr_alloc_graph(allocr_prefill, gf);
+                set_inputs(gf, chunk_tokens, chunk_pos);
+                ggml_backend_graph_compute(backend, gf);
+                advance_cache(chunk_size, slot_idx);
+
+                std::vector<float> chunk_logits = get_output_logits(gf);
+                result.insert(result.end(), chunk_logits.begin(), chunk_logits.end());
+            }
+        }
         if (allocr_prefill) 
             ggml_gallocr_free(allocr_prefill);
         return result;
@@ -782,26 +842,64 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
         throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: empty token input");
     }
 
+    const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
     if (scheduler != nullptr) {
-        ggml_backend_sched_reset(scheduler);
-        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-        if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
-            throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: failed to allocate graph");
+        if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
+            ggml_backend_sched_reset(scheduler);
+            ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+            if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+                throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: failed to allocate graph");
+            }
+            set_inputs(gf, tokens, pos);
+            ggml_backend_sched_graph_compute(scheduler, gf);
+            advance_cache(tokens.size(), slot_idx);
+            return get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
         }
-        set_inputs(gf, tokens, pos);
-        ggml_backend_sched_graph_compute(scheduler, gf);
-        advance_cache(tokens.size(), slot_idx);
-        return get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+
+        TopKSampleCandidates result;
+        for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
+            const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
+            std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + start + chunk_size);
+            const int chunk_pos = pos + static_cast<int>(start);
+
+            ggml_backend_sched_reset(scheduler);
+            ggml_cgraph* gf = build_prefill_graph(chunk_tokens, chunk_pos, slot_idx);
+            if (!ggml_backend_sched_alloc_graph(scheduler, gf)) {
+                throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: failed to allocate graph");
+            }
+            set_inputs(gf, chunk_tokens, chunk_pos);
+            ggml_backend_sched_graph_compute(scheduler, gf);
+            advance_cache(chunk_size, slot_idx);
+
+            result = get_output_topk_candidates(gf, static_cast<uint32_t>(chunk_size - 1));
+        }
+        return result;
     } else {
         auto backend = model_->get_curr_backend();
         auto buf_type = ggml_backend_get_default_buffer_type(backend);
         ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
-        ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
-        ggml_gallocr_alloc_graph(allocr_prefill, gf);
-        set_inputs(gf, tokens, pos);
-        ggml_backend_graph_compute(backend, gf);
-        advance_cache(tokens.size(), slot_idx);
-        auto result = get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+        TopKSampleCandidates result;
+        if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
+            ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
+            ggml_gallocr_alloc_graph(allocr_prefill, gf);
+            set_inputs(gf, tokens, pos);
+            ggml_backend_graph_compute(backend, gf);
+            advance_cache(tokens.size(), slot_idx);
+            result = get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+        } else {
+            for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
+                const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
+                std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + start + chunk_size);
+                const int chunk_pos = pos + static_cast<int>(start);
+
+                ggml_cgraph* gf = build_prefill_graph(chunk_tokens, chunk_pos, slot_idx);
+                ggml_gallocr_alloc_graph(allocr_prefill, gf);
+                set_inputs(gf, chunk_tokens, chunk_pos);
+                ggml_backend_graph_compute(backend, gf);
+                advance_cache(chunk_size, slot_idx);
+                result = get_output_topk_candidates(gf, static_cast<uint32_t>(chunk_size - 1));
+            }
+        }
         if (allocr_prefill) {
             ggml_gallocr_free(allocr_prefill);
         }
@@ -821,7 +919,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, n_ubatch_tokens_, required_kv));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -849,7 +947,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, n_ubatch_tokens_, required_kv));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);

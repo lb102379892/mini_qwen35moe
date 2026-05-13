@@ -38,7 +38,7 @@ public:
     Qwen35moeForwardPass();
     ~Qwen35moeForwardPass();
 
-    int init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model);
+    int init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model, uint32_t n_batch = 0, uint32_t n_ubatch = 0);
 
     void reset_context();
     void reset_sequence(uint32_t slot_idx = 0);
@@ -311,8 +311,12 @@ private:
     uint32_t cached_decode_scratch_pos_ = 0;
     int cached_decode_last_mask_pos_ = -1;
     std::vector<ggml_tensor*> cached_decode_mask_tensors_;
+    ggml_tensor* cached_decode_tokens_tensor_ = nullptr;
+    ggml_tensor* cached_decode_pos_tensor_ = nullptr;
     std::vector<float> cached_decode_mask_f32_;
     std::vector<ggml_fp16_t> cached_decode_mask_f16_;
+    uint32_t n_batch_tokens_ = 0;
+    uint32_t n_ubatch_tokens_ = 0;
     bool use_flash_attention_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
