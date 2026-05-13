@@ -138,10 +138,10 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     // Decode phase
     const int32_t eos_token_id = m->tokenizer.ggml_eos_token_id;
     const int32_t im_end_token_id = tokenizer_->get_special_token_id("<|im_end|>");
-    const int32_t eos_text_token_id = tokenizer_->get_special_token_id("<|endoftext|>");
+    const int32_t endoftext_token_id = tokenizer_->get_special_token_id("<|endoftext|>");
     const bool has_im_end_token_id = im_end_token_id >= 0;
-    const bool has_eos_text_token_id = eos_text_token_id >= 0;
-    const bool needs_string_stop_check = !has_im_end_token_id || !has_eos_text_token_id;
+    const bool has_endoftext_token_id = endoftext_token_id >= 0;
+    const bool needs_string_stop_check = !has_im_end_token_id || !has_endoftext_token_id;
     const std::string im_end_str = "<|im_end|>";
     const std::string eos_str = "<|endoftext|>";
 
@@ -161,7 +161,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     for (int i = 0; i < max_tokens; ++i) {
         if (next_token_id == eos_token_id ||
             (has_im_end_token_id && next_token_id == im_end_token_id) ||
-            (has_eos_text_token_id && next_token_id == eos_text_token_id)) {
+            (has_endoftext_token_id && next_token_id == endoftext_token_id)) {
             break;
         }
 
