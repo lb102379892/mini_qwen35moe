@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <unordered_map>
 #include <ggml.h>
 #include <memory>
 #include "model/model.h"
@@ -67,6 +68,15 @@ public:
     uint32_t get_cache_pos(uint32_t slot_idx) const;
 
 private:
+    struct DecodeGraphSignature {
+        uint32_t slot_idx = 0;
+        uint32_t kv_capacity = 0;
+        uint32_t context_len = 0;
+        uint32_t n_batch_tokens = 0;
+        uint32_t n_ubatch_tokens = 0;
+        bool use_flash_attention = false;
+    };
+
     // Create a new graph
     ggml_cgraph* new_graph();
 
@@ -279,6 +289,10 @@ private:
 
     void advance_cache(uint32_t n_tokens, uint32_t slot_idx);
     void prepare_cached_decode_graph(ggml_backend_sched_t scheduler, uint32_t slot_idx, uint32_t kv_capacity);
+    uint32_t decode_cache_bucket_capacity(uint32_t required_kv) const;
+    bool is_cached_decode_graph_compatible(const DecodeGraphSignature& signature, uint32_t required_kv) const;
+    void ensure_cached_decode_graph(ggml_backend_sched_t scheduler, const DecodeGraphSignature& signature, uint32_t required_kv);
+    void maybe_log_decode_graph_stats();
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
@@ -315,6 +329,19 @@ private:
     ggml_tensor* cached_decode_pos_tensor_ = nullptr;
     std::vector<float> cached_decode_mask_f32_;
     std::vector<ggml_fp16_t> cached_decode_mask_f16_;
+    DecodeGraphSignature cached_decode_signature_{};
+    bool cached_decode_signature_valid_ = false;
+    uint64_t decode_graph_lookup_count_ = 0;
+    uint64_t decode_graph_hit_count_ = 0;
+    uint64_t decode_graph_miss_count_ = 0;
+    uint64_t decode_graph_recapture_count_ = 0;
+    uint64_t decode_graph_fallback_count_ = 0;
+    uint64_t decode_graph_scheduler_reset_count_ = 0;
+    uint64_t decode_graph_last_logged_lookup_ = 0;
+    uint64_t decode_graph_last_logged_recapture_ = 0;
+    std::unordered_map<uint32_t, uint64_t> decode_graph_bucket_usage_;
+    bool decode_graph_diag_enabled_ = false;
+    uint32_t decode_graph_diag_interval_ = 256;
     uint32_t n_batch_tokens_ = 0;
     uint32_t n_ubatch_tokens_ = 0;
     bool use_flash_attention_ = false;
