@@ -53,6 +53,8 @@ static void print_usage(const char* prog) {
         "  --top-k          <N>      Top-k sampling (default: GGUF metadata or 40; 0=off)\n"
         "  --threads        <N>      CPU threads (default: 4)\n"
         "  --ctx-size       <N>      KV cache context length (default: auto for single prompt, 2048 for REPL)\n"
+        "  --n-batch        <N>      Logical prompt batch tokens (default: ctx-size)\n"
+        "  --n-ubatch       <N>      Physical micro-batch tokens (default: n-batch)\n"
         "  --seed           <N>      RNG seed (default: random)\n"
         "  --no-chat                Pass prompt verbatim (no chat template)\n"
         "  --verbose                Show tokenization and timing info\n"
@@ -80,6 +82,8 @@ int main(int argc, char* argv[]) {
     int         top_k        = 50;
     int         n_threads    = 4;
     int         ctx_size     = 4096;
+    int         n_batch      = -1;
+    int         n_ubatch     = -1;
     size_t      gpu_layer    = 0;
     bool        use_chat     = true;
     bool        verbose      = true;
@@ -105,6 +109,8 @@ int main(int argc, char* argv[]) {
         else if (arg("--top-k"))     { top_k = atoi(next("--top-k")); }
         else if (arg("--threads"))        n_threads   = atoi(next("--threads"));
         else if (arg("--ctx-size"))   ctx_size     = atoi(next("--ctx-size"));
+        else if (arg("--n-batch"))   n_batch      = atoi(next("--n-batch"));
+        else if (arg("--n-ubatch"))  n_ubatch     = atoi(next("--n-ubatch"));
         else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
@@ -139,11 +145,17 @@ int main(int argc, char* argv[]) {
     if (prompt.empty()) {
         repl_mode = true;
     }
+    if (n_batch <= 0) {
+        n_batch = ctx_size;
+    }
+    if (n_ubatch <= 0) {
+        n_ubatch = n_batch;
+    }
 
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
 
     ChatEngine chat;
-    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention)) {
+    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention, n_batch, n_ubatch)) {
         fprintf(stderr, "Engine initialization failed\n");
         return 1;
     }

@@ -13,12 +13,14 @@ ChatEngine::ChatEngine() {
 ChatEngine::~ChatEngine() {
 }
 
-bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer, bool flash_attention) {
+bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer, bool flash_attention, int n_batch, int n_ubatch) {
     dev_mode_ = dev_mode;
     max_seq_len_= max_seq_len;
     top_p_ = top_p;
     top_k_ = top_k;
     temperature_ = temperature;
+    n_batch_ = n_batch > 0 ? n_batch : max_seq_len_;
+    n_ubatch_ = n_ubatch > 0 ? n_ubatch : n_batch_;
     use_gpu_topk_sampling_ = (dev_mode_ != DevMode::CPU_MODE && temperature_ > 0.0f && top_k_ > 0);
 
     ggml_backend_load_all();
@@ -44,7 +46,7 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
     sched_ = model_->get_scheduler();
 
     forward_pass_ = std::make_shared<Qwen35moeForwardPass>();
-    forward_pass_->init(max_seq_len_, 1, model_);
+    forward_pass_->init(max_seq_len_, 1, model_, static_cast<uint32_t>(n_batch_), static_cast<uint32_t>(n_ubatch_));
     if (use_gpu_topk_sampling_) {
         forward_pass_->configure_device_sampling(top_k_, temperature_);
     }
@@ -135,12 +137,19 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
     // Decode phase
     const int32_t eos_token_id = m->tokenizer.ggml_eos_token_id;
+    const int32_t im_end_token_id = tokenizer_->get_special_token_id("<|im_end|>");
+    const int32_t eos_text_token_id = tokenizer_->get_special_token_id("<|endoftext|>");
+    const bool has_im_end_token_id = im_end_token_id >= 0;
+    const bool has_eos_text_token_id = eos_text_token_id >= 0;
+    const bool needs_string_stop_check = !has_im_end_token_id || !has_eos_text_token_id;
     const std::string im_end_str = "<|im_end|>";
     const std::string eos_str = "<|endoftext|>";
 
     // PLD state for single-prompt mode
     std::vector<int32_t> prompt_tokens_for_pld = tokens;  // Original prompt
     std::vector<int32_t> generated_tokens;
+    tokens.reserve(tokens.size() + static_cast<size_t>(max_tokens));
+    generated_tokens.reserve(static_cast<size_t>(max_tokens));
 
     double decode_tok_decode_ms = 0.0;
     double decode_forward_ms = 0.0;
@@ -150,13 +159,19 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
     auto t_decode_start = Clock::now();
     for (int i = 0; i < max_tokens; ++i) {
+        if (next_token_id == eos_token_id ||
+            (has_im_end_token_id && next_token_id == im_end_token_id) ||
+            (has_eos_text_token_id && next_token_id == eos_text_token_id)) {
+            break;
+        }
+
         auto t0 = Clock::now();
         std::string decoded_token = tokenizer_->decode(next_token_id);
         auto t1 = Clock::now();
 
         decode_tok_decode_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == eos_str) {
+        if (needs_string_stop_check && (decoded_token == im_end_str || decoded_token == eos_str)) {
             break;
         }
         response += decoded_token;
