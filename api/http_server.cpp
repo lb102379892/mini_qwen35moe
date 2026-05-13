@@ -398,8 +398,6 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
-    float temperature = extract_json_float(body, "temperature", -1.0f);
-    (void) temperature;
     const bool code_only = request_wants_code_only(body, user_content);
     const std::string prompt = code_only ? build_code_only_prompt(user_content) : user_content;
 
@@ -659,7 +657,7 @@ bool HttpServer::request_wants_code_only(const std::string& json, const std::str
     };
 
     for (const char* hint : hints) {
-        if (lowered.find(hint) != std::string::npos || user_content.find(hint) != std::string::npos) {
+        if (lowered.find(hint) != std::string::npos) {
             return true;
         }
     }
@@ -682,7 +680,7 @@ std::string HttpServer::extract_code_only_output(const std::string& generated_te
 
     std::string out;
     size_t pos = fence;
-    while (pos != std::string::npos) {
+    while (true) {
         size_t open = generated_text.find("```", pos);
         if (open == std::string::npos) break;
 
