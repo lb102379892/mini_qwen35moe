@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <vector>
 #include "pipeline/chat.h"
 
 using RequestHandler = std::function<std::string(const std::string& method, const std::string& path, const std::string& body)>;
@@ -47,10 +48,8 @@ private:
     static bool extract_json_bool(const std::string& json, const std::string& key, bool default_value);
     static int extract_json_int(const std::string& json, const std::string& key, int default_value);
     static float extract_json_float(const std::string& json, const std::string& key, float default_value);
-    static std::string extract_last_user_content(const std::string& json);
-    static bool request_wants_code_only(const std::string& json, const std::string& user_content);
-    static std::string build_code_only_prompt(const std::string& user_content);
-    static std::string extract_code_only_output(const std::string& generated_text);
+    static std::vector<std::pair<std::string, std::string>> extract_messages(const std::string& json);
+    static std::string build_prompt_from_messages(const std::vector<std::pair<std::string, std::string>>& messages, bool code_only);
 
     ChatEngine* engine_ = nullptr;
     int server_fd_ = -1;

@@ -391,21 +391,18 @@ bool HttpServer::send_all(int fd, const char* data, size_t len) {
 // Route handlers
 // ---------------------------------------------------------------------------
 std::string HttpServer::handle_chat_completions(const std::string& body) {
-    std::string user_content = extract_last_user_content(body);
-    if (user_content.empty()) {
-        return R"({"error":{"message":"No user message found","type":"invalid_request"}})";
+    const auto messages = extract_messages(body);
+    if (messages.empty()) {
+        return R"({"error":{"message":"No valid messages found","type":"invalid_request"}})";
     }
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
-    const bool code_only = request_wants_code_only(body, user_content);
-    const std::string prompt = code_only ? build_code_only_prompt(user_content) : user_content;
+    const bool code_only = extract_json_bool(body, "code_only", false);
+    const std::string prompt = build_prompt_from_messages(messages, code_only);
 
     std::string generated_text;
     engine_->run_complete(prompt, max_tokens, generated_text);
-    if (code_only) {
-        generated_text = extract_code_only_output(generated_text);
-    }
     std::string escaped_content = json_escape(generated_text);
 
     // Build OpenAI-compatible response
@@ -589,113 +586,53 @@ float HttpServer::extract_json_float(const std::string& json, const std::string&
     return val;
 }
 
-std::string HttpServer::extract_last_user_content(const std::string& json) {
-    // Find the last "role":"user" entry and extract its "content" value.
-    // Searches backwards for the last user message in the messages array.
-    std::string result;
+std::vector<std::pair<std::string, std::string>> HttpServer::extract_messages(const std::string& json) {
+    std::vector<std::pair<std::string, std::string>> messages;
     size_t search_from = 0;
 
     while (true) {
-        // Look for "role" : "user" patterns
         size_t role_pos = json.find("\"role\"", search_from);
         if (role_pos == std::string::npos) break;
 
-        // Check if this role is "user"
-        size_t colon = json.find(':', role_pos + 6);
-        if (colon == std::string::npos) break;
+        size_t object_start = json.rfind('{', role_pos);
+        size_t object_end = json.find('}', role_pos);
+        if (object_start == std::string::npos || object_end == std::string::npos || object_end <= object_start) {
+            search_from = role_pos + 6;
+            continue;
+        }
 
-        size_t quote = json.find('"', colon + 1);
-        if (quote == std::string::npos) break;
-
-        size_t end_quote = json.find('"', quote + 1);
-        if (end_quote == std::string::npos) break;
-
-        std::string role_value = json.substr(quote + 1, end_quote - quote - 1);
-
-        if (role_value == "user") {
-            // Find the "content" key near this role entry.
-            // Search within a reasonable window after the role.
-            size_t content_search_start = end_quote;
-            size_t content_search_end = std::min(json.size(), content_search_start + 2048);
-            std::string window = json.substr(content_search_start, content_search_end - content_search_start);
-            std::string content = extract_json_string(window, "content");
-            if (!content.empty()) {
-                result = content;
+        const std::string obj = json.substr(object_start, object_end - object_start + 1);
+        std::string role = extract_json_string(obj, "role");
+        std::string content = extract_json_string(obj, "content");
+        if (!role.empty() && !content.empty()) {
+            if (role == "system" || role == "user" || role == "assistant") {
+                messages.emplace_back(role, content);
             }
         }
 
-        search_from = end_quote + 1;
+        search_from = object_end + 1;
     }
 
-    return result;
+    return messages;
 }
 
-bool HttpServer::request_wants_code_only(const std::string& json, const std::string& user_content) {
-    if (extract_json_bool(json, "code_only", false)) {
-        return true;
+std::string HttpServer::build_prompt_from_messages(const std::vector<std::pair<std::string, std::string>>& messages, bool code_only) {
+    std::ostringstream prompt;
+    if (code_only) {
+        prompt
+            << "<|im_start|>system\n"
+            << "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
+            << "如果需要多文件，按文件分隔但内容必须都是代码。"
+            << "You must output code only. No prose, no bullets, no explanations."
+            << "<|im_end|>\n";
     }
 
-    std::string lowered;
-    lowered.reserve(user_content.size());
-    for (unsigned char ch : user_content) {
-        lowered.push_back(static_cast<char>(std::tolower(ch)));
+    for (const auto& message : messages) {
+        prompt
+            << "<|im_start|>" << message.first << "\n"
+            << message.second
+            << "<|im_end|>\n";
     }
-
-    static const char* const hints[] = {
-        "only code",
-        "code only",
-        "just code",
-        "no explanation",
-        "no explanations",
-        "只要求代码",
-        "只要代码",
-        "仅输出代码",
-        "只输出代码",
-        "不要解释",
-        "不要任何解释",
-        "不需要解释",
-    };
-
-    for (const char* hint : hints) {
-        if (lowered.find(hint) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::string HttpServer::build_code_only_prompt(const std::string& user_content) {
-    return
-        "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
-        "如果需要多文件，按文件分隔但内容必须都是代码。"
-        "You must output code only. No prose, no bullets, no explanations.\n\n"
-        + user_content;
-}
-
-std::string HttpServer::extract_code_only_output(const std::string& generated_text) {
-    std::string out;
-    size_t pos = 0;
-    while (true) {
-        size_t open = generated_text.find("```", pos);
-        if (open == std::string::npos) break;
-
-        size_t line_end = generated_text.find('\n', open + 3);
-        if (line_end == std::string::npos) break;
-
-        size_t close = generated_text.find("```", line_end + 1);
-        if (close == std::string::npos) break;
-
-        if (!out.empty() && out.back() != '\n') out.push_back('\n');
-        out.append(generated_text, line_end + 1, close - line_end - 1);
-
-        pos = close + 3;
-    }
-
-    if (!out.empty()) {
-        while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
-            out.pop_back();
-        }
-        return out;
-    }
-    return generated_text;
+    prompt << "<|im_start|>assistant\n";
+    return prompt.str();
 }
