@@ -724,15 +724,15 @@ std::string HttpServer::build_chatml_prompt(const std::string& json) {
     if (!saw_user) return "";
     if (!enable_thinking &&
         last_user_content_start != std::string::npos &&
-        last_user_content_end != std::string::npos &&
-        last_user_content_end >= last_user_content_start) {
+        last_user_content_end != std::string::npos) {
         const std::string user_content = prompt.substr(
             last_user_content_start,
             last_user_content_end - last_user_content_start
         );
         if (user_content.find("/think") == std::string::npos &&
             user_content.find("/no_think") == std::string::npos) {
-            prompt.insert(last_user_content_end, "\n/no_think");
+            const bool ends_with_newline = !user_content.empty() && user_content.back() == '\n';
+            prompt.insert(last_user_content_end, ends_with_newline ? "/no_think" : "\n/no_think");
         }
     }
     prompt += "<|im_start|>assistant\n";
