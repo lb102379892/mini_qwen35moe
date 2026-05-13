@@ -10,6 +10,7 @@
  */
 #include "graph/graph.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 namespace {
@@ -18,27 +19,46 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-uint32_t decode_cache_capacity(uint32_t context_len, uint32_t required_kv) {
-    if (context_len == 0) {
+uint32_t env_u32_or_default(const char* name, uint32_t default_value) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return default_value;
+    }
+    const unsigned long parsed = std::strtoul(value, nullptr, 10);
+    if (parsed == 0) {
+        return default_value;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+}
+
+uint32_t Qwen35moeForwardPass::decode_cache_bucket_capacity(uint32_t required_kv) const {
+    if (context_len_ == 0 || required_kv == 0) {
         return 0;
     }
 
-    // Keep decode CUDA graph KV span close to the actual sequence length.
-    // This avoids paying full n_ubatch attention cost at early decode steps.
-    uint32_t capacity = 1;
-    while (capacity < required_kv && capacity < context_len) {
-        capacity <<= 1;
+    // Use coarse decode buckets to increase CUDA graph replay compatibility.
+    // Coarser buckets reduce graph variant churn while keeping early decode
+    // over-compute bounded.
+    uint32_t bucket = required_kv;
+    if (required_kv <= 256) {
+        bucket = 256;
+    } else if (required_kv <= 1024) {
+        bucket = 1024;
+    } else if (required_kv <= 2048) {
+        bucket = 2048;
+    } else {
+        // For long contexts keep growth coarse by 2048-token buckets.
+        bucket = ((required_kv + 2047) / 2048) * 2048;
     }
 
-    // Avoid too-frequent graph rebuilds for very short prompts.
-    // 64 keeps graph recapture frequency low for short prompts while still
-    // avoiding large over-allocation (e.g. 512/1024) at early decode steps.
-    const uint32_t kMinDecodeCapacity = 64;
-    if (capacity < kMinDecodeCapacity) {
-        capacity = std::min(kMinDecodeCapacity, context_len);
+    if (bucket > context_len_) {
+        bucket = context_len_;
     }
-
-    return std::max(capacity, required_kv);
+    if (bucket < required_kv) {
+        bucket = required_kv;
+    }
+    return bucket;
 }
 
 void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
@@ -49,7 +69,6 @@ void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
         return;
     }
     ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(float));
-}
 }
 
 /**
@@ -84,6 +103,8 @@ Qwen35moeForwardPass::~Qwen35moeForwardPass() {
 int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model, uint32_t n_batch, uint32_t n_ubatch) {
     model_ = model;
     use_flash_attention_ = env_flag_enabled("QWEN35MOE_FLASH_ATTN");
+    decode_graph_diag_enabled_ = env_flag_enabled("QWEN35MOE_DECODE_GRAPH_DIAG");
+    decode_graph_diag_interval_ = env_u32_or_default("QWEN35MOE_DECODE_GRAPH_DIAG_INTERVAL", 256);
     auto& m = model_->meta_->qwen35moe;
 
     context_len_ = context_len;
@@ -180,6 +201,7 @@ void Qwen35moeForwardPass::reset_context() {
     cached_decode_pos_tensor_ = nullptr;
     cached_decode_mask_f32_.clear();
     cached_decode_mask_f16_.clear();
+    cached_decode_signature_valid_ = false;
     struct ggml_init_params params = {
         .mem_size   = ctx_buffer_.size(),
         .mem_buffer = ctx_buffer_.data(),
@@ -219,6 +241,14 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     if (kv_capacity > context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: kv_capacity exceeds context_len_");
     }
+
+    DecodeGraphSignature signature;
+    signature.slot_idx = slot_idx;
+    signature.kv_capacity = kv_capacity;
+    signature.context_len = context_len_;
+    signature.n_batch_tokens = n_batch_tokens_;
+    signature.n_ubatch_tokens = n_ubatch_tokens_;
+    signature.use_flash_attention = use_flash_attention_;
 
     const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     const uint32_t saved_snap = slot_idx < snapkv_seq_pos_.size() ? snapkv_seq_pos_[slot_idx] : 0;
@@ -263,10 +293,67 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     }
 
     ggml_backend_sched_reset(scheduler);
+    decode_graph_scheduler_reset_count_++;
     if (!ggml_backend_sched_alloc_graph(scheduler, cached_decode_graph_)) {
         throw std::runtime_error("Qwen35moeForwardPass::prepare_cached_decode_graph: failed to allocate graph");
     }
     cached_decode_graph_allocated_ = true;
+    cached_decode_signature_ = signature;
+    cached_decode_signature_valid_ = true;
+    decode_graph_bucket_usage_[kv_capacity]++;
+    decode_graph_recapture_count_++;
+}
+
+bool Qwen35moeForwardPass::is_cached_decode_graph_compatible(const DecodeGraphSignature& signature, uint32_t required_kv) const {
+    return cached_decode_graph_ != nullptr &&
+           cached_decode_graph_allocated_ &&
+           cached_decode_signature_valid_ &&
+           cached_decode_signature_.slot_idx == signature.slot_idx &&
+           cached_decode_signature_.context_len == signature.context_len &&
+           cached_decode_signature_.n_batch_tokens == signature.n_batch_tokens &&
+           cached_decode_signature_.n_ubatch_tokens == signature.n_ubatch_tokens &&
+           cached_decode_signature_.use_flash_attention == signature.use_flash_attention &&
+           required_kv <= cached_decode_signature_.kv_capacity;
+}
+
+void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
+    if (!decode_graph_diag_enabled_) {
+        return;
+    }
+    if (decode_graph_lookup_count_ == 0) {
+        return;
+    }
+
+    const bool interval_reached = (decode_graph_lookup_count_ % decode_graph_diag_interval_) == 0;
+    const bool has_new_recapture = decode_graph_recapture_count_ > decode_graph_last_logged_recapture_;
+    if (!interval_reached && !has_new_recapture) {
+        return;
+    }
+
+    uint32_t hottest_bucket = 0;
+    uint64_t hottest_bucket_count = 0;
+    for (const auto& item : decode_graph_bucket_usage_) {
+        if (item.second > hottest_bucket_count) {
+            hottest_bucket_count = item.second;
+            hottest_bucket = item.first;
+        }
+    }
+
+    std::fprintf(
+        stderr,
+        "[PERF][decode-graph] lookups=%llu hit=%llu miss=%llu recapture=%llu fallback=%llu sched_reset=%llu active_bucket=%u hot_bucket=%u hot_bucket_uses=%llu\n",
+        static_cast<unsigned long long>(decode_graph_lookup_count_),
+        static_cast<unsigned long long>(decode_graph_hit_count_),
+        static_cast<unsigned long long>(decode_graph_miss_count_),
+        static_cast<unsigned long long>(decode_graph_recapture_count_),
+        static_cast<unsigned long long>(decode_graph_fallback_count_),
+        static_cast<unsigned long long>(decode_graph_scheduler_reset_count_),
+        cached_decode_signature_valid_ ? cached_decode_signature_.kv_capacity : 0,
+        hottest_bucket,
+        static_cast<unsigned long long>(hottest_bucket_count)
+    );
+    decode_graph_last_logged_lookup_ = decode_graph_lookup_count_;
+    decode_graph_last_logged_recapture_ = decode_graph_recapture_count_;
 }
 
 /**
@@ -925,9 +1012,30 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
-    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
-        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, required_kv));
+    DecodeGraphSignature requested_signature;
+    requested_signature.slot_idx = slot_idx;
+    requested_signature.context_len = context_len_;
+    requested_signature.n_batch_tokens = n_batch_tokens_;
+    requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
+    requested_signature.use_flash_attention = use_flash_attention_;
+    requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
+
+    decode_graph_lookup_count_++;
+    if (!is_cached_decode_graph_compatible(requested_signature, required_kv)) {
+        decode_graph_miss_count_++;
+        try {
+            prepare_cached_decode_graph(scheduler, slot_idx, requested_signature.kv_capacity);
+        } catch (const std::exception&) {
+            const uint32_t fallback_capacity = std::min(context_len_, required_kv);
+            if (fallback_capacity != requested_signature.kv_capacity) {
+                decode_graph_fallback_count_++;
+                prepare_cached_decode_graph(scheduler, slot_idx, fallback_capacity);
+            } else {
+                throw;
+            }
+        }
+    } else {
+        decode_graph_hit_count_++;
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -937,6 +1045,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
         kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
     }
     advance_cache(1, slot_idx);
+    maybe_log_decode_graph_stats();
     return get_output_logits(cached_decode_graph_);
 }
 
@@ -953,9 +1062,30 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
-    if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
-        !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_, required_kv));
+    DecodeGraphSignature requested_signature;
+    requested_signature.slot_idx = slot_idx;
+    requested_signature.context_len = context_len_;
+    requested_signature.n_batch_tokens = n_batch_tokens_;
+    requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
+    requested_signature.use_flash_attention = use_flash_attention_;
+    requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
+
+    decode_graph_lookup_count_++;
+    if (!is_cached_decode_graph_compatible(requested_signature, required_kv)) {
+        decode_graph_miss_count_++;
+        try {
+            prepare_cached_decode_graph(scheduler, slot_idx, requested_signature.kv_capacity);
+        } catch (const std::exception&) {
+            const uint32_t fallback_capacity = std::min(context_len_, required_kv);
+            if (fallback_capacity != requested_signature.kv_capacity) {
+                decode_graph_fallback_count_++;
+                prepare_cached_decode_graph(scheduler, slot_idx, fallback_capacity);
+            } else {
+                throw;
+            }
+        }
+    } else {
+        decode_graph_hit_count_++;
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -965,6 +1095,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
         kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
     }
     advance_cache(1, slot_idx);
+    maybe_log_decode_graph_stats();
     return get_output_topk_candidates(cached_decode_graph_, 0);
 }
 
