@@ -28,6 +28,10 @@ static constexpr int kReadBufSize = 8192;
 static constexpr int kListenBacklog = 64;
 
 static constexpr int kMaxGenerateTokens = 4096;
+static constexpr const char* kCodeOnlySystemInstruction =
+    "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
+    "如果需要多文件，按文件分隔但内容必须都是代码。"
+    "You must output code only. No prose, no bullets, no explanations.";
 
 static std::string debug_escape_token_piece(const std::string& text) {
     std::string out;
@@ -588,29 +592,100 @@ float HttpServer::extract_json_float(const std::string& json, const std::string&
 
 std::vector<std::pair<std::string, std::string>> HttpServer::extract_messages(const std::string& json) {
     std::vector<std::pair<std::string, std::string>> messages;
-    size_t search_from = 0;
+    const size_t messages_key_pos = json.find("\"messages\"");
+    if (messages_key_pos == std::string::npos) {
+        return messages;
+    }
 
-    while (true) {
-        size_t role_pos = json.find("\"role\"", search_from);
-        if (role_pos == std::string::npos) break;
+    size_t array_start = json.find('[', messages_key_pos);
+    if (array_start == std::string::npos) {
+        return messages;
+    }
 
-        size_t object_start = json.rfind('{', role_pos);
-        size_t object_end = json.find('}', role_pos);
-        if (object_start == std::string::npos || object_end == std::string::npos || object_end <= object_start) {
-            search_from = role_pos + 6;
+    size_t array_end = std::string::npos;
+    bool in_string = false;
+    bool escaped = false;
+    int depth = 0;
+    for (size_t i = array_start; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
             continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+            continue;
+        }
+        if (ch == '[') {
+            depth++;
+        } else if (ch == ']') {
+            depth--;
+            if (depth == 0) {
+                array_end = i;
+                break;
+            }
+        }
+    }
+    if (array_end == std::string::npos || array_end <= array_start) {
+        return messages;
+    }
+
+    size_t cursor = array_start + 1;
+    while (cursor < array_end) {
+        size_t object_start = json.find('{', cursor);
+        if (object_start == std::string::npos || object_start >= array_end) {
+            break;
+        }
+
+        size_t object_end = std::string::npos;
+        in_string = false;
+        escaped = false;
+        int obj_depth = 0;
+        for (size_t i = object_start; i <= array_end; ++i) {
+            const char ch = json[i];
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            if (ch == '"') {
+                in_string = true;
+            } else if (ch == '{') {
+                obj_depth++;
+            } else if (ch == '}') {
+                obj_depth--;
+                if (obj_depth == 0) {
+                    object_end = i;
+                    break;
+                }
+            }
+        }
+        if (object_end == std::string::npos) {
+            break;
         }
 
         const std::string obj = json.substr(object_start, object_end - object_start + 1);
         std::string role = extract_json_string(obj, "role");
         std::string content = extract_json_string(obj, "content");
-        if (!role.empty() && !content.empty()) {
-            if (role == "system" || role == "user" || role == "assistant") {
-                messages.emplace_back(role, content);
-            }
+        if (!role.empty() && !content.empty() &&
+            (role == "system" || role == "user" || role == "assistant")) {
+            messages.emplace_back(role, content);
         }
 
-        search_from = object_end + 1;
+        cursor = object_end + 1;
     }
 
     return messages;
@@ -621,9 +696,7 @@ std::string HttpServer::build_prompt_from_messages(const std::vector<std::pair<s
     if (code_only) {
         prompt
             << "<|im_start|>system\n"
-            << "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
-            << "如果需要多文件，按文件分隔但内容必须都是代码。"
-            << "You must output code only. No prose, no bullets, no explanations."
+            << kCodeOnlySystemInstruction
             << "<|im_end|>\n";
     }
 
