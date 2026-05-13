@@ -698,6 +698,8 @@ std::string HttpServer::build_chatml_prompt(const std::string& json) {
         std::string role = extract_json_string(message_obj, "role");
         std::string content = extract_json_string(message_obj, "content");
 
+        // OpenAI-compatible "developer" instructions should precede user turns,
+        // so normalize them to ChatML's "system" role.
         if (role == "developer") role = "system";
         if ((role == "system" || role == "user" || role == "assistant")) {
             prompt += "<|im_start|>";
