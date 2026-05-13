@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace {
 bool env_flag_enabled(const char* name) {
@@ -24,10 +25,15 @@ uint32_t env_u32_or_default(const char* name, uint32_t default_value) {
     if (!value || value[0] == '\0') {
         return default_value;
     }
-    const unsigned long parsed = std::strtoul(value, nullptr, 10);
-    if (parsed == 0) {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || (end != nullptr && *end != '\0')) {
         return default_value;
     }
+    if (parsed > static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max())) {
+        return default_value;
+    }
+    // Allow explicit 0 so diagnostics can be recapture only when interval=0.
     return static_cast<uint32_t>(parsed);
 }
 }
@@ -316,6 +322,32 @@ bool Qwen35moeForwardPass::is_cached_decode_graph_compatible(const DecodeGraphSi
            required_kv <= cached_decode_signature_.kv_capacity;
 }
 
+void Qwen35moeForwardPass::ensure_cached_decode_graph(ggml_backend_sched_t scheduler, const DecodeGraphSignature& signature, uint32_t required_kv) {
+    decode_graph_lookup_count_++;
+    if (is_cached_decode_graph_compatible(signature, required_kv)) {
+        decode_graph_hit_count_++;
+        return;
+    }
+
+    decode_graph_miss_count_++;
+    try {
+        prepare_cached_decode_graph(scheduler, signature.slot_idx, signature.kv_capacity);
+    } catch (const std::exception& ex) {
+        std::fprintf(
+            stderr,
+            "[PERF][decode-graph] recapture_failed requested_bucket=%u err=%s\n",
+            signature.kv_capacity,
+            ex.what()
+        );
+        const uint32_t fallback_capacity = std::min(context_len_, required_kv);
+        if (fallback_capacity == signature.kv_capacity) {
+            throw;
+        }
+        decode_graph_fallback_count_++;
+        prepare_cached_decode_graph(scheduler, signature.slot_idx, fallback_capacity);
+    }
+}
+
 void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
     if (!decode_graph_diag_enabled_) {
         return;
@@ -324,7 +356,10 @@ void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
         return;
     }
 
-    const bool interval_reached = (decode_graph_lookup_count_ % decode_graph_diag_interval_) == 0;
+    bool interval_reached = false;
+    if (decode_graph_diag_interval_ > 0) {
+        interval_reached = (decode_graph_lookup_count_ % decode_graph_diag_interval_) == 0;
+    }
     const bool has_new_recapture = decode_graph_recapture_count_ > decode_graph_last_logged_recapture_;
     if (!interval_reached && !has_new_recapture) {
         return;
@@ -1020,23 +1055,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     requested_signature.use_flash_attention = use_flash_attention_;
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
-    decode_graph_lookup_count_++;
-    if (!is_cached_decode_graph_compatible(requested_signature, required_kv)) {
-        decode_graph_miss_count_++;
-        try {
-            prepare_cached_decode_graph(scheduler, slot_idx, requested_signature.kv_capacity);
-        } catch (const std::exception&) {
-            const uint32_t fallback_capacity = std::min(context_len_, required_kv);
-            if (fallback_capacity != requested_signature.kv_capacity) {
-                decode_graph_fallback_count_++;
-                prepare_cached_decode_graph(scheduler, slot_idx, fallback_capacity);
-            } else {
-                throw;
-            }
-        }
-    } else {
-        decode_graph_hit_count_++;
-    }
+    ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
@@ -1070,23 +1089,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     requested_signature.use_flash_attention = use_flash_attention_;
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
-    decode_graph_lookup_count_++;
-    if (!is_cached_decode_graph_compatible(requested_signature, required_kv)) {
-        decode_graph_miss_count_++;
-        try {
-            prepare_cached_decode_graph(scheduler, slot_idx, requested_signature.kv_capacity);
-        } catch (const std::exception&) {
-            const uint32_t fallback_capacity = std::min(context_len_, required_kv);
-            if (fallback_capacity != requested_signature.kv_capacity) {
-                decode_graph_fallback_count_++;
-                prepare_cached_decode_graph(scheduler, slot_idx, fallback_capacity);
-            } else {
-                throw;
-            }
-        }
-    } else {
-        decode_graph_hit_count_++;
-    }
+    ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
