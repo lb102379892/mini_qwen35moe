@@ -401,7 +401,6 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
-    float temperature = extract_json_float(body, "temperature", -1.0f);
 
     std::string generated_text;
     engine_->run_complete(prompt, max_tokens, generated_text);
@@ -630,6 +629,7 @@ std::string HttpServer::extract_last_user_content(const std::string& json) {
 }
 
 std::string HttpServer::build_chatml_prompt(const std::string& json) {
+    const bool enable_thinking = extract_json_bool(json, "enable_thinking", false);
     const std::string messages_key = "\"messages\"";
     size_t key_pos = json.find(messages_key);
     if (key_pos == std::string::npos) return "";
@@ -648,6 +648,8 @@ std::string HttpServer::build_chatml_prompt(const std::string& json) {
     std::string prompt;
     prompt.reserve(1024);
     bool saw_user = false;
+    size_t last_user_content_start = std::string::npos;
+    size_t last_user_content_end = std::string::npos;
 
     size_t pos = array_start + 1;
     while (pos < json.size()) {
@@ -705,15 +707,34 @@ std::string HttpServer::build_chatml_prompt(const std::string& json) {
             prompt += "<|im_start|>";
             prompt += role;
             prompt += "\n";
+            const size_t content_start = prompt.size();
             prompt += content;
+            const size_t content_end = prompt.size();
             prompt += "<|im_end|>\n";
-            if (role == "user") saw_user = true;
+            if (role == "user") {
+                saw_user = true;
+                last_user_content_start = content_start;
+                last_user_content_end = content_end;
+            }
         }
 
         pos = obj_end + 1;
     }
 
     if (!saw_user) return "";
+    if (!enable_thinking &&
+        last_user_content_start != std::string::npos &&
+        last_user_content_end != std::string::npos &&
+        last_user_content_end >= last_user_content_start) {
+        const std::string user_content = prompt.substr(
+            last_user_content_start,
+            last_user_content_end - last_user_content_start
+        );
+        if (user_content.find("/think") == std::string::npos &&
+            user_content.find("/no_think") == std::string::npos) {
+            prompt.insert(last_user_content_end, "\n/no_think");
+        }
+    }
     prompt += "<|im_start|>assistant\n";
     return prompt;
 }

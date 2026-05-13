@@ -46,11 +46,12 @@ curl -X POST http://localhost:6666/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "写个linux用c++语言实现的server示例，只要求代码"}
     ],
+    "enable_thinking": false,
     "temperature": 0,
     "max_tokens": 1024
   }'
 
-`/v1/chat/completions` 会按 `messages` 构造 ChatML 提示词（`<|im_start|>...<|im_end|>`，并追加 `assistant` generation prompt），行为与 llama.cpp 的模板驱动方式一致，不做生成后字符串过滤。
+`/v1/chat/completions` 会按 `messages` 构造 ChatML 提示词（`<|im_start|>...<|im_end|>`，并追加 `assistant` generation prompt），行为与 llama.cpp 的模板驱动方式一致，不做生成后字符串过滤。默认会在最后一条 user 消息上追加 `/no_think`（可通过 `enable_thinking: true` 显式开启思维模式）。
 
 ./test_qwen35moe \
   --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
