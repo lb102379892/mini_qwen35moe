@@ -3,6 +3,7 @@
 #include <climits>
 #include <cmath>
 #include <chrono>
+#include <cctype>
 #include <ctime>
 #include <cstdio>
 #include <cstring>
@@ -398,9 +399,15 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
     float temperature = extract_json_float(body, "temperature", -1.0f);
+    (void) temperature;
+    const bool code_only = request_wants_code_only(body, user_content);
+    const std::string prompt = code_only ? build_code_only_prompt(user_content) : user_content;
 
     std::string generated_text;
-    engine_->run_complete(user_content, max_tokens, generated_text);
+    engine_->run_complete(prompt, max_tokens, generated_text);
+    if (code_only) {
+        generated_text = extract_code_only_output(generated_text);
+    }
     std::string escaped_content = json_escape(generated_text);
 
     // Build OpenAI-compatible response
@@ -623,4 +630,79 @@ std::string HttpServer::extract_last_user_content(const std::string& json) {
     }
 
     return result;
+}
+
+bool HttpServer::request_wants_code_only(const std::string& json, const std::string& user_content) {
+    if (extract_json_bool(json, "code_only", false)) {
+        return true;
+    }
+
+    std::string lowered;
+    lowered.reserve(user_content.size());
+    for (unsigned char ch : user_content) {
+        lowered.push_back(static_cast<char>(std::tolower(ch)));
+    }
+
+    static const char* const hints[] = {
+        "only code",
+        "code only",
+        "just code",
+        "no explanation",
+        "no explanations",
+        "只要求代码",
+        "只要代码",
+        "仅输出代码",
+        "只输出代码",
+        "不要解释",
+        "不要任何解释",
+        "不需要解释",
+    };
+
+    for (const char* hint : hints) {
+        if (lowered.find(hint) != std::string::npos || user_content.find(hint) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string HttpServer::build_code_only_prompt(const std::string& user_content) {
+    return
+        "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
+        "如果需要多文件，按文件分隔但内容必须都是代码。"
+        "You must output code only. No prose, no bullets, no explanations.\n\n"
+        + user_content;
+}
+
+std::string HttpServer::extract_code_only_output(const std::string& generated_text) {
+    size_t fence = generated_text.find("```");
+    if (fence == std::string::npos) {
+        return generated_text;
+    }
+
+    std::string out;
+    size_t pos = fence;
+    while (pos != std::string::npos) {
+        size_t open = generated_text.find("```", pos);
+        if (open == std::string::npos) break;
+
+        size_t line_end = generated_text.find('\n', open + 3);
+        if (line_end == std::string::npos) break;
+
+        size_t close = generated_text.find("```", line_end + 1);
+        if (close == std::string::npos) break;
+
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
+        out.append(generated_text, line_end + 1, close - line_end - 1);
+
+        pos = close + 3;
+    }
+
+    if (!out.empty()) {
+        while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
+            out.pop_back();
+        }
+        return out;
+    }
+    return generated_text;
 }
