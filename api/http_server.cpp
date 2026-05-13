@@ -31,7 +31,7 @@ static constexpr int kMaxGenerateTokens = 4096;
 static constexpr const char* kCodeOnlySystemInstruction =
     "你必须只输出可直接运行的代码，不要解释、不要标题、不要步骤、不要Markdown说明。"
     "如果需要多文件，按文件分隔但内容必须都是代码。"
-    "You must output code only. No prose, no bullets, no explanations.";
+    "\nYou must output code only. No prose, no bullets, no explanations.";
 
 static std::string debug_escape_token_piece(const std::string& text) {
     std::string out;
@@ -402,6 +402,7 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
+    // code_only=true prepends a strict system instruction; no post-generation filtering is applied.
     const bool code_only = extract_json_bool(body, "code_only", false);
     const std::string prompt = build_prompt_from_messages(messages, code_only);
 
