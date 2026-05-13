@@ -20,15 +20,12 @@ bool env_flag_enabled(const char* name) {
 
 uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
     constexpr uint32_t min_capacity = 64;
-    constexpr uint32_t growth_step = 128;
-
     required = std::min(required, context_len);
-    if (required <= min_capacity) {
-        return std::min(min_capacity, context_len);
+    uint32_t capacity = min_capacity;
+    while (capacity < required) {
+        capacity *= 2;
     }
-
-    const uint32_t rounded = ((required + growth_step - 1) / growth_step) * growth_step;
-    return std::min(rounded, context_len);
+    return std::min(capacity, context_len);
 }
 
 void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
