@@ -18,14 +18,8 @@ bool env_flag_enabled(const char* name) {
     return value && value[0] != '\0' && value[0] != '0';
 }
 
-uint32_t decode_cache_capacity(uint32_t required, uint32_t context_len) {
-    constexpr uint32_t min_capacity = 64;
-    required = std::min(required, context_len);
-    uint32_t capacity = min_capacity;
-    while (capacity < required) {
-        capacity *= 2;
-    }
-    return std::min(capacity, context_len);
+uint32_t decode_cache_capacity(uint32_t context_len) {
+    return context_len;
 }
 
 void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
@@ -159,6 +153,7 @@ void Qwen35moeForwardPass::reset_context() {
     cached_decode_graph_allocated_ = false;
     cached_decode_kv_capacity_ = 0;
     cached_decode_scratch_pos_ = 0;
+    cached_decode_last_mask_pos_ = -1;
     cached_decode_mask_tensors_.clear();
     cached_decode_mask_f32_.clear();
     cached_decode_mask_f16_.clear();
@@ -218,6 +213,7 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     cached_decode_slot_ = slot_idx;
     cached_decode_kv_capacity_ = kv_capacity;
     cached_decode_scratch_pos_ = scratch_pos;
+    cached_decode_last_mask_pos_ = -1;
     cached_decode_mask_tensors_.clear();
     for (uint32_t il = 0; il < model_->meta_->qwen35moe.block_count; ++il) {
         if (!is_full_attention_layer(il)) {
@@ -301,17 +297,34 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
 
     uint32_t prepared_n_kv = 0;
     bool f16_ready = false;
+    // Cached decode advances one token per step, so mask expansion is expected
+    // to be strictly sequential (pos == last_pos + 1).
+    const bool can_incremental =
+        cached_decode_last_mask_pos_ >= 0 && pos == cached_decode_last_mask_pos_ + 1;
+
     for (ggml_tensor* kq_mask : cached_decode_mask_tensors_) {
         const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
         if (prepared_n_kv != n_kv) {
-            cached_decode_mask_f32_.resize(n_kv);
-            std::fill(cached_decode_mask_f32_.begin(), cached_decode_mask_f32_.end(), -INFINITY);
-            const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
-            for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
-                cached_decode_mask_f32_[j] = 0.0f;
-            }
-            if (scratch_pos < n_kv) {
-                cached_decode_mask_f32_[scratch_pos] = 0.0f;
+            const bool need_full_refresh =
+                !can_incremental ||
+                cached_decode_mask_f32_.size() != n_kv ||
+                cached_decode_last_mask_pos_ < 0;
+            if (need_full_refresh) {
+                cached_decode_mask_f32_.assign(n_kv, -INFINITY);
+                const uint32_t valid_prev = pos > 0 ? static_cast<uint32_t>(pos) : 0;
+                for (uint32_t j = 0; j < valid_prev && j < n_kv; ++j) {
+                    cached_decode_mask_f32_[j] = 0.0f;
+                }
+                if (scratch_pos < n_kv) {
+                    cached_decode_mask_f32_[scratch_pos] = 0.0f;
+                }
+            } else {
+                if (pos > 0) {
+                    const uint32_t visible_prev_pos = static_cast<uint32_t>(pos - 1);
+                    if (visible_prev_pos < n_kv) {
+                        cached_decode_mask_f32_[visible_prev_pos] = 0.0f;
+                    }
+                }
             }
             prepared_n_kv = n_kv;
             f16_ready = false;
@@ -342,6 +355,7 @@ void Qwen35moeForwardPass::set_cached_decode_inputs(ggml_cgraph* gf, int32_t tok
             );
         }
     }
+    cached_decode_last_mask_pos_ = pos;
 }
 
 /**
@@ -807,7 +821,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
@@ -835,7 +849,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     if (cached_decode_graph_ == nullptr || cached_decode_slot_ != slot_idx ||
         !cached_decode_graph_allocated_ || required_kv > cached_decode_kv_capacity_) {
-        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(required_kv, context_len_));
+        prepare_cached_decode_graph(scheduler, slot_idx, decode_cache_capacity(context_len_));
     }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
