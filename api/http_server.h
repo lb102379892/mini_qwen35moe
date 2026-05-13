@@ -48,6 +48,7 @@ private:
     static int extract_json_int(const std::string& json, const std::string& key, int default_value);
     static float extract_json_float(const std::string& json, const std::string& key, float default_value);
     static std::string extract_last_user_content(const std::string& json);
+    static std::string build_chatml_prompt(const std::string& json);
 
     ChatEngine* engine_ = nullptr;
     int server_fd_ = -1;
