@@ -50,6 +50,8 @@ curl -X POST http://localhost:6666/v1/chat/completions \
     "max_tokens": 1024
   }'
 
+`/v1/chat/completions` 会按 `messages` 构造 ChatML 提示词（`<|im_start|>...<|im_end|>`，并追加 `assistant` generation prompt），行为与 llama.cpp 的模板驱动方式一致，不做生成后字符串过滤。
+
 ./test_qwen35moe \
   --model /home/xc/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf \
   --prompt "你的模型是什么" \

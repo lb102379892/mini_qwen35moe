@@ -390,9 +390,13 @@ bool HttpServer::send_all(int fd, const char* data, size_t len) {
 // Route handlers
 // ---------------------------------------------------------------------------
 std::string HttpServer::handle_chat_completions(const std::string& body) {
-    std::string user_content = extract_last_user_content(body);
-    if (user_content.empty()) {
-        return R"({"error":{"message":"No user message found","type":"invalid_request"}})";
+    std::string prompt = build_chatml_prompt(body);
+    if (prompt.empty()) {
+        std::string user_content = extract_last_user_content(body);
+        if (user_content.empty()) {
+            return R"({"error":{"message":"No user message found","type":"invalid_request"}})";
+        }
+        prompt = "<|im_start|>user\n" + user_content + "<|im_end|>\n<|im_start|>assistant\n";
     }
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
@@ -400,7 +404,7 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
     float temperature = extract_json_float(body, "temperature", -1.0f);
 
     std::string generated_text;
-    engine_->run_complete(user_content, max_tokens, generated_text);
+    engine_->run_complete(prompt, max_tokens, generated_text);
     std::string escaped_content = json_escape(generated_text);
 
     // Build OpenAI-compatible response
@@ -623,4 +627,93 @@ std::string HttpServer::extract_last_user_content(const std::string& json) {
     }
 
     return result;
+}
+
+std::string HttpServer::build_chatml_prompt(const std::string& json) {
+    const std::string messages_key = "\"messages\"";
+    size_t key_pos = json.find(messages_key);
+    if (key_pos == std::string::npos) return "";
+
+    size_t colon_pos = json.find(':', key_pos + messages_key.size());
+    if (colon_pos == std::string::npos) return "";
+
+    size_t array_start = colon_pos + 1;
+    while (array_start < json.size() &&
+            (json[array_start] == ' ' || json[array_start] == '\t' ||
+             json[array_start] == '\n' || json[array_start] == '\r')) {
+        array_start++;
+    }
+    if (array_start >= json.size() || json[array_start] != '[') return "";
+
+    std::string prompt;
+    prompt.reserve(1024);
+    bool saw_user = false;
+
+    size_t pos = array_start + 1;
+    while (pos < json.size()) {
+        while (pos < json.size() &&
+                (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' ||
+                 json[pos] == '\r' || json[pos] == ',')) {
+            pos++;
+        }
+        if (pos >= json.size()) break;
+        if (json[pos] == ']') break;
+        if (json[pos] != '{') return "";
+
+        size_t obj_start = pos;
+        size_t obj_end = std::string::npos;
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (size_t i = pos; i < json.size(); ++i) {
+            char c = json[i];
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                continue;
+            }
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    obj_end = i;
+                    break;
+                }
+            }
+        }
+
+        if (obj_end == std::string::npos) return "";
+
+        std::string message_obj = json.substr(obj_start, obj_end - obj_start + 1);
+        std::string role = extract_json_string(message_obj, "role");
+        std::string content = extract_json_string(message_obj, "content");
+
+        // OpenAI-compatible "developer" instructions should precede user turns,
+        // so normalize them to ChatML's "system" role.
+        if (role == "developer") role = "system";
+        if ((role == "system" || role == "user" || role == "assistant")) {
+            prompt += "<|im_start|>";
+            prompt += role;
+            prompt += "\n";
+            prompt += content;
+            prompt += "<|im_end|>\n";
+            if (role == "user") saw_user = true;
+        }
+
+        pos = obj_end + 1;
+    }
+
+    if (!saw_user) return "";
+    prompt += "<|im_start|>assistant\n";
+    return prompt;
 }
