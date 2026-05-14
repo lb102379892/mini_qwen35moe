@@ -75,6 +75,13 @@ private:
         uint32_t n_batch_tokens = 0;
         uint32_t n_ubatch_tokens = 0;
         bool use_flash_attention = false;
+        // Mixed-mode guard: when true the scheduler contains both GPU and CPU
+        // backends. The cached-decode-graph path is disabled in this mode because
+        // ggml's CUDA-graph capture/replay is unreliable across heterogeneous ops.
+        bool is_mixed_mode = false;
+        // FNV-1a hash of the current layer→device assignment in AUTO_MODE.
+        // Any change in layer placement forces a full graph recapture.
+        uint64_t device_map_hash = 0;
     };
 
     // Create a new graph
@@ -347,4 +354,8 @@ private:
     bool use_flash_attention_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
+    // Set via QWEN35MOE_DEV_CHECK=1 to enable lightweight device-consistency logging
+    // on key layer boundaries (attention + ffn entry). Disabled by default so that
+    // release performance is unaffected.
+    bool dev_check_enabled_ = false;
 };

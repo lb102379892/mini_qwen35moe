@@ -111,6 +111,7 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
     use_flash_attention_ = env_flag_enabled("QWEN35MOE_FLASH_ATTN");
     decode_graph_diag_enabled_ = env_flag_enabled("QWEN35MOE_DECODE_GRAPH_DIAG");
     decode_graph_diag_interval_ = env_u32_or_default("QWEN35MOE_DECODE_GRAPH_DIAG_INTERVAL", 256);
+    dev_check_enabled_ = env_flag_enabled("QWEN35MOE_DEV_CHECK");
     auto& m = model_->meta_->qwen35moe;
 
     context_len_ = context_len;
@@ -141,7 +142,17 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
 
     // 创建 KV 缓存：用于存储注意力机制的 Key/Value 张量
     // Qwen3.5-MoE 有 10 个 Full Attention 层
+    // In mixed GPU/CPU mode the cached-decode-graph path is disabled (eager fallback).
+    // KV cache stays on GPU so that pure-GPU attention layers can access it without copies.
+    // When CPU attention layers are scheduled the ggml backend scheduler inserts the
+    // necessary GPU→CPU copies automatically.
     ggml_backend_t cache_backend = model_->get_curr_backend();
+    if (model_->is_mixed_mode()) {
+        std::fprintf(stderr,
+            "[dev-mode=auto] mixed GPU/CPU detected (device_map_hash=0x%llx): "
+            "decode cached-graph disabled, using eager execution per step.\n",
+            static_cast<unsigned long long>(model_->compute_device_map_hash()));
+    }
 
     const int n_kv_layers = kv_idx;  // Full Attention 层数量
     const uint32_t n_embd_k = static_cast<uint32_t>(m.head_count_kv * m.key_length);  // K 维度
@@ -255,6 +266,8 @@ void Qwen35moeForwardPass::prepare_cached_decode_graph(ggml_backend_sched_t sche
     signature.n_batch_tokens = n_batch_tokens_;
     signature.n_ubatch_tokens = n_ubatch_tokens_;
     signature.use_flash_attention = use_flash_attention_;
+    signature.is_mixed_mode = model_->is_mixed_mode();
+    signature.device_map_hash = model_->compute_device_map_hash();
 
     const uint32_t saved_pos = kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     const uint32_t saved_snap = slot_idx < snapkv_seq_pos_.size() ? snapkv_seq_pos_[slot_idx] : 0;
@@ -319,6 +332,8 @@ bool Qwen35moeForwardPass::is_cached_decode_graph_compatible(const DecodeGraphSi
            cached_decode_signature_.n_batch_tokens == signature.n_batch_tokens &&
            cached_decode_signature_.n_ubatch_tokens == signature.n_ubatch_tokens &&
            cached_decode_signature_.use_flash_attention == signature.use_flash_attention &&
+           cached_decode_signature_.is_mixed_mode == signature.is_mixed_mode &&
+           cached_decode_signature_.device_map_hash == signature.device_map_hash &&
            required_kv <= cached_decode_signature_.kv_capacity;
 }
 
@@ -567,6 +582,17 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
 
         // ── Pre-attention RMSNorm ───────────────────────────────────────────
         struct ggml_tensor* attn_norm_weight = model_->get_attn_norm_weight(il);
+
+        // Optional device consistency log (QWEN35MOE_DEV_CHECK=1)
+        if (dev_check_enabled_ && attn_norm_weight) {
+            const char* norm_dev = attn_norm_weight->buffer
+                ? ggml_backend_buft_name(ggml_backend_buffer_get_type(attn_norm_weight->buffer))
+                : "unallocated";
+            std::fprintf(stderr,
+                "[dev-check] prefill layer=%u attn_norm_weight.backend=%s\n",
+                il, norm_dev);
+        }
+
         ggml_tensor* cur = build_norm(gf, inpL, attn_norm_weight, il);
 
         // ── Attention 或 DeltaNet 层 ────────────────────────────────────────
@@ -582,6 +608,27 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
             struct ggml_tensor* attn_k_norm_weight = model_->get_attn_k_norm_weight(il);
             struct ggml_tensor* attn_v_weight = model_->get_attn_v_weight(il);
             struct ggml_tensor* attn_output_weight = model_->get_attn_output_weight(il);
+
+            if (dev_check_enabled_ && attn_q_weight && attn_k_weight) {
+                const char* q_dev = attn_q_weight->buffer
+                    ? ggml_backend_buft_name(ggml_backend_buffer_get_type(attn_q_weight->buffer))
+                    : "unallocated";
+                const char* k_dev = attn_k_weight->buffer
+                    ? ggml_backend_buft_name(ggml_backend_buffer_get_type(attn_k_weight->buffer))
+                    : "unallocated";
+                int kc_layer = kv_layer_map_[il];
+                const char* kc_dev = (kc_layer >= 0 && kv_cache_)
+                    ? (kv_cache_->get_k_cache_tensor(kc_layer) &&
+                       kv_cache_->get_k_cache_tensor(kc_layer)->buffer
+                       ? ggml_backend_buft_name(ggml_backend_buffer_get_type(
+                           kv_cache_->get_k_cache_tensor(kc_layer)->buffer))
+                       : "unallocated")
+                    : "n/a";
+                std::fprintf(stderr,
+                    "[dev-check] prefill layer=%u attn_q.backend=%s attn_k.backend=%s kv_cache.backend=%s\n",
+                    il, q_dev, k_dev, kc_dev);
+            }
+
             cur = build_gated_attention(
                 ctx_, gf, kv_cache_.get(), cur, inp_pos,
                 kv_idx, n_tok, slot_idx, il, attn_q_weight, 
@@ -603,6 +650,19 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
         // ── Pre-FFN RMSNorm ─────────────────────────────────────────────────
         ggml_tensor* ffn_inp = cur;
         struct ggml_tensor* post_attention_norm = model_->get_post_attention_norm_weight(il);
+
+        if (dev_check_enabled_) {
+            struct ggml_tensor* ffn_gate_inp_w = model_->get_ffn_gate_inp_weight(il);
+            if (ffn_gate_inp_w) {
+                const char* ffn_dev = ffn_gate_inp_w->buffer
+                    ? ggml_backend_buft_name(ggml_backend_buffer_get_type(ffn_gate_inp_w->buffer))
+                    : "unallocated";
+                std::fprintf(stderr,
+                    "[dev-check] prefill layer=%u ffn_gate_inp.backend=%s\n",
+                    il, ffn_dev);
+            }
+        }
+
         cur = build_norm(gf, cur, post_attention_norm, il);
 
         // ── MoE FFN：混合专家前馈网络 ───────────────────────────────────────
@@ -1046,6 +1106,15 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
+
+    // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
+    // ggml's CUDA-graph capture/replay does not support cross-device operations.
+    // Fall back to a fresh single-token eager prefill every step.
+    if (model_->is_mixed_mode()) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, scheduler);
+    }
+
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     DecodeGraphSignature requested_signature;
     requested_signature.slot_idx = slot_idx;
@@ -1053,6 +1122,8 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     requested_signature.n_batch_tokens = n_batch_tokens_;
     requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
     requested_signature.use_flash_attention = use_flash_attention_;
+    requested_signature.is_mixed_mode = model_->is_mixed_mode();
+    requested_signature.device_map_hash = model_->compute_device_map_hash();
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
@@ -1080,6 +1151,13 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
+
+    // Mixed GPU/CPU mode: fall back to eager single-token prefill.
+    if (model_->is_mixed_mode()) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
+    }
+
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
     DecodeGraphSignature requested_signature;
     requested_signature.slot_idx = slot_idx;
@@ -1087,6 +1165,8 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     requested_signature.n_batch_tokens = n_batch_tokens_;
     requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
     requested_signature.use_flash_attention = use_flash_attention_;
+    requested_signature.is_mixed_mode = model_->is_mixed_mode();
+    requested_signature.device_map_hash = model_->compute_device_map_hash();
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
