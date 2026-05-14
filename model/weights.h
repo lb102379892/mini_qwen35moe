@@ -67,5 +67,5 @@ public:
 class Qwen35moeWeights {
 public:
     std::unordered_map<EN_WEIGHT_TYPE, ggml_tensor*> heads;
-    std::unordered_map<int, std::shared_ptr<Qwen35moeLayer>> layers;
+    std::map<int, std::shared_ptr<Qwen35moeLayer>, std::less<int>> layers;
 };

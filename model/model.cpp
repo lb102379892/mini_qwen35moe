@@ -463,11 +463,15 @@ bool Qwen35moeModel::init_gpu() {
     return true;
 }
 
-bool Qwen35moeModel::init_auto_cpu(std::vector<struct tensor_info>::iterator& enditer) {
+bool Qwen35moeModel::init_auto_cpu(const int load_gpu_layer_index) {
     size_t use_byte = 0;
-    std::vector<struct tensor_info>::iterator beginiter = enditer;
-    for (; beginiter != loader_->tensors_layer_.end(); ++beginiter) {
-        use_byte += loader_->get_tensor_bytesize(*beginiter);
+    auto beginiter = loader_->tensor_layer_index_list_.find(load_gpu_layer_index);
+    ++beginiter;
+    auto new_beginiter = beginiter;
+    for (; beginiter != loader_->tensor_layer_index_list_.end(); ++beginiter) {
+        for (auto& index : beginiter->second) {
+            use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
+        }
     }
 
     ggml_init_params cpu_p = { use_byte, nullptr, true };
@@ -478,15 +482,17 @@ bool Qwen35moeModel::init_auto_cpu(std::vector<struct tensor_info>::iterator& en
     }
 
     cpu_weights_ = std::make_shared<Qwen35moeWeights>();
-    beginiter = enditer;
-    for (; beginiter != loader_->tensors_layer_.end(); ++beginiter) {
-        struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, beginiter->type, beginiter->n_dims, beginiter->dims);
-        if (NULL != cur) {
-            ggml_set_name(cur, beginiter->name.c_str());
-            if (cpu_weights_->layers.find(beginiter->layer_idx) == cpu_weights_->layers.end()) {
-                cpu_weights_->layers[beginiter->layer_idx] = std::make_shared<Qwen35moeLayer>();
+    for (; new_beginiter != loader_->tensor_layer_index_list_.end(); ++new_beginiter) {
+        for (auto& index : new_beginiter->second) {
+            auto* iter = &loader_->tensors_layer_[index];
+            struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, iter->type, iter->n_dims, iter->dims);
+            if (NULL != cur) {
+                ggml_set_name(cur, iter->name.c_str());
+                if (cpu_weights_->layers.find(iter->layer_idx) == cpu_weights_->layers.end()) {
+                    cpu_weights_->layers[iter->layer_idx] = std::make_shared<Qwen35moeLayer>();
+                }
+                cpu_weights_->layers[iter->layer_idx]->tensors[iter->weight_type] = cur;
             }
-            cpu_weights_->layers[beginiter->layer_idx]->tensors[beginiter->weight_type] = cur;
         }
     }
 
@@ -530,19 +536,22 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
             return false;
         }
     }
-    std::vector<struct tensor_info>::iterator enditer = loader_->tensors_layer_.begin();
-    for (; enditer != loader_->tensors_layer_.end(); ++enditer) {
-        curr_tensor_byte = loader_->get_tensor_bytesize(*enditer);
-        if (use_byte + curr_tensor_byte > free_mem) {
-            gpu_layer_ = curr_gpu_layer;
+    int load_gpu_layer_index = -1;
+    for (auto& layer_list : loader_->tensor_layer_index_list_) {
+        size_t layer_use_byte = 0;
+        size_t gpu_layer_num = layer_list.second.size();
+        for (auto& index : layer_list.second) {
+            layer_use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
+        }
+        if (
+            (use_byte + layer_use_byte > free_mem) || 
+            (gpu_layer_ > 0 && (curr_gpu_layer + gpu_layer_num > gpu_layer_))
+        ) {
             break;
         }
-        use_byte += curr_tensor_byte;
-        ++curr_gpu_layer;
-        if (gpu_layer_ > 0 && curr_gpu_layer >= gpu_layer_) {
-            gpu_layer_ = curr_gpu_layer;
-            break;
-        }
+        use_byte += layer_use_byte;
+        curr_gpu_layer += gpu_layer_num;
+        load_gpu_layer_index = layer_list.first;
     }
 
     ggml_init_params gpu_p = { use_byte, nullptr, true };
@@ -568,15 +577,21 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         }
     }
 
-    auto iter = loader_->tensors_layer_.begin();
-    for (; iter != enditer; ++iter) {
-        struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, iter->type, iter->n_dims, iter->dims);
-        if (NULL != cur) {
-            ggml_set_name(cur, iter->name.c_str());
-            if (gpu_weights_->layers.find(iter->layer_idx) == gpu_weights_->layers.end()) {
-                gpu_weights_->layers[iter->layer_idx] = std::make_shared<Qwen35moeLayer>();
+    for (auto& layer_list : loader_->tensor_layer_index_list_) {
+        if (layer_list.first > load_gpu_layer_index) {
+            break;
+        }
+
+        for (auto& index : layer_list.second) {
+            auto* iter = &loader_->tensors_layer_[index];
+            struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, iter->type, iter->n_dims, iter->dims);
+            if (NULL != cur) {
+                ggml_set_name(cur, iter->name.c_str());
+                if (gpu_weights_->layers.find(iter->layer_idx) == gpu_weights_->layers.end()) {
+                    gpu_weights_->layers[iter->layer_idx] = std::make_shared<Qwen35moeLayer>();
+                }
+                gpu_weights_->layers[iter->layer_idx]->tensors[iter->weight_type] = cur;
             }
-            gpu_weights_->layers[iter->layer_idx]->tensors[iter->weight_type] = cur;
         }
     }
 
@@ -602,11 +617,11 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
     }
     printf("[Loader] auto GPU weight loading complete\n");
 
-    if (enditer == loader_->tensors_layer_.end()) {
+    if (load_gpu_layer_index == loader_->tensor_layer_index_list_.end()->first) {
         return true;
     }
     
-    return init_auto_cpu(enditer);
+    return init_auto_cpu(load_gpu_layer_index);
 }
 
 bool Qwen35moeModel::load_metadata() {

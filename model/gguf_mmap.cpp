@@ -6,7 +6,6 @@
 #include <cstring>
 #include <algorithm>
 #include <string>
-#include <set>
 #include <ggml.h>
 #include <ggml-backend.h>
 #include "gguf_mmap.h"
@@ -383,7 +382,9 @@ bool GGUFLoader::prase_model_file() {
                     info.weight_type = iter->second;
                 }
                 tensors_layer_.push_back(info);
-                tensor_layer_index_map_[info.name] = tensors_layer_.size() - 1;
+                auto index = tensors_layer_.size() - 1;
+                tensor_layer_index_map_[info.name] = index;
+                tensor_layer_index_list_[info.layer_idx].insert(index);
             }
             
         }

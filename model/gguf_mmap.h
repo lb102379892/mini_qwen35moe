@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <ggml.h>
 #include <gguf.h>
@@ -317,6 +318,7 @@ public:
     std::map<std::string, size_t> kv_index_map_;
     std::vector<struct tensor_info> tensors_layer_;
     std::map<std::string, size_t> tensor_layer_index_map_;
+    std::map<int, std::set<size_t>, std::less<int>> tensor_layer_index_list_;
     std::map<std::string, struct tensor_info> tensors_head_;
     uint32_t alignment_idx_ = 0;
 
