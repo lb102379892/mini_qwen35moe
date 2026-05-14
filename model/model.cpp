@@ -105,6 +105,34 @@ ggml_backend_sched_t Qwen35moeModel::get_scheduler() const {
     return sched_; 
 }
 
+bool Qwen35moeModel::is_mixed_mode() const {
+    return dev_mode_ == DevMode::AUTO_MODE &&
+           gpu_weights_ != nullptr && !gpu_weights_->layers.empty() &&
+           cpu_weights_ != nullptr && !cpu_weights_->layers.empty();
+}
+
+uint64_t Qwen35moeModel::compute_device_map_hash() const {
+    if (dev_mode_ != DevMode::AUTO_MODE) {
+        return static_cast<uint64_t>(dev_mode_);
+    }
+    // FNV-1a-inspired mixing: encode layer index + device tag into the hash
+    uint64_t hash = 0xcbf29ce484222325ULL;  // FNV offset basis
+    constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
+    if (gpu_weights_) {
+        for (const auto& kv : gpu_weights_->layers) {
+            uint64_t v = (static_cast<uint64_t>(kv.first) << 1) | 0ULL;  // tag 0 = GPU
+            hash = (hash ^ v) * FNV_PRIME;
+        }
+    }
+    if (cpu_weights_) {
+        for (const auto& kv : cpu_weights_->layers) {
+            uint64_t v = (static_cast<uint64_t>(kv.first) << 1) | 1ULL;  // tag 1 = CPU
+            hash = (hash ^ v) * FNV_PRIME;
+        }
+    }
+    return hash;
+}
+
 ggml_tensor* Qwen35moeModel::get_weight_tensor(const EN_WEIGHT_TYPE weight_type) {
     if (dev_mode_ == DevMode::CPU_MODE)
         return cpu_weights_->heads[weight_type];

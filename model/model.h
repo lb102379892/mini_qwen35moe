@@ -29,6 +29,15 @@ public:
     bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, size_t gpu_layer = 0);
     ggml_backend_t get_curr_backend();
     ggml_backend_sched_t get_scheduler() const;
+
+    // Returns true when both GPU and CPU layers are present (AUTO_MODE with partial GPU offload).
+    // In this case the cached-decode-graph optimisation must be disabled to avoid device
+    // mismatch errors and incorrect CUDA-graph capture/replay.
+    bool is_mixed_mode() const;
+
+    // Compute a stable hash of the current layer→device assignment.
+    // Used as part of the decode-graph signature to prevent reuse across different mappings.
+    uint64_t compute_device_map_hash() const;
     ggml_tensor* get_weight_tensor(const EN_WEIGHT_TYPE weight_type);
     ggml_tensor* get_weight_layer_tensor(const EN_WEIGHT_TYPE layer_type, const int layer_idx);
     struct ggml_tensor* get_token_embedding_weight();
