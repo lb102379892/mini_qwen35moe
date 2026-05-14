@@ -607,6 +607,7 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         } else {
             loader_->load_tensor_head_data(head_iter.second);
         }
+        printf("Loaded auto head %s to GPU\n", head_iter.second->name);
     }
     auto layer_iter = gpu_weights_->layers.begin();
     for (; layer_iter != gpu_weights_->layers.end(); ++layer_iter) {
