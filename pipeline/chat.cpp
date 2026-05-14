@@ -108,6 +108,7 @@ int ChatEngine::sample_from_topk_candidates(const TopKSampleCandidates& candidat
 }
 
 bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response) {
+    printf("run_complete: prompt='%s', max_tokens=%d\n", prompt.c_str(), max_tokens);
     auto m = model_->meta_;
     forward_pass_->reset_sequence(0);
 

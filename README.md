@@ -15,6 +15,53 @@ cmake .. -DQWEN35MOE_CUDA=OFF -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CUDA_ARCHITECTURE
 make -j$(nproc)
 /home/xc/3rd/cmake-3.31.11-linux-x86_64/bin/cmake
 # Binary: build/test_qwen35moe
+
+
+./test_qwen35moe --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf --dev-mode gpu --temp 0.7 --top-p 0.9 --top-k 50 --ctx-size 4090 --threads 4
+./llama-server -c 4090 --temp 0.7 --top-p 0.9 --top-k 50 --ctx-size 4090 --threads 4 -m /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf 
+
+./test_qwen35moe --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf --dev-mode gpu --temp 0 --top-p 1 --top-k 1 --ctx-size 4090 --threads 4
+./llama-server -c 4090 --temp 0 --top-p 1 --top-k 1 --ctx-size 4090 --threads 4 -m /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf 
+
+date && curl -X POST http://localhost:6666/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "写个linux用c++语言实现的server示例，只要求代码"}
+    ],
+    "temperature": 0,
+    "max_tokens": 4096
+  }' && date
+
+./llama-server -c 4096 --temp 0.01 --top-p 1 --top-k 1 --ctx-size 4096 --threads 4 -m /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf --flash-attn on
+date && curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf",
+    "messages": [
+      {"role": "user", "content": "写个linux用c++语言实现的server示例，只要求代码"}
+    ],
+    "temperature": 0.01,
+    "max_tokens": 4096,
+    "stream": false
+  }' && date
+ ./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode gpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4
+date && curl -X POST http://localhost:6666/v1/chat/completions   -H "Content-Type: application/json"   -d '{
+    "messages":[{"role":"user","content":"写个linux用c++语言实现的server示例，只要求代码"}],
+    "temperature": 0.01,
+    "top_p": 1,
+    "top_k": 1,
+    "max_tokens": 4096,
+    "enable_thinking": false
+  }' && date
+date && curl -X POST http://localhost:6666/v1/chat/completions   -H "Content-Type: application/json"   -d '{
+    "messages":[{"role":"user","content":"写个linux用c++语言实现的server示例，只要求代码"}],
+    "temperature": 0.01,
+    "top_p": 1,
+    "top_k": 1,
+    "max_tokens": 4096,
+    "enable_thinking": true
+  }' && date
 ```
 
 Requires: CMake >= 3.14, C++17, Linux or macOS.
