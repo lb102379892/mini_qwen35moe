@@ -508,7 +508,7 @@ bool Qwen35moeModel::init_auto_cpu(const int load_gpu_layer_index) {
         for (auto& layer_info : layer_iter->second->tensors) {
             loader_->load_tensor_layer_data(layer_info.second);
         }
-        printf("Loaded layer %d to auto CPU\n", layer_iter->first);
+        printf("Loaded layer blk.%d.* to auto CPU\n", layer_iter->first);
     }
     printf("[Loader] auto CPU weight loading complete\n");
 
@@ -614,7 +614,7 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         for (auto& layer_info : layer_iter->second->tensors) {
             loader_->load_tensor_layer_data(layer_info.second);
         }
-        printf("Loaded auto layer %d to GPU\n", layer_iter->first);
+        printf("Loaded auto layer blk.%d.* to GPU\n", layer_iter->first);
     }
     printf("[Loader] auto GPU weight loading complete\n");
 
