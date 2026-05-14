@@ -1122,7 +1122,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     requested_signature.n_batch_tokens = n_batch_tokens_;
     requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
     requested_signature.use_flash_attention = use_flash_attention_;
-    requested_signature.is_mixed_mode = false;  // pure-GPU path only
+    requested_signature.is_mixed_mode = model_->is_mixed_mode();
     requested_signature.device_map_hash = model_->compute_device_map_hash();
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
@@ -1165,7 +1165,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     requested_signature.n_batch_tokens = n_batch_tokens_;
     requested_signature.n_ubatch_tokens = n_ubatch_tokens_;
     requested_signature.use_flash_attention = use_flash_attention_;
-    requested_signature.is_mixed_mode = false;  // pure-GPU path only
+    requested_signature.is_mixed_mode = model_->is_mixed_mode();
     requested_signature.device_map_hash = model_->compute_device_map_hash();
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
