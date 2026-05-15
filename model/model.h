@@ -75,7 +75,8 @@ public:
 private:
     bool init_cpu();
     bool init_gpu();
-    bool init_auto_cpu(const int load_gpu_layer_index);
+    bool is_full_attention_layer(uint32_t layer_idx) const;
+    bool init_auto_cpu(const std::set<int, std::less<int>>& gpu_layer_set);
     bool init_auto_gpu(size_t& free_mem);
 
     bool load_metadata();

@@ -496,12 +496,13 @@ bool Qwen35moeModel::init_gpu() {
     return true;
 }
 
-bool Qwen35moeModel::init_auto_cpu(const int load_gpu_layer_index) {
+bool Qwen35moeModel::init_auto_cpu(const std::set<int, std::less<int>>& gpu_layer_set) {
     size_t use_byte = 0;
-    auto beginiter = loader_->tensor_layer_index_list_.find(load_gpu_layer_index);
-    ++beginiter;
-    auto new_beginiter = beginiter;
+    auto beginiter = loader_->tensor_layer_index_list_.begin();
     for (; beginiter != loader_->tensor_layer_index_list_.end(); ++beginiter) {
+        if (gpu_layer_set.find(beginiter->first) != gpu_layer_set.end()) {
+            continue;
+        }
         for (auto& index : beginiter->second) {
             use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
         }
@@ -515,8 +516,12 @@ bool Qwen35moeModel::init_auto_cpu(const int load_gpu_layer_index) {
     }
 
     cpu_weights_ = std::make_shared<Qwen35moeWeights>();
-    for (; new_beginiter != loader_->tensor_layer_index_list_.end(); ++new_beginiter) {
-        for (auto& index : new_beginiter->second) {
+    beginiter = loader_->tensor_layer_index_list_.begin();
+    for (; beginiter != loader_->tensor_layer_index_list_.end(); ++beginiter) {
+        if (gpu_layer_set.find(beginiter->first) != gpu_layer_set.end()) {
+            continue;
+        }
+        for (auto& index : beginiter->second) {
             auto* iter = &loader_->tensors_layer_[index];
             struct ggml_tensor* cur = ggml_new_tensor(cpu_ctx_, iter->type, iter->n_dims, iter->dims);
             if (NULL != cur) {
@@ -548,6 +553,10 @@ bool Qwen35moeModel::init_auto_cpu(const int load_gpu_layer_index) {
     return true;
 }
 
+bool Qwen35moeModel::is_full_attention_layer(uint32_t layer_idx) const {
+    return (layer_idx % meta_->qwen35moe.full_attention_interval) == (meta_->qwen35moe.full_attention_interval - 1);
+}
+
 bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
     // 留出 10% 的余量，避免显存占满导致系统不稳定
     free_mem = (size_t)(free_mem * 0.9); 
@@ -555,6 +564,7 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
     size_t use_byte = 0;
     size_t curr_gpu_layer = 0;
     size_t curr_tensor_byte = 0;
+    // 输出头，必须优先放GPU
     for (auto& tensor_iter : loader_->tensors_head_) {
         auto* tensor_info = &tensor_iter.second;
         curr_tensor_byte = loader_->get_tensor_bytesize(*tensor_info);
@@ -569,11 +579,38 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
             return false;
         }
     }
-    int load_gpu_layer_index = -1;
-    for (auto& layer_list : loader_->tensor_layer_index_list_) {
+
+    // 间隔全注意力，优先全放 GPU
+    std::set<int, std::less<int>> gpu_layer_set;
+    auto iter = loader_->tensor_layer_index_list_.rbegin();
+    for (; iter != loader_->tensor_layer_index_list_.rend(); ++iter) {
+        if (is_full_attention_layer(iter->first)) {
+            size_t layer_use_byte = 0;
+            size_t gpu_layer_num = iter->second.size();
+            for (auto& index : iter->second) {
+                layer_use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
+            }
+            if (
+                (use_byte + layer_use_byte > free_mem) || 
+                (gpu_layer_ > 0 && (curr_gpu_layer + gpu_layer_num > gpu_layer_))
+            ) {
+                break;
+            }
+            use_byte += layer_use_byte;
+            curr_gpu_layer += gpu_layer_num;
+            gpu_layer_set.insert(iter->first);
+        }
+    }
+
+    // 末尾连续层的其余DeltaNet，优先全放GPU
+    iter = loader_->tensor_layer_index_list_.rbegin();
+    for (; iter != loader_->tensor_layer_index_list_.rend(); ++iter) {
+        if (gpu_layer_set.find(iter->first) != gpu_layer_set.end()) {
+            continue;
+        }
         size_t layer_use_byte = 0;
-        size_t gpu_layer_num = layer_list.second.size();
-        for (auto& index : layer_list.second) {
+        size_t gpu_layer_num = iter->second.size();
+        for (auto& index : iter->second) {
             layer_use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
         }
         if (
@@ -584,7 +621,7 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         }
         use_byte += layer_use_byte;
         curr_gpu_layer += gpu_layer_num;
-        load_gpu_layer_index = layer_list.first;
+        gpu_layer_set.insert(iter->first);
     }
 
     ggml_init_params gpu_p = { use_byte, nullptr, true };
@@ -611,8 +648,8 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
     }
 
     for (auto& layer_list : loader_->tensor_layer_index_list_) {
-        if (layer_list.first > load_gpu_layer_index) {
-            break;
+        if (gpu_layer_set.find(layer_list.first) == gpu_layer_set.end()) {
+            continue;
         }
 
         for (auto& index : layer_list.second) {
@@ -651,11 +688,11 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
     }
     printf("[Loader] auto GPU weight loading complete\n");
 
-    if (load_gpu_layer_index == loader_->tensor_layer_index_list_.end()->first) {
+    if (gpu_layer_set.size() == loader_->tensor_layer_index_list_.size()) {
         return true;
     }
     
-    return init_auto_cpu(load_gpu_layer_index);
+    return init_auto_cpu(gpu_layer_set);
 }
 
 bool Qwen35moeModel::load_metadata() {
