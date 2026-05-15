@@ -13,8 +13,6 @@ DeltaNetState::DeltaNetState(const DeltaNetStateParams& hp)
     : hp_(hp)
     , rec_slot_floats_(static_cast<size_t>(hp.head_v_dim) * hp.head_k_dim * hp.num_v_heads)
     , conv_slot_floats_(static_cast<size_t>(hp.conv_kernel > 0 ? hp.conv_kernel - 1 : 0) * hp.conv_channels)
-    , ctx_(nullptr, ggml_free)
-    , buf_(nullptr, ggml_backend_buffer_free)
 {
     if (hp_.n_dn_layers == 0)
         throw std::runtime_error("deltanet_state: n_dn_layers must be > 0");
@@ -25,42 +23,52 @@ DeltaNetState::DeltaNetState(const DeltaNetStateParams& hp)
 }
 
 void DeltaNetState::init_storage() {
-    // 2 tensors per DeltaNet layer (recurrent + conv) + small headroom
-    const size_t ctx_size = (static_cast<size_t>(hp_.n_dn_layers) * 2 + 64) * ggml_tensor_overhead();
-
-    struct ggml_init_params params = {
-        /* .mem_size   = */ ctx_size,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-    ctx_.reset(ggml_init(params));
-    if (!ctx_)
-        throw std::runtime_error("deltanet_state: ggml_init failed");
-
     rec_tensors_.resize(hp_.n_dn_layers);
     conv_tensors_.resize(hp_.n_dn_layers);
+    layer_ctxs_.clear();
+    layer_bufs_.clear();
+    layer_ctxs_.reserve(hp_.n_dn_layers);
+    layer_bufs_.reserve(hp_.n_dn_layers);
 
     for (uint32_t il = 0; il < hp_.n_dn_layers; ++il) {
+        const size_t ctx_size = (2 + 32) * ggml_tensor_overhead();
+        struct ggml_init_params params = {
+            /* .mem_size   = */ ctx_size,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        layer_ctxs_.emplace_back(ggml_init(params), ggml_free);
+        if (!layer_ctxs_.back())
+            throw std::runtime_error("deltanet_state: ggml_init failed");
+
         rec_tensors_[il] = ggml_new_tensor_2d(
-            ctx_.get(), GGML_TYPE_F32,
+            layer_ctxs_.back().get(), GGML_TYPE_F32,
             static_cast<int64_t>(rec_slot_floats_),
             static_cast<int64_t>(hp_.n_slots)
         );
 
         conv_tensors_[il] = ggml_new_tensor_2d(
-            ctx_.get(), GGML_TYPE_F32,
+            layer_ctxs_.back().get(), GGML_TYPE_F32,
             static_cast<int64_t>(conv_slot_floats_),
             static_cast<int64_t>(hp_.n_slots)
         );
+
+        ggml_backend_t backend = hp_.backend;
+        if (il < hp_.layer_backends.size() && hp_.layer_backends[il] != nullptr) {
+            backend = hp_.layer_backends[il];
+        }
+        if (!backend) {
+            throw std::runtime_error("deltanet_state: backend must be non-null");
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        layer_bufs_.emplace_back(
+            ggml_backend_alloc_ctx_tensors_from_buft(layer_ctxs_.back().get(), buft),
+            ggml_backend_buffer_free
+        );
+        if (!layer_bufs_.back()) {
+            throw std::runtime_error("deltanet_state: failed to allocate backend buffer");
+        }
     }
-
-    if (!hp_.backend)
-        throw std::runtime_error("deltanet_state: backend must be non-null");
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(hp_.backend);
-
-    buf_.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_.get(), buft));
-    if (!buf_)
-        throw std::runtime_error("deltanet_state: failed to allocate backend buffer");
 
     // Zero-initialise all tensors
     {
@@ -82,8 +90,11 @@ void DeltaNetState::reset_sequence(int seq_id) {
 }
 
 size_t DeltaNetState::memory_bytes() const {
-    if (!buf_) return 0;
-    return ggml_backend_buffer_get_size(buf_.get());
+    size_t total = 0;
+    for (const auto& b : layer_bufs_) {
+        total += ggml_backend_buffer_get_size(b.get());
+    }
+    return total;
 }
 
 // ── Tensor accessors ──────────────────────────────────────────────────────────

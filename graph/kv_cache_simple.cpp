@@ -1,4 +1,5 @@
 #include "graph/kv_cache_simple.h"
+#include <string>
 
 namespace {
 constexpr size_t KV_COPY_SCRATCH_BUFFER_SIZE = 1024 * 1024; // Stores temporary view metadata for per-layer KV copy views.
@@ -7,11 +8,12 @@ constexpr size_t KV_COPY_SCRATCH_BUFFER_SIZE = 1024 * 1024; // Stores temporary 
 simple_kv_cache::simple_kv_cache(
     uint32_t n_layers, uint32_t n_ctx_max, uint32_t n_batch_max,
     uint32_t n_embd_k, uint32_t n_embd_v, ggml_type type_k,
-    ggml_type type_v, ggml_backend_t backend
+    ggml_type type_v, ggml_backend_t backend,
+    const std::vector<ggml_backend_t>& layer_backends
 ) : n_layers(n_layers), n_ctx_max(n_ctx_max), n_batch_max(n_batch_max),
     n_embd_k(n_embd_k), n_embd_v(n_embd_v), type_k(type_k),
-    type_v(type_v), backend(backend), buf(nullptr, ggml_backend_buffer_free),
-    ctx(nullptr, ggml_free), scratch_ctx(nullptr, ggml_free) {
+    type_v(type_v), backend(backend), layer_backends_(layer_backends),
+    scratch_ctx(nullptr, ggml_free) {
     
     positions.resize(n_batch_max, 0);
     init_cache();
@@ -27,51 +29,75 @@ simple_kv_cache::simple_kv_cache(
 }
 
 void simple_kv_cache::init_cache() {
-    // Calculate memory for tensor metadata, including headroom for views
-    const size_t ctx_size = (n_layers * 2 + 512) * ggml_tensor_overhead();
-
-    // Create context with no_alloc=true
-    struct ggml_init_params params = {
-        .mem_size   = ctx_size,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,  // Don't allocate data
-    };
-    ctx.reset(ggml_init(params));
-
-    // Create tensors (metadata only, no data allocated yet)
+    // Create per-layer contexts and tensors (metadata only first)
     k_cache.resize(n_layers);
     v_cache.resize(n_layers);
+    layer_ctxs_.clear();
+    layer_bufs_.clear();
+    layer_ctxs_.reserve(n_layers);
+    layer_bufs_.reserve(n_layers);
+
+    std::vector<size_t> backend_layer_counts;
+    std::vector<const char*> backend_names;
+
+    const auto count_backend = [&](ggml_backend_t be) {
+        const char* name = be ? ggml_backend_name(be) : "CPU";
+        for (size_t i = 0; i < backend_names.size(); ++i) {
+            if (std::string(backend_names[i]) == name) {
+                backend_layer_counts[i]++;
+                return;
+            }
+        }
+        backend_names.push_back(name);
+        backend_layer_counts.push_back(1);
+    };
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        k_cache[il] = ggml_new_tensor_3d(ctx.get(), type_k, n_embd_k, n_ctx_max, n_batch_max);
-        v_cache[il] = ggml_new_tensor_3d(ctx.get(), type_v, n_embd_v, n_ctx_max, n_batch_max);
+        const size_t ctx_size = (2 + 64) * ggml_tensor_overhead();
+        struct ggml_init_params params = {
+            .mem_size   = ctx_size,
+            .mem_buffer = nullptr,
+            .no_alloc   = true,
+        };
+        layer_ctxs_.emplace_back(ggml_init(params), ggml_free);
+        GGML_ASSERT(layer_ctxs_.back());
+
+        k_cache[il] = ggml_new_tensor_3d(layer_ctxs_.back().get(), type_k, n_embd_k, n_ctx_max, n_batch_max);
+        v_cache[il] = ggml_new_tensor_3d(layer_ctxs_.back().get(), type_v, n_embd_v, n_ctx_max, n_batch_max);
+
+        ggml_backend_t layer_backend = backend;
+        if (il < layer_backends_.size() && layer_backends_[il] != nullptr) {
+            layer_backend = layer_backends_[il];
+        }
+        const ggml_backend_buffer_type_t buffer_type = layer_backend
+            ? ggml_backend_get_default_buffer_type(layer_backend)
+            : ggml_backend_cpu_buffer_type();
+        layer_bufs_.emplace_back(
+            ggml_backend_alloc_ctx_tensors_from_buft(layer_ctxs_.back().get(), buffer_type),
+            ggml_backend_buffer_free
+        );
+        GGML_ASSERT(layer_bufs_.back());
+
+        count_backend(layer_backend);
     }
 
-    // Choose buffer type based on backend availability
-    // If Metal backend provided, use it; otherwise fall back to CPU
-    ggml_backend_buffer_type_t buffer_type;
-    if (backend) {
-        buffer_type = ggml_backend_get_default_buffer_type(backend);
-    } else {
-        buffer_type = ggml_backend_cpu_buffer_type();
+    double total_mb = 0.0;
+    for (const auto& b : layer_bufs_) {
+        total_mb += ggml_backend_buffer_get_size(b.get()) / (1024.0 * 1024.0);
     }
-    
-    // Allocate buffer and assign all tensors to it
-    buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buffer_type));
-
-    // DEBUG: Verify cache buffer backend
-    if (buf) {
-        ggml_backend_buffer_type_t buf_type = ggml_backend_buffer_get_type(buf.get());
-        const char* buf_name = ggml_backend_buft_name(buf_type);
-        printf("KV cache allocated on: %s\n", buf_name);
-        printf("KV cache size: %.2f MB\n", ggml_backend_buffer_get_size(buf.get()) / (1024.0 * 1024.0));
-    } else {
-        printf("ERROR: KV cache buffer is NULL!\n");
+    std::printf("KV cache segmented allocation enabled (global reserve disabled for mixed decode)\n");
+    std::printf("KV cache total size: %.2f MB\n", total_mb);
+    for (size_t i = 0; i < backend_names.size(); ++i) {
+        std::printf("KV cache layers on %s: %zu\n", backend_names[i], backend_layer_counts[i]);
     }
 }
 
 size_t simple_kv_cache::memory_bytes() const {
-    return buf ? ggml_backend_buffer_get_size(buf.get()) : 0;
+    size_t total = 0;
+    for (const auto& b : layer_bufs_) {
+        total += ggml_backend_buffer_get_size(b.get());
+    }
+    return total;
 }
 
 ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uint32_t n_kv, uint32_t slot_idx) {

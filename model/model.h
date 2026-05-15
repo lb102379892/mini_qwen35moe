@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -38,6 +39,8 @@ public:
     // Compute a stable hash of the current layer→device assignment.
     // Used as part of the decode-graph signature to prevent reuse across different mappings.
     uint64_t compute_device_map_hash() const;
+    const std::vector<ggml_backend_t>& get_layer_device_map() const;
+    ggml_backend_t get_layer_backend(uint32_t layer_idx) const;
     ggml_tensor* get_weight_tensor(const EN_WEIGHT_TYPE weight_type);
     ggml_tensor* get_weight_layer_tensor(const EN_WEIGHT_TYPE layer_type, const int layer_idx);
     struct ggml_tensor* get_token_embedding_weight();
@@ -79,6 +82,7 @@ private:
     int get_ctx_size();
     void dequant_set(ggml_tensor* dst);
     void print_context_info(gguf_context* gguf_ctx, ggml_context* ctx_);
+    void rebuild_layer_device_map();
 
 public:
     DevMode dev_mode_ = DevMode::CPU_MODE;
@@ -97,4 +101,5 @@ public:
     ggml_backend_buffer_t cpu_buf_ = nullptr;
     ggml_context* gpu_ctx_ = nullptr;
     ggml_context* cpu_ctx_ = nullptr;
+    std::vector<ggml_backend_t> layer_device_map_;
 };

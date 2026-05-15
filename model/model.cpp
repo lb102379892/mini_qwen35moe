@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <set>
 #include <string>
 #include "model/model.h"
@@ -60,6 +61,7 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
 
     init_cpu();
     init_gpu();
+    rebuild_layer_device_map();
 
     // 权重加载完成释放模型文件占用的内存映射，避免占用过多内存
     loader_->unload();
@@ -112,25 +114,56 @@ bool Qwen35moeModel::is_mixed_mode() const {
 }
 
 uint64_t Qwen35moeModel::compute_device_map_hash() const {
-    if (dev_mode_ != DevMode::AUTO_MODE) {
+    if (layer_device_map_.empty()) {
         return static_cast<uint64_t>(dev_mode_);
     }
-    // FNV-1a-inspired mixing: encode layer index + device tag into the hash
+
     uint64_t hash = 0xcbf29ce484222325ULL;  // FNV offset basis
     constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
-    if (gpu_weights_) {
-        for (const auto& kv : gpu_weights_->layers) {
-            uint64_t v = (static_cast<uint64_t>(kv.first) << 1) | 0ULL;  // tag 0 = GPU
-            hash = (hash ^ v) * FNV_PRIME;
+    for (size_t il = 0; il < layer_device_map_.size(); ++il) {
+        uint64_t tag = 2ULL;
+        if (layer_device_map_[il] == backend_gpu_) {
+            tag = 0ULL;
+        } else if (layer_device_map_[il] == backend_cpu_) {
+            tag = 1ULL;
         }
-    }
-    if (cpu_weights_) {
-        for (const auto& kv : cpu_weights_->layers) {
-            uint64_t v = (static_cast<uint64_t>(kv.first) << 1) | 1ULL;  // tag 1 = CPU
-            hash = (hash ^ v) * FNV_PRIME;
-        }
+        uint64_t v = (static_cast<uint64_t>(il) << 2) | tag;
+        hash = (hash ^ v) * FNV_PRIME;
     }
     return hash;
+}
+
+const std::vector<ggml_backend_t>& Qwen35moeModel::get_layer_device_map() const {
+    return layer_device_map_;
+}
+
+ggml_backend_t Qwen35moeModel::get_layer_backend(uint32_t layer_idx) const {
+    if (layer_idx < layer_device_map_.size() && layer_device_map_[layer_idx] != nullptr) {
+        return layer_device_map_[layer_idx];
+    }
+    return dev_mode_ == DevMode::CPU_MODE ? backend_cpu_ : backend_gpu_;
+}
+
+void Qwen35moeModel::rebuild_layer_device_map() {
+    const size_t n_layers = meta_ ? static_cast<size_t>(meta_->qwen35moe.block_count) : 0;
+    layer_device_map_.assign(n_layers, backend_cpu_);
+    if (dev_mode_ == DevMode::GPU_MODE) {
+        std::fill(layer_device_map_.begin(), layer_device_map_.end(), backend_gpu_);
+        return;
+    }
+    if (dev_mode_ == DevMode::CPU_MODE) {
+        std::fill(layer_device_map_.begin(), layer_device_map_.end(), backend_cpu_);
+        return;
+    }
+    for (size_t il = 0; il < n_layers; ++il) {
+        ggml_backend_t backend = backend_cpu_;
+        if (gpu_weights_ && gpu_weights_->layers.find(static_cast<int>(il)) != gpu_weights_->layers.end()) {
+            backend = backend_gpu_;
+        } else if (cpu_weights_ && cpu_weights_->layers.find(static_cast<int>(il)) != cpu_weights_->layers.end()) {
+            backend = backend_cpu_;
+        }
+        layer_device_map_[il] = backend;
+    }
 }
 
 ggml_tensor* Qwen35moeModel::get_weight_tensor(const EN_WEIGHT_TYPE weight_type) {

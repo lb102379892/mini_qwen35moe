@@ -68,6 +68,12 @@ public:
     uint32_t get_cache_pos(uint32_t slot_idx) const;
 
 private:
+    struct LayerSegment {
+        uint32_t l0 = 0;
+        uint32_t l1 = 0;
+        ggml_backend_t backend = nullptr;
+    };
+
     struct DecodeGraphSignature {
         uint32_t slot_idx = 0;
         uint32_t kv_capacity = 0;
@@ -88,6 +94,37 @@ private:
     ggml_cgraph* new_graph();
 
     ggml_tensor* embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens);
+    ggml_tensor* build_layer_range(
+        ggml_cgraph* gf,
+        ggml_tensor* inpL,
+        ggml_tensor* inp_pos,
+        uint32_t n_tok,
+        uint32_t slot_idx,
+        uint32_t layer_begin,
+        uint32_t layer_end
+    );
+    ggml_cgraph* build_decode_segment_graph(
+        int32_t token,
+        int pos,
+        uint32_t slot_idx,
+        const LayerSegment& segment,
+        bool is_first_segment,
+        bool is_last_segment,
+        ggml_type hidden_type
+    );
+    ggml_cgraph* build_output_head_graph_from_hidden(ggml_type hidden_type);
+    void set_segment_inputs(
+        ggml_cgraph* gf,
+        int32_t token,
+        int pos,
+        ggml_type hidden_type,
+        const std::vector<uint8_t>* hidden_data,
+        uint32_t layer_begin,
+        uint32_t layer_end
+    );
+    std::vector<float> run_decode_segmented(int32_t token, int pos, uint32_t slot_idx);
+    TopKSampleCandidates run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx);
+    void rebuild_layer_segments();
 
     // Inline MoE FFN for one physical layer, after the pre-FFN norm has been applied.
     // Returns the FFN output (before residual). il is the physical layer index.
@@ -358,4 +395,5 @@ private:
     // on key layer boundaries (attention + ffn entry). Disabled by default so that
     // release performance is unaffected.
     bool dev_check_enabled_ = false;
+    std::vector<LayerSegment> layer_segments_;
 };
