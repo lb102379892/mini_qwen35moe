@@ -172,7 +172,7 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
 
     rebuild_layer_segments();
     if (model_->is_mixed_mode()) {
-        std::fprintf(stderr, "[dev-mode=auto] decode execution mode: segmented reserve (global reserve disabled)\n");
+        //std::fprintf(stderr, "[dev-mode=auto] decode execution mode: segmented reserve (global reserve disabled)\n");
         for (size_t i = 0; i < layer_segments_.size(); ++i) {
             std::fprintf(stderr,
                 "[dev-mode=auto] segment[%zu]=[%u,%u) backend=%s\n",
@@ -1071,13 +1071,13 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: segment alloc failed");
         }
         const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
-        std::fprintf(stderr,
-            "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
-            i,
-            layer_segments_[i].l0,
-            layer_segments_[i].l1,
-            ggml_backend_name(layer_segments_[i].backend),
-            reserve_bytes);
+        // std::fprintf(stderr,
+        //     "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
+        //     i,
+        //     layer_segments_[i].l0,
+        //     layer_segments_[i].l1,
+        //     ggml_backend_name(layer_segments_[i].backend),
+        //     reserve_bytes);
 
         set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
         ggml_backend_graph_compute(layer_segments_[i].backend, gf);
@@ -1109,7 +1109,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
-    std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
+    //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
     std::vector<float> logits = get_output_logits(gf_head);
     ggml_gallocr_free(head_alloc);
@@ -1139,13 +1139,13 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: segment alloc failed");
         }
         const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
-        std::fprintf(stderr,
-            "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
-            i,
-            layer_segments_[i].l0,
-            layer_segments_[i].l1,
-            ggml_backend_name(layer_segments_[i].backend),
-            reserve_bytes);
+        // std::fprintf(stderr,
+        //     "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
+        //     i,
+        //     layer_segments_[i].l0,
+        //     layer_segments_[i].l1,
+        //     ggml_backend_name(layer_segments_[i].backend),
+        //     reserve_bytes);
 
         set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
         ggml_backend_graph_compute(layer_segments_[i].backend, gf);
@@ -1177,7 +1177,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
-    std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
+    //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
     TopKSampleCandidates result = get_output_topk_candidates(gf_head, 0);
     ggml_gallocr_free(head_alloc);

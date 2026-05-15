@@ -62,6 +62,8 @@ date && curl -X POST http://localhost:6666/v1/chat/completions   -H "Content-Typ
     "max_tokens": 4096,
     "enable_thinking": true
   }' && date
+
+ ./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode auto   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --gpu-layer 200
 ```
 
 Requires: CMake >= 3.14, C++17, Linux or macOS.
