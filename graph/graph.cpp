@@ -1111,9 +1111,10 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
+    std::vector<float> logits = get_output_logits(gf_head);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
-    return get_output_logits(gf_head);
+    return logits;
 }
 
 TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx) {
@@ -1178,9 +1179,10 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
+    TopKSampleCandidates result = get_output_topk_candidates(gf_head, 0);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
-    return get_output_topk_candidates(gf_head, 0);
+    return result;
 }
 
 /**
