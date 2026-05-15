@@ -1,5 +1,6 @@
 #include "graph/kv_cache_simple.h"
 #include <string>
+#include <unordered_map>
 
 namespace {
 constexpr size_t KV_COPY_SCRATCH_BUFFER_SIZE = 1024 * 1024; // Stores temporary view metadata for per-layer KV copy views.
@@ -38,18 +39,19 @@ void simple_kv_cache::init_cache() {
     layer_bufs_.reserve(n_layers);
 
     std::vector<size_t> backend_layer_counts;
-    std::vector<const char*> backend_names;
+    std::vector<std::string> backend_names;
+    std::unordered_map<std::string, size_t> backend_index;
 
     const auto count_backend = [&](ggml_backend_t be) {
-        const char* name = be ? ggml_backend_name(be) : "CPU";
-        for (size_t i = 0; i < backend_names.size(); ++i) {
-            if (std::string(backend_names[i]) == name) {
-                backend_layer_counts[i]++;
-                return;
-            }
+        const std::string name = be ? ggml_backend_name(be) : "CPU";
+        const auto it = backend_index.find(name);
+        if (it != backend_index.end()) {
+            backend_layer_counts[it->second]++;
+            return;
         }
         backend_names.push_back(name);
         backend_layer_counts.push_back(1);
+        backend_index.emplace(name, backend_names.size() - 1);
     };
 
     for (uint32_t il = 0; il < n_layers; ++il) {
@@ -88,7 +90,7 @@ void simple_kv_cache::init_cache() {
     std::printf("KV cache segmented allocation enabled (global reserve disabled for mixed decode)\n");
     std::printf("KV cache total size: %.2f MB\n", total_mb);
     for (size_t i = 0; i < backend_names.size(); ++i) {
-        std::printf("KV cache layers on %s: %zu\n", backend_names[i], backend_layer_counts[i]);
+        std::printf("KV cache layers on %s: %zu\n", backend_names[i].c_str(), backend_layer_counts[i]);
     }
 }
 
