@@ -142,11 +142,14 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
 
     // 创建 KV 缓存：用于存储注意力机制的 Key/Value 张量
     // Qwen3.5-MoE 有 10 个 Full Attention 层
-    // In mixed GPU/CPU mode the cached-decode-graph path is disabled (eager fallback).
-    // KV cache stays on GPU so that pure-GPU attention layers can access it without copies.
-    // When CPU attention layers are scheduled the ggml backend scheduler inserts the
-    // necessary GPU→CPU copies automatically.
     ggml_backend_t cache_backend = model_->get_curr_backend();
+    std::vector<ggml_backend_t> kv_layer_backends(static_cast<size_t>(kv_idx), cache_backend);
+    for (uint32_t il = 0; il < m.block_count; ++il) {
+        const int32_t mapped = kv_layer_map_[il];
+        if (mapped >= 0) {
+            kv_layer_backends[static_cast<size_t>(mapped)] = model_->get_layer_backend(il);
+        }
+    }
     if (model_->is_mixed_mode()) {
         std::fprintf(stderr,
             "[dev-mode=auto] mixed GPU/CPU detected (device_map_hash=0x%llx): "
@@ -163,12 +166,33 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
         max_batch_size_,                      // 最大批大小
         n_embd_k, n_embd_v,                   // K/V 维度
         GGML_TYPE_F16, GGML_TYPE_F16,         // 数据类型
-        cache_backend                         // 后端设备
+        cache_backend,                        // 默认后端设备
+        kv_layer_backends                     // 每层设备映射
     );
+
+    rebuild_layer_segments();
+    if (model_->is_mixed_mode()) {
+        std::fprintf(stderr, "[dev-mode=auto] decode execution mode: segmented reserve (global reserve disabled)\n");
+        for (size_t i = 0; i < layer_segments_.size(); ++i) {
+            std::fprintf(stderr,
+                "[dev-mode=auto] segment[%zu]=[%u,%u) backend=%s\n",
+                i,
+                layer_segments_[i].l0,
+                layer_segments_[i].l1,
+                ggml_backend_name(layer_segments_[i].backend));
+        }
+    }
 
     // 创建 DeltaNet 状态：用于存储 DeltaNet 层的循环状态
     // Qwen3.5-MoE 有 30 个 DeltaNet 层
     const int n_dn_layers = dn_idx;
+    std::vector<ggml_backend_t> dn_layer_backends(static_cast<size_t>(n_dn_layers), cache_backend);
+    for (uint32_t il = 0; il < m.block_count; ++il) {
+        const int32_t mapped = dn_layer_map_[il];
+        if (mapped >= 0) {
+            dn_layer_backends[static_cast<size_t>(mapped)] = model_->get_layer_backend(il);
+        }
+    }
     const uint32_t d_inner       = m.inner_size;     // 内部维度 = 4096
     const uint32_t num_v_heads   = m.time_step_rank; // V 头数量 = 32
     const uint32_t num_k_heads   = m.group_count;    // K 头数量 = 16
@@ -183,7 +207,8 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
         num_v_heads,
         conv_channels,
         m.conv_kernel, // 卷积核大小 = 4
-        cache_backend
+        cache_backend,
+        dn_layer_backends
     };
     dn_state_ = std::make_unique<DeltaNetState>(dn_state_hp);
 
@@ -549,22 +574,6 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
     ggml_cgraph* gf = new_graph();
 
     auto& m = model_->meta_->qwen35moe;
-    const uint32_t d_inner = m.inner_size;
-    const uint32_t num_v_heads = m.time_step_rank;
-    const uint32_t num_k_heads = m.group_count;
-    const uint32_t head_v_dim = d_inner / num_v_heads;
-    const uint32_t conv_channels = d_inner + 2 * num_k_heads * m.state_size;
-    
-    // DeltaNet 参数配置
-    DeltaNetStateParams dn_hp {
-        0, 0,             // n_dn_layers / n_slots 在 helper 中不使用
-        head_v_dim,
-        m.state_size,
-        num_v_heads,
-        conv_channels,
-        m.conv_kernel,
-        nullptr
-    };
 
     // 1. Token Embedding：将 token ID 转换为词向量
     ggml_tensor* inpL = embedding(gf, tokens);
@@ -577,37 +586,58 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
     ggml_build_forward_expand(gf, inp_pos);
 
     // 3. Transformer 层循环
-    for (uint32_t il = 0; il < m.block_count; ++il) {
-        ggml_tensor* inpSA = inpL;  // 保存残差连接的输入
+    inpL = build_layer_range(gf, inpL, inp_pos, n_tok, slot_idx, 0, m.block_count);
 
-        // ── Pre-attention RMSNorm ───────────────────────────────────────────
-        struct ggml_tensor* attn_norm_weight = model_->get_attn_norm_weight(il);
+    // 4. 最终归一化 + LM Head（输出 logits）
+    build_output_head(gf, inpL);
 
-        // Optional device consistency log (QWEN35MOE_DEV_CHECK=1)
+    return gf;
+}
+
+ggml_tensor* Qwen35moeForwardPass::build_layer_range(
+    ggml_cgraph* gf,
+    ggml_tensor* inpL,
+    ggml_tensor* inp_pos,
+    uint32_t n_tok,
+    uint32_t slot_idx,
+    uint32_t layer_begin,
+    uint32_t layer_end
+) {
+    auto& m = model_->meta_->qwen35moe;
+    const uint32_t d_inner = m.inner_size;
+    const uint32_t num_v_heads = m.time_step_rank;
+    const uint32_t num_k_heads = m.group_count;
+    const uint32_t head_v_dim = d_inner / num_v_heads;
+    const uint32_t conv_channels = d_inner + 2 * num_k_heads * m.state_size;
+    DeltaNetStateParams dn_hp {
+        0, 0,
+        head_v_dim,
+        m.state_size,
+        num_v_heads,
+        conv_channels,
+        m.conv_kernel,
+        nullptr
+    };
+
+    for (uint32_t il = layer_begin; il < layer_end; ++il) {
+        ggml_tensor* inpSA = inpL;
+        ggml_tensor* attn_norm_weight = model_->get_attn_norm_weight(il);
         if (dev_check_enabled_ && attn_norm_weight) {
             const char* norm_dev = attn_norm_weight->buffer
                 ? ggml_backend_buft_name(ggml_backend_buffer_get_type(attn_norm_weight->buffer))
                 : "unallocated";
-            std::fprintf(stderr,
-                "[dev-check] prefill layer=%u attn_norm_weight.backend=%s\n",
-                il, norm_dev);
+            std::fprintf(stderr, "[dev-check] prefill layer=%u attn_norm_weight.backend=%s\n", il, norm_dev);
         }
 
         ggml_tensor* cur = build_norm(gf, inpL, attn_norm_weight, il);
-
-        // ── Attention 或 DeltaNet 层 ────────────────────────────────────────
         if (is_full_attention_layer(il)) {
-            // Full Attention 层：使用标准多头注意力 + KV 缓存
             int kv_idx = kv_layer_map_[il];
-
-            // Gated Attention：联合 Q+Gate 投影，Q 权重输出
-            // [(n_embd_head*2)*n_head, n_tokens]
-            struct ggml_tensor* attn_q_weight = model_->get_attn_q_weight(il);
-            struct ggml_tensor* attn_q_norm_weight = model_->get_attn_q_norm_weight(il);
-            struct ggml_tensor* attn_k_weight = model_->get_attn_k_weight(il);
-            struct ggml_tensor* attn_k_norm_weight = model_->get_attn_k_norm_weight(il);
-            struct ggml_tensor* attn_v_weight = model_->get_attn_v_weight(il);
-            struct ggml_tensor* attn_output_weight = model_->get_attn_output_weight(il);
+            ggml_tensor* attn_q_weight = model_->get_attn_q_weight(il);
+            ggml_tensor* attn_q_norm_weight = model_->get_attn_q_norm_weight(il);
+            ggml_tensor* attn_k_weight = model_->get_attn_k_weight(il);
+            ggml_tensor* attn_k_norm_weight = model_->get_attn_k_norm_weight(il);
+            ggml_tensor* attn_v_weight = model_->get_attn_v_weight(il);
+            ggml_tensor* attn_output_weight = model_->get_attn_output_weight(il);
 
             if (dev_check_enabled_ && attn_q_weight && attn_k_weight) {
                 const char* q_dev = attn_q_weight->buffer
@@ -631,54 +661,56 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
 
             cur = build_gated_attention(
                 ctx_, gf, kv_cache_.get(), cur, inp_pos,
-                kv_idx, n_tok, slot_idx, il, attn_q_weight, 
+                kv_idx, n_tok, slot_idx, il, attn_q_weight,
                 attn_q_norm_weight, attn_k_weight, attn_k_norm_weight, attn_v_weight, attn_output_weight,
                 m.key_length, m.head_count, m.head_count_kv, m.dimension_count, m.freq_base,
                 static_cast<int>(context_len_), m.layer_norm_rms_epsilon
             );
         } else {
-            // DeltaNet 层：使用门控 delta 网络进行高效序列建模
             uint32_t dn_idx = static_cast<uint32_t>(dn_layer_map_[il]);
-            cur = build_dn_layer(ctx_, gf, cur, dn_state_.get(), dn_hp, num_k_heads, 
+            cur = build_dn_layer(ctx_, gf, cur, dn_state_.get(), dn_hp, num_k_heads,
                 m.embedding_length, dn_idx, n_tok, slot_idx, m.layer_norm_rms_epsilon, il
             );
         }
 
-        // ── 残差连接 1 (Attention / DeltaNet) ───────────────────────────────
         cur = ggml_add(ctx_, cur, inpSA);
 
-        // ── Pre-FFN RMSNorm ─────────────────────────────────────────────────
         ggml_tensor* ffn_inp = cur;
-        struct ggml_tensor* post_attention_norm = model_->get_post_attention_norm_weight(il);
-
+        ggml_tensor* post_attention_norm = model_->get_post_attention_norm_weight(il);
         if (dev_check_enabled_) {
-            struct ggml_tensor* ffn_gate_inp_w = model_->get_ffn_gate_inp_weight(il);
+            ggml_tensor* ffn_gate_inp_w = model_->get_ffn_gate_inp_weight(il);
             if (ffn_gate_inp_w) {
                 const char* ffn_dev = ffn_gate_inp_w->buffer
                     ? ggml_backend_buft_name(ggml_backend_buffer_get_type(ffn_gate_inp_w->buffer))
                     : "unallocated";
-                std::fprintf(stderr,
-                    "[dev-check] prefill layer=%u ffn_gate_inp.backend=%s\n",
-                    il, ffn_dev);
+                std::fprintf(stderr, "[dev-check] prefill layer=%u ffn_gate_inp.backend=%s\n", il, ffn_dev);
             }
         }
 
         cur = build_norm(gf, cur, post_attention_norm, il);
-
-        // ── MoE FFN：混合专家前馈网络 ───────────────────────────────────────
         cur = build_moe_layer(ctx_, gf, cur, il);
-
-        // ── 残差连接 2 (FFN) ────────────────────────────────────────────────
         cur = ggml_add(ctx_, cur, ffn_inp);
         set_tensor_name(cur, "layer_out", il);
-
-        inpL = cur;  // 更新输入为当前层输出
+        inpL = cur;
     }
+    return inpL;
+}
 
-    // 4. 最终归一化 + LM Head（输出 logits）
-    build_output_head(gf, inpL);
-
-    return gf;
+void Qwen35moeForwardPass::rebuild_layer_segments() {
+    layer_segments_.clear();
+    const auto& device_map = model_->get_layer_device_map();
+    if (device_map.empty()) {
+        return;
+    }
+    uint32_t i = 0;
+    while (i < device_map.size()) {
+        uint32_t j = i + 1;
+        while (j < device_map.size() && device_map[j] == device_map[i]) {
+            ++j;
+        }
+        layer_segments_.push_back(LayerSegment{i, j, device_map[i]});
+        i = j;
+    }
 }
 
 /**
@@ -926,6 +958,231 @@ void Qwen35moeForwardPass::set_batched_inputs(ggml_cgraph* gf, const std::vector
     }
 }
 
+ggml_cgraph* Qwen35moeForwardPass::build_decode_segment_graph(
+    int32_t token,
+    int pos,
+    uint32_t slot_idx,
+    const LayerSegment& segment,
+    bool is_first_segment,
+    bool is_last_segment,
+    ggml_type hidden_type
+) {
+    (void)is_last_segment;
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_set_input(inp_pos);
+    set_tensor_name(inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    ggml_tensor* inpL = nullptr;
+    if (is_first_segment) {
+        std::vector<int32_t> token_vec = { token };
+        inpL = embedding(gf, token_vec);
+        set_tensor_name(inpL, "inpL");
+    } else {
+        const int64_t n_embd = static_cast<int64_t>(model_->meta_->qwen35moe.embedding_length);
+        inpL = ggml_new_tensor_2d(ctx_, hidden_type, n_embd, 1);
+        ggml_set_input(inpL);
+        set_tensor_name(inpL, "segment_hidden_in");
+        ggml_build_forward_expand(gf, inpL);
+    }
+
+    inpL = build_layer_range(gf, inpL, inp_pos, 1, slot_idx, segment.l0, segment.l1);
+    set_tensor_name(inpL, "segment_hidden_out");
+    ggml_build_forward_expand(gf, inpL);
+
+    return gf;
+}
+
+ggml_cgraph* Qwen35moeForwardPass::build_output_head_graph_from_hidden(ggml_type hidden_type) {
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+    const int64_t n_embd = static_cast<int64_t>(model_->meta_->qwen35moe.embedding_length);
+    ggml_tensor* inpL = ggml_new_tensor_2d(ctx_, hidden_type, n_embd, 1);
+    ggml_set_input(inpL);
+    set_tensor_name(inpL, "segment_hidden_in");
+    ggml_build_forward_expand(gf, inpL);
+    build_output_head(gf, inpL);
+    return gf;
+}
+
+void Qwen35moeForwardPass::set_segment_inputs(
+    ggml_cgraph* gf,
+    int32_t token,
+    int pos,
+    ggml_type hidden_type,
+    const std::vector<uint8_t>* hidden_data,
+    uint32_t layer_begin,
+    uint32_t layer_end
+) {
+    if (ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens")) {
+        ggml_backend_tensor_set(tok_t, &token, 0, sizeof(token));
+    }
+    if (ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos")) {
+        ggml_backend_tensor_set(pos_t, &pos, 0, sizeof(pos));
+    }
+    if (ggml_tensor* hidden_t = ggml_graph_get_tensor(gf, "segment_hidden_in")) {
+        if (hidden_data == nullptr) {
+            throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: hidden input missing");
+        }
+        if (hidden_t->type != hidden_type || static_cast<size_t>(ggml_nbytes(hidden_t)) != hidden_data->size()) {
+            throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: hidden tensor mismatch");
+        }
+        ggml_backend_tensor_set(hidden_t, hidden_data->data(), 0, hidden_data->size());
+    }
+
+    for (uint32_t il = layer_begin; il < layer_end; ++il) {
+        if (!is_full_attention_layer(il)) {
+            continue;
+        }
+        char name[32];
+        std::snprintf(name, sizeof(name), "kq_mask.%u", il);
+        ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, name);
+        if (!kq_mask) {
+            continue;
+        }
+        const uint32_t n_kv = static_cast<uint32_t>(kq_mask->ne[0]);
+        std::vector<float> mask(n_kv, -INFINITY);
+        for (uint32_t j = 0; j <= static_cast<uint32_t>(pos) && j < n_kv; ++j) {
+            mask[j] = 0.0f;
+        }
+        set_mask_data(kq_mask, mask);
+    }
+}
+
+std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int pos, uint32_t slot_idx) {
+    if (layer_segments_.empty()) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, nullptr);
+    }
+
+    std::vector<uint8_t> hidden_data;
+    ggml_type hidden_type = GGML_TYPE_F32;
+    for (size_t i = 0; i < layer_segments_.size(); ++i) {
+        const bool first = i == 0;
+        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, layer_segments_[i], first, false, hidden_type);
+
+        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(layer_segments_[i].backend);
+        ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
+        if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: segment alloc failed");
+        }
+        const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
+        std::fprintf(stderr,
+            "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
+            i,
+            layer_segments_[i].l0,
+            layer_segments_[i].l1,
+            ggml_backend_name(layer_segments_[i].backend),
+            reserve_bytes);
+
+        set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
+        ggml_backend_graph_compute(layer_segments_[i].backend, gf);
+
+        ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
+        if (!hidden_out) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: missing segment_hidden_out");
+        }
+        hidden_type = hidden_out->type;
+        hidden_data.resize(static_cast<size_t>(ggml_nbytes(hidden_out)));
+        ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size());
+        ggml_gallocr_free(seg_alloc);
+    }
+
+    ggml_cgraph* gf_head = build_output_head_graph_from_hidden(hidden_type);
+    ggml_backend_t head_backend = model_->get_curr_backend();
+    ggml_gallocr_t head_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(head_backend));
+    if (!ggml_gallocr_alloc_graph(head_alloc, gf_head)) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head alloc failed");
+    }
+    if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
+        if (hidden_data.empty() || hidden_in->type != hidden_type ||
+            static_cast<size_t>(ggml_nbytes(hidden_in)) != hidden_data.size()) {
+            ggml_gallocr_free(head_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head hidden mismatch");
+        }
+        ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
+    }
+    const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
+    std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
+    ggml_backend_graph_compute(head_backend, gf_head);
+    ggml_gallocr_free(head_alloc);
+    advance_cache(1, slot_idx);
+    return get_output_logits(gf_head);
+}
+
+TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx) {
+    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: device sampling not configured");
+    }
+    if (layer_segments_.empty()) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, nullptr);
+    }
+
+    std::vector<uint8_t> hidden_data;
+    ggml_type hidden_type = GGML_TYPE_F32;
+    for (size_t i = 0; i < layer_segments_.size(); ++i) {
+        const bool first = i == 0;
+        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, layer_segments_[i], first, false, hidden_type);
+
+        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(layer_segments_[i].backend);
+        ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
+        if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: segment alloc failed");
+        }
+        const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
+        std::fprintf(stderr,
+            "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
+            i,
+            layer_segments_[i].l0,
+            layer_segments_[i].l1,
+            ggml_backend_name(layer_segments_[i].backend),
+            reserve_bytes);
+
+        set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
+        ggml_backend_graph_compute(layer_segments_[i].backend, gf);
+
+        ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
+        if (!hidden_out) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: missing segment_hidden_out");
+        }
+        hidden_type = hidden_out->type;
+        hidden_data.resize(static_cast<size_t>(ggml_nbytes(hidden_out)));
+        ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size());
+        ggml_gallocr_free(seg_alloc);
+    }
+
+    ggml_cgraph* gf_head = build_output_head_graph_from_hidden(hidden_type);
+    ggml_backend_t head_backend = model_->get_curr_backend();
+    ggml_gallocr_t head_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(head_backend));
+    if (!ggml_gallocr_alloc_graph(head_alloc, gf_head)) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head alloc failed");
+    }
+    if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
+        if (hidden_data.empty() || hidden_in->type != hidden_type ||
+            static_cast<size_t>(ggml_nbytes(hidden_in)) != hidden_data.size()) {
+            ggml_gallocr_free(head_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head hidden mismatch");
+        }
+        ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
+    }
+    const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
+    std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
+    ggml_backend_graph_compute(head_backend, gf_head);
+    ggml_gallocr_free(head_alloc);
+    advance_cache(1, slot_idx);
+    return get_output_topk_candidates(gf_head, 0);
+}
+
 /**
  * @brief 执行 Prefill 阶段推理
  * 
@@ -1109,10 +1366,9 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
 
     // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
     // ggml's CUDA-graph capture/replay does not support cross-device operations.
-    // Fall back to a fresh single-token eager prefill every step.
+    // Force segmented eager execution with per-backend allocators.
     if (model_->is_mixed_mode()) {
-        std::vector<int32_t> token_vec = { token };
-        return run_prefill(token_vec, pos, slot_idx, scheduler);
+        return run_decode_segmented(token, pos, slot_idx);
     }
 
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
@@ -1152,10 +1408,9 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
 
-    // Mixed GPU/CPU mode: fall back to eager single-token prefill.
+    // Mixed GPU/CPU mode: force segmented eager decode.
     if (model_->is_mixed_mode()) {
-        std::vector<int32_t> token_vec = { token };
-        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
+        return run_decode_segmented_topk(token, pos, slot_idx);
     }
 
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;

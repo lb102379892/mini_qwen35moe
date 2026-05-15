@@ -48,6 +48,7 @@ struct DeltaNetStateParams {
     uint32_t       conv_channels;  // full conv channel width
     uint32_t       conv_kernel;    // causal conv1d kernel size (e.g. 4)
     ggml_backend_t backend;        // nullptr → CPU backend
+    std::vector<ggml_backend_t> layer_backends;
 };
 
 struct DeltaNetParams {
@@ -114,8 +115,8 @@ private:
     size_t rec_slot_floats_;    // head_v_dim * head_k_dim * num_v_heads
     size_t conv_slot_floats_;   // (conv_kernel - 1) * conv_channels
 
-    std::unique_ptr<ggml_context, void(*)(ggml_context*)> ctx_;
-    std::unique_ptr<ggml_backend_buffer, void(*)(ggml_backend_buffer*)> buf_;
+    std::vector<std::unique_ptr<ggml_context, void(*)(ggml_context*)>> layer_ctxs_;
+    std::vector<std::unique_ptr<ggml_backend_buffer, void(*)(ggml_backend_buffer*)>> layer_bufs_;
 
     std::vector<ggml_tensor*> rec_tensors_;   // [n_dn_layers]: [rec_slot_floats, n_slots]
     std::vector<ggml_tensor*> conv_tensors_;  // [n_dn_layers]: [conv_slot_floats, n_slots]

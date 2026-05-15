@@ -11,7 +11,8 @@ public:
     simple_kv_cache(
         uint32_t n_layers, uint32_t n_ctx_max, uint32_t n_batch_max,
         uint32_t n_embd_k, uint32_t n_embd_v, ggml_type type_k = GGML_TYPE_F16,
-        ggml_type type_v = GGML_TYPE_F16, ggml_backend_t backend = nullptr // Optional backend parameter
+        ggml_type type_v = GGML_TYPE_F16, ggml_backend_t backend = nullptr,
+        const std::vector<ggml_backend_t>& layer_backends = {}
     );  
 
     ~simple_kv_cache() = default;
@@ -74,13 +75,14 @@ private:
     const uint32_t n_embd_v;
     const ggml_type type_k;
     const ggml_type type_v;
-    ggml_backend_t backend;  // Store backend reference
+    ggml_backend_t backend;  // default backend
+    std::vector<ggml_backend_t> layer_backends_;
 
     std::vector<uint32_t> positions;
 
-    // Backend buffer and context
-    std::unique_ptr<ggml_backend_buffer, void(*)(ggml_backend_buffer*)> buf;
-    std::unique_ptr<ggml_context, void(*)(ggml_context*)> ctx;
+    // Per-layer backend buffer and context
+    std::vector<std::unique_ptr<ggml_backend_buffer, void(*)(ggml_backend_buffer*)>> layer_bufs_;
+    std::vector<std::unique_ptr<ggml_context, void(*)(ggml_context*)>> layer_ctxs_;
 
     // Persistent cache tensors (allocated in buf)
     std::vector<ggml_tensor*> k_cache;  // One per layer
