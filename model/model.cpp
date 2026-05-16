@@ -580,34 +580,10 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         }
     }
 
-    // 间隔全注意力，优先全放 GPU
+    // 末尾连续层的其余DeltaNet+间隔全注意力，优先全放 GPU
     std::set<int, std::less<int>> gpu_layer_set;
     auto iter = loader_->tensor_layer_index_list_.rbegin();
     for (; iter != loader_->tensor_layer_index_list_.rend(); ++iter) {
-        if (is_full_attention_layer(iter->first)) {
-            size_t layer_use_byte = 0;
-            size_t gpu_layer_num = iter->second.size();
-            for (auto& index : iter->second) {
-                layer_use_byte += loader_->get_tensor_bytesize(loader_->tensors_layer_[index]);
-            }
-            if (
-                (use_byte + layer_use_byte > free_mem) || 
-                (gpu_layer_ > 0 && (curr_gpu_layer + gpu_layer_num > gpu_layer_))
-            ) {
-                break;
-            }
-            use_byte += layer_use_byte;
-            curr_gpu_layer += gpu_layer_num;
-            gpu_layer_set.insert(iter->first);
-        }
-    }
-
-    // 末尾连续层的其余DeltaNet，优先全放GPU
-    iter = loader_->tensor_layer_index_list_.rbegin();
-    for (; iter != loader_->tensor_layer_index_list_.rend(); ++iter) {
-        if (gpu_layer_set.find(iter->first) != gpu_layer_set.end()) {
-            continue;
-        }
         size_t layer_use_byte = 0;
         size_t gpu_layer_num = iter->second.size();
         for (auto& index : iter->second) {
@@ -647,12 +623,9 @@ bool Qwen35moeModel::init_auto_gpu(size_t& free_mem) {
         }
     }
 
-    for (auto& layer_list : loader_->tensor_layer_index_list_) {
-        if (gpu_layer_set.find(layer_list.first) == gpu_layer_set.end()) {
-            continue;
-        }
-
-        for (auto& index : layer_list.second) {
+    for(auto& layer_index : gpu_layer_set) {
+        auto layer_list = loader_->tensor_layer_index_list_.find(layer_index);
+        for (auto& index : layer_list->second) {
             auto* iter = &loader_->tensors_layer_[index];
             struct ggml_tensor* cur = ggml_new_tensor(gpu_ctx_, iter->type, iter->n_dims, iter->dims);
             if (NULL != cur) {
