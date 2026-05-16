@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace {
 bool env_flag_enabled(const char* name) {
@@ -75,6 +76,167 @@ void set_mask_data(ggml_tensor* tensor, const std::vector<float>& mask) {
         return;
     }
     ggml_backend_tensor_set(tensor, mask.data(), 0, mask.size() * sizeof(float));
+}
+
+bool Qwen35moeForwardPass::can_run_token_embedding_on_backend(ggml_backend_t backend) const {
+    if (!backend) {
+        return false;
+    }
+    ggml_tensor* token_embedding = model_->get_token_embedding_weight();
+    if (!token_embedding) {
+        throw std::runtime_error("Qwen35moeForwardPass::can_run_token_embedding_on_backend: token embedding weight missing");
+    }
+    if (!token_embedding->buffer) {
+        return true;
+    }
+    const ggml_backend_buffer_type_t token_buft = ggml_backend_buffer_get_type(token_embedding->buffer);
+    const ggml_backend_buffer_type_t backend_buft = ggml_backend_get_default_buffer_type(backend);
+    return token_buft == backend_buft;
+}
+
+ggml_backend_t Qwen35moeForwardPass::find_backend_for_tensor(const ggml_tensor* tensor) const {
+    ggml_backend_t fallback = model_->get_curr_backend();
+    if (!tensor || !tensor->buffer) {
+        return fallback;
+    }
+
+    const ggml_backend_buffer_type_t tensor_buft = ggml_backend_buffer_get_type(tensor->buffer);
+    if (fallback && ggml_backend_get_default_buffer_type(fallback) == tensor_buft) {
+        return fallback;
+    }
+    for (const auto& segment : layer_segments_) {
+        if (segment.backend && ggml_backend_get_default_buffer_type(segment.backend) == tensor_buft) {
+            return segment.backend;
+        }
+    }
+    return fallback;
+}
+
+void Qwen35moeForwardPass::maybe_log_segment_tensor(
+    const char* scope,
+    const LayerSegment* segment,
+    ggml_tensor* tensor
+) const {
+    if (!dev_check_enabled_ || !tensor) {
+        return;
+    }
+    const char* backend_name = "n/a";
+    if (segment && segment->backend) {
+        backend_name = ggml_backend_name(segment->backend);
+    } else if (tensor->buffer) {
+        backend_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer));
+    }
+    std::fprintf(
+        stderr,
+        "[dev-check] segmented %s backend=%s tensor=%s type=%s ne=[%lld,%lld,%lld,%lld] bytes=%zu\n",
+        scope,
+        backend_name,
+        tensor->name,
+        ggml_type_name(tensor->type),
+        static_cast<long long>(tensor->ne[0]),
+        static_cast<long long>(tensor->ne[1]),
+        static_cast<long long>(tensor->ne[2]),
+        static_cast<long long>(tensor->ne[3]),
+        static_cast<size_t>(ggml_nbytes(tensor))
+    );
+}
+
+void Qwen35moeForwardPass::validate_handoff_tensor(
+    const char* where,
+    ggml_tensor* tensor,
+    ggml_type expected_type,
+    size_t expected_bytes
+) const {
+    if (!tensor) {
+        throw std::runtime_error(std::string(where) + ": missing tensor");
+    }
+    const int64_t expected_ne0 = static_cast<int64_t>(model_->meta_->qwen35moe.embedding_length);
+    if (tensor->ne[0] != expected_ne0 || tensor->ne[1] != 1) {
+        throw std::runtime_error(
+            std::string(where) +
+            ": hidden shape mismatch (expected [" + std::to_string(expected_ne0) + ",1], got [" +
+            std::to_string(tensor->ne[0]) + "," + std::to_string(tensor->ne[1]) + "])");
+    }
+    const size_t actual_bytes = static_cast<size_t>(ggml_nbytes(tensor));
+    if (tensor->type != expected_type || actual_bytes != expected_bytes) {
+        throw std::runtime_error(
+            std::string(where) +
+            ": hidden handoff mismatch (expected type=" + ggml_type_name(expected_type) +
+            ", bytes=" + std::to_string(expected_bytes) +
+            "; got type=" + ggml_type_name(tensor->type) +
+            ", bytes=" + std::to_string(actual_bytes) + ")");
+    }
+}
+
+void Qwen35moeForwardPass::read_segment_hidden_out(
+    const char* where,
+    const LayerSegment* segment,
+    ggml_cgraph* gf,
+    std::vector<uint8_t>& hidden_data,
+    ggml_type& hidden_type
+) {
+    ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
+    if (!hidden_out) {
+        throw std::runtime_error(std::string(where) + ": missing segment_hidden_out");
+    }
+    maybe_log_segment_tensor("segment_hidden_out", segment, hidden_out);
+    hidden_type = hidden_out->type;
+    const size_t hidden_bytes = static_cast<size_t>(ggml_nbytes(hidden_out));
+    if (hidden_bytes == 0) {
+        throw std::runtime_error(std::string(where) + ": segment_hidden_out has zero bytes");
+    }
+    hidden_data.resize(hidden_bytes);
+    ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size());
+}
+
+void Qwen35moeForwardPass::prepare_first_segment_hidden_from_token(
+    const char* where,
+    int32_t token,
+    const LayerSegment& first_segment,
+    std::vector<uint8_t>& hidden_data,
+    ggml_type& hidden_type
+) {
+    ggml_tensor* token_embedding = model_->get_token_embedding_weight();
+    if (!token_embedding) {
+        throw std::runtime_error(std::string(where) + ": token embedding weight missing");
+    }
+
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+    ggml_tensor* tok_t = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    ggml_set_input(tok_t);
+    set_tensor_name(tok_t, "tokens");
+    ggml_build_forward_expand(gf, tok_t);
+
+    ggml_tensor* hidden_out = ggml_get_rows(ctx_, token_embedding, tok_t);
+    set_tensor_name(hidden_out, "segment_hidden_out");
+    ggml_build_forward_expand(gf, hidden_out);
+
+    ggml_backend_t embed_backend = find_backend_for_tensor(token_embedding);
+    if (!embed_backend) {
+        throw std::runtime_error(std::string(where) + ": no backend available for token embedding");
+    }
+
+    ggml_gallocr_t embed_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(embed_backend));
+    if (!ggml_gallocr_alloc_graph(embed_alloc, gf)) {
+        ggml_gallocr_free(embed_alloc);
+        throw std::runtime_error(std::string(where) + ": token embedding graph alloc failed");
+    }
+
+    maybe_log_segment_tensor("tokens", &first_segment, tok_t);
+    ggml_backend_tensor_set(tok_t, &token, 0, sizeof(token));
+    ggml_backend_graph_compute(embed_backend, gf);
+    read_segment_hidden_out(where, &first_segment, gf, hidden_data, hidden_type);
+    ggml_gallocr_free(embed_alloc);
+
+    if (dev_check_enabled_) {
+        std::fprintf(
+            stderr,
+            "[dev-check] segmented first-segment embedding bridge token_backend=%s segment_backend=%s\n",
+            ggml_backend_name(embed_backend),
+            first_segment.backend ? ggml_backend_name(first_segment.backend) : "n/a"
+        );
+    }
 }
 
 /**
@@ -1014,22 +1176,33 @@ void Qwen35moeForwardPass::set_segment_inputs(
     int pos,
     ggml_type hidden_type,
     const std::vector<uint8_t>* hidden_data,
+    const LayerSegment* segment,
     uint32_t layer_begin,
     uint32_t layer_end
 ) {
-    if (ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens")) {
+    ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
+    if (hidden_data == nullptr && !tok_t) {
+        throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: missing both hidden_data and tokens tensor for first segment");
+    }
+    if (tok_t) {
+        if (tok_t->type != GGML_TYPE_I32 || static_cast<size_t>(ggml_nbytes(tok_t)) != sizeof(int32_t)) {
+            throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: tokens tensor mismatch");
+        }
+        maybe_log_segment_tensor("tokens", segment, tok_t);
         ggml_backend_tensor_set(tok_t, &token, 0, sizeof(token));
     }
     if (ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "inp_pos")) {
+        if (pos_t->type != GGML_TYPE_I32 || static_cast<size_t>(ggml_nbytes(pos_t)) != sizeof(int32_t)) {
+            throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: inp_pos tensor mismatch");
+        }
         ggml_backend_tensor_set(pos_t, &pos, 0, sizeof(pos));
     }
     if (ggml_tensor* hidden_t = ggml_graph_get_tensor(gf, "segment_hidden_in")) {
         if (hidden_data == nullptr) {
             throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: hidden input missing");
         }
-        if (hidden_t->type != hidden_type || static_cast<size_t>(ggml_nbytes(hidden_t)) != hidden_data->size()) {
-            throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: hidden tensor mismatch");
-        }
+        validate_handoff_tensor("Qwen35moeForwardPass::set_segment_inputs", hidden_t, hidden_type, hidden_data->size());
+        maybe_log_segment_tensor("segment_hidden_in", segment, hidden_t);
         ggml_backend_tensor_set(hidden_t, hidden_data->data(), 0, hidden_data->size());
     }
 
@@ -1062,9 +1235,20 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
     ggml_type hidden_type = GGML_TYPE_F32;
     for (size_t i = 0; i < layer_segments_.size(); ++i) {
         const bool first = i == 0;
-        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, layer_segments_[i], first, false, hidden_type);
+        const LayerSegment& segment = layer_segments_[i];
+        const bool first_uses_token_input = first && can_run_token_embedding_on_backend(segment.backend);
+        if (first && !first_uses_token_input) {
+            prepare_first_segment_hidden_from_token(
+                "Qwen35moeForwardPass::run_decode_segmented",
+                token,
+                segment,
+                hidden_data,
+                hidden_type
+            );
+        }
+        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, segment, first_uses_token_input, false, hidden_type);
 
-        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(layer_segments_[i].backend);
+        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(segment.backend);
         ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
         if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
             ggml_gallocr_free(seg_alloc);
@@ -1079,17 +1263,9 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
         //     ggml_backend_name(layer_segments_[i].backend),
         //     reserve_bytes);
 
-        set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
-        ggml_backend_graph_compute(layer_segments_[i].backend, gf);
-
-        ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
-        if (!hidden_out) {
-            ggml_gallocr_free(seg_alloc);
-            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: missing segment_hidden_out");
-        }
-        hidden_type = hidden_out->type;
-        hidden_data.resize(static_cast<size_t>(ggml_nbytes(hidden_out)));
-        ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size());
+        set_segment_inputs(gf, token, pos, hidden_type, first_uses_token_input ? nullptr : &hidden_data, &segment, segment.l0, segment.l1);
+        ggml_backend_graph_compute(segment.backend, gf);
+        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented", &segment, gf, hidden_data, hidden_type);
         ggml_gallocr_free(seg_alloc);
     }
 
@@ -1101,16 +1277,23 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head alloc failed");
     }
     if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
-        if (hidden_data.empty() || hidden_in->type != hidden_type ||
-            static_cast<size_t>(ggml_nbytes(hidden_in)) != hidden_data.size()) {
+        if (hidden_data.empty()) {
             ggml_gallocr_free(head_alloc);
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head hidden mismatch");
         }
+        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented: head", hidden_in, hidden_type, hidden_data.size());
+        maybe_log_segment_tensor("head_segment_hidden_in", nullptr, hidden_in);
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
+    ggml_tensor* head_logits = ggml_graph_get_tensor(gf_head, "logits");
+    if (!head_logits) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: logits tensor missing in head graph");
+    }
+    maybe_log_segment_tensor("head_logits", nullptr, head_logits);
     std::vector<float> logits = get_output_logits(gf_head);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
@@ -1130,9 +1313,20 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
     ggml_type hidden_type = GGML_TYPE_F32;
     for (size_t i = 0; i < layer_segments_.size(); ++i) {
         const bool first = i == 0;
-        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, layer_segments_[i], first, false, hidden_type);
+        const LayerSegment& segment = layer_segments_[i];
+        const bool first_uses_token_input = first && can_run_token_embedding_on_backend(segment.backend);
+        if (first && !first_uses_token_input) {
+            prepare_first_segment_hidden_from_token(
+                "Qwen35moeForwardPass::run_decode_segmented_topk",
+                token,
+                segment,
+                hidden_data,
+                hidden_type
+            );
+        }
+        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, segment, first_uses_token_input, false, hidden_type);
 
-        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(layer_segments_[i].backend);
+        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(segment.backend);
         ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
         if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
             ggml_gallocr_free(seg_alloc);
@@ -1147,17 +1341,9 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
         //     ggml_backend_name(layer_segments_[i].backend),
         //     reserve_bytes);
 
-        set_segment_inputs(gf, token, pos, hidden_type, first ? nullptr : &hidden_data, layer_segments_[i].l0, layer_segments_[i].l1);
-        ggml_backend_graph_compute(layer_segments_[i].backend, gf);
-
-        ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
-        if (!hidden_out) {
-            ggml_gallocr_free(seg_alloc);
-            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: missing segment_hidden_out");
-        }
-        hidden_type = hidden_out->type;
-        hidden_data.resize(static_cast<size_t>(ggml_nbytes(hidden_out)));
-        ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size());
+        set_segment_inputs(gf, token, pos, hidden_type, first_uses_token_input ? nullptr : &hidden_data, &segment, segment.l0, segment.l1);
+        ggml_backend_graph_compute(segment.backend, gf);
+        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented_topk", &segment, gf, hidden_data, hidden_type);
         ggml_gallocr_free(seg_alloc);
     }
 
@@ -1169,16 +1355,25 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head alloc failed");
     }
     if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
-        if (hidden_data.empty() || hidden_in->type != hidden_type ||
-            static_cast<size_t>(ggml_nbytes(hidden_in)) != hidden_data.size()) {
+        if (hidden_data.empty()) {
             ggml_gallocr_free(head_alloc);
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head hidden mismatch");
         }
+        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented_topk: head", hidden_in, hidden_type, hidden_data.size());
+        maybe_log_segment_tensor("head_segment_hidden_in", nullptr, hidden_in);
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
+    ggml_tensor* logits_scaled = ggml_graph_get_tensor(gf_head, "logits_scaled");
+    ggml_tensor* topk_idx = ggml_graph_get_tensor(gf_head, "sample_topk_idx");
+    if (!logits_scaled || !topk_idx) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: missing logits_scaled or sample_topk_idx in head graph");
+    }
+    maybe_log_segment_tensor("head_logits_scaled", nullptr, logits_scaled);
+    maybe_log_segment_tensor("head_topk_idx", nullptr, topk_idx);
     TopKSampleCandidates result = get_output_topk_candidates(gf_head, 0);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);

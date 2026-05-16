@@ -113,12 +113,40 @@ private:
         ggml_type hidden_type
     );
     ggml_cgraph* build_output_head_graph_from_hidden(ggml_type hidden_type);
+    bool can_run_token_embedding_on_backend(ggml_backend_t backend) const;
+    ggml_backend_t find_backend_for_tensor(const ggml_tensor* tensor) const;
+    void maybe_log_segment_tensor(
+        const char* scope,
+        const LayerSegment* segment,
+        ggml_tensor* tensor
+    ) const;
+    void validate_handoff_tensor(
+        const char* where,
+        ggml_tensor* tensor,
+        ggml_type expected_type,
+        size_t expected_bytes
+    ) const;
+    void read_segment_hidden_out(
+        const char* where,
+        const LayerSegment* segment,
+        ggml_cgraph* gf,
+        std::vector<uint8_t>& hidden_data,
+        ggml_type& hidden_type
+    );
+    void prepare_first_segment_hidden_from_token(
+        const char* where,
+        int32_t token,
+        const LayerSegment& first_segment,
+        std::vector<uint8_t>& hidden_data,
+        ggml_type& hidden_type
+    );
     void set_segment_inputs(
         ggml_cgraph* gf,
         int32_t token,
         int pos,
         ggml_type hidden_type,
         const std::vector<uint8_t>* hidden_data,
+        const LayerSegment* segment,
         uint32_t layer_begin,
         uint32_t layer_end
     );
