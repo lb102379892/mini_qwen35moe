@@ -1182,7 +1182,7 @@ void Qwen35moeForwardPass::set_segment_inputs(
 ) {
     ggml_tensor* tok_t = ggml_graph_get_tensor(gf, "tokens");
     if (hidden_data == nullptr && !tok_t) {
-        throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: missing tokens tensor for first segment");
+        throw std::runtime_error("Qwen35moeForwardPass::set_segment_inputs: missing both hidden_data and tokens tensor for first segment");
     }
     if (tok_t) {
         if (tok_t->type != GGML_TYPE_I32 || static_cast<size_t>(ggml_nbytes(tok_t)) != sizeof(int32_t)) {
@@ -1288,7 +1288,12 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
-    maybe_log_segment_tensor("head_logits", nullptr, ggml_graph_get_tensor(gf_head, "logits"));
+    ggml_tensor* head_logits = ggml_graph_get_tensor(gf_head, "logits");
+    if (!head_logits) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: logits tensor missing in head graph");
+    }
+    maybe_log_segment_tensor("head_logits", nullptr, head_logits);
     std::vector<float> logits = get_output_logits(gf_head);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
@@ -1361,8 +1366,14 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
     const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
-    maybe_log_segment_tensor("head_logits_scaled", nullptr, ggml_graph_get_tensor(gf_head, "logits_scaled"));
-    maybe_log_segment_tensor("head_topk_idx", nullptr, ggml_graph_get_tensor(gf_head, "sample_topk_idx"));
+    ggml_tensor* logits_scaled = ggml_graph_get_tensor(gf_head, "logits_scaled");
+    ggml_tensor* topk_idx = ggml_graph_get_tensor(gf_head, "sample_topk_idx");
+    if (!logits_scaled || !topk_idx) {
+        ggml_gallocr_free(head_alloc);
+        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: missing logits_scaled or sample_topk_idx in head graph");
+    }
+    maybe_log_segment_tensor("head_logits_scaled", nullptr, logits_scaled);
+    maybe_log_segment_tensor("head_topk_idx", nullptr, topk_idx);
     TopKSampleCandidates result = get_output_topk_candidates(gf_head, 0);
     ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
