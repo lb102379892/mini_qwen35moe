@@ -419,6 +419,7 @@ private:
     uint32_t n_ubatch_tokens_ = 0;
     bool use_flash_attention_ = false;
     bool paged_kv_enabled_ = false;
+    bool paged_prefill_fallback_warned_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
     // Set via QWEN35MOE_DEV_CHECK=1 to enable lightweight device-consistency logging

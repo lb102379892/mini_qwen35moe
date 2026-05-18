@@ -1417,6 +1417,11 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
 std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>& tokens, int pos, 
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
     if (paged_kv_enabled_ && tokens.size() > 1) {
+        if (!paged_prefill_fallback_warned_) {
+            std::fprintf(stderr,
+                "[paged-kv] prefill fallback enabled: processing multi-token prefill as single-token steps in phase-1 mode\n");
+            paged_prefill_fallback_warned_ = true;
+        }
         std::vector<float> last_logits;
         for (size_t i = 0; i < tokens.size(); ++i) {
             std::vector<int32_t> one_token = { tokens[i] };
@@ -1511,6 +1516,11 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
     }
 
     if (paged_kv_enabled_ && tokens.size() > 1) {
+        if (!paged_prefill_fallback_warned_) {
+            std::fprintf(stderr,
+                "[paged-kv] prefill fallback enabled: processing multi-token prefill as single-token steps in phase-1 mode\n");
+            paged_prefill_fallback_warned_ = true;
+        }
         TopKSampleCandidates last_candidates;
         for (size_t i = 0; i < tokens.size(); ++i) {
             std::vector<int32_t> one_token = { tokens[i] };

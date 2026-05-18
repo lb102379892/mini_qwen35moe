@@ -24,6 +24,9 @@ simple_kv_cache::simple_kv_cache(
     positions.resize(n_batch_max, 0);
     paged_enabled_ = paged_config_.enabled;
     paged_block_size_ = std::max<uint32_t>(1u, paged_config_.block_size);
+    if (paged_enabled_ && paged_block_size_ > n_ctx_max) {
+        throw std::invalid_argument("simple_kv_cache: paged block size cannot exceed n_ctx_max");
+    }
     total_token_capacity_ = n_ctx_max * n_batch_max;
     total_blocks_ = (total_token_capacity_ + paged_block_size_ - 1) / paged_block_size_;
 
@@ -45,6 +48,11 @@ simple_kv_cache::simple_kv_cache(
     GGML_ASSERT(scratch_ctx);
 
     if (paged_enabled_) {
+        if (paged_config_.diagnostics && (paged_block_size_ & (paged_block_size_ - 1)) != 0) {
+            std::fprintf(stderr,
+                "[paged-kv] warning: non-power-of-two block size (%u) may reduce paging efficiency\n",
+                paged_block_size_);
+        }
         maybe_log_paged_stats("init", 0);
     }
 }
@@ -278,6 +286,9 @@ void simple_kv_cache::fill_gather_indices(const std::vector<uint32_t>& slots, ui
             uint32_t mapped = 0;
             if (!paged_enabled_) {
                 mapped = slot * n_ctx_max + j;
+            // j == positions[slot] is intentionally allowed for decode graphs:
+            // the pending token is written to this logical position earlier in the
+            // same graph before gather reads execute.
             } else if (slot < n_batch_max && !slot_block_tables_[slot].empty() && j <= positions[slot]) {
                 mapped = logical_to_physical_internal(slot, j, allow_pending);
             }
