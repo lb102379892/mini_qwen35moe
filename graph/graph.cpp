@@ -779,7 +779,7 @@ void Qwen35moeForwardPass::maybe_log_paged_fused_fallback(const char* reason) {
     const bool changed = paged_fused_last_fallback_reason_ != reason;
     if (first || changed) {
         std::fprintf(stderr,
-            "[paged-fused] decode fallback reason=%s (falling back to phase-1 paged prefill path)\n",
+            "[paged-fused] decode fallback reason=%s (falling back to standard decode path)\n",
             reason);
         paged_fused_last_fallback_reason_ = reason;
         paged_fused_fallback_warned_ = true;
@@ -1695,13 +1695,13 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     if (paged_kv_enabled_) {
         paged_fused_decode_attempt_count_++;
         const char* fallback_reason = nullptr;
-        if (!can_use_paged_fused_decode(&fallback_reason)) {
+        const bool use_fused_decode = can_use_paged_fused_decode(&fallback_reason);
+        if (!use_fused_decode) {
             maybe_log_paged_fused_fallback(fallback_reason);
-            std::vector<int32_t> token_vec = { token };
-            return run_prefill(token_vec, pos, slot_idx, scheduler);
+        } else {
+            paged_fused_decode_hit_count_++;
+            maybe_log_paged_fused_activation();
         }
-        paged_fused_decode_hit_count_++;
-        maybe_log_paged_fused_activation();
     }
 
     // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
@@ -1757,13 +1757,13 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     if (paged_kv_enabled_) {
         paged_fused_decode_attempt_count_++;
         const char* fallback_reason = nullptr;
-        if (!can_use_paged_fused_decode(&fallback_reason)) {
+        const bool use_fused_decode = can_use_paged_fused_decode(&fallback_reason);
+        if (!use_fused_decode) {
             maybe_log_paged_fused_fallback(fallback_reason);
-            std::vector<int32_t> token_vec = { token };
-            return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
+        } else {
+            paged_fused_decode_hit_count_++;
+            maybe_log_paged_fused_activation();
         }
-        paged_fused_decode_hit_count_++;
-        maybe_log_paged_fused_activation();
     }
 
     // Mixed GPU/CPU mode: force segmented eager decode.
