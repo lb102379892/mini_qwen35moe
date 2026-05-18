@@ -371,6 +371,8 @@ private:
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     bool can_use_paged_fused_decode(const char** reason) const;
     void maybe_log_paged_fused_fallback(const char* reason);
+    void maybe_log_paged_fused_activation();
+    void record_paged_fused_decode_timing(uint64_t delta_us);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
     std::vector<float> get_output_logits(ggml_cgraph* gf);

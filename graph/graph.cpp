@@ -18,6 +18,8 @@
 #include <string>
 
 namespace {
+constexpr const char* CUDA_BACKEND_NAME = "CUDA";
+
 bool env_flag_enabled(const char* name) {
     const char* value = std::getenv(name);
     return value && value[0] != '\0' && value[0] != '0';
@@ -45,7 +47,7 @@ bool backend_name_contains_cuda(ggml_backend_t backend) {
         return false;
     }
     const char* name = ggml_backend_name(backend);
-    return name != nullptr && std::strstr(name, "CUDA") != nullptr;
+    return name != nullptr && std::strstr(name, CUDA_BACKEND_NAME) != nullptr;
 }
 }
 
@@ -602,7 +604,7 @@ void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
 
     std::fprintf(
         stderr,
-        "[PERF][decode-graph] lookups=%llu hit=%llu miss=%llu recapture=%llu fallback=%llu sched_reset=%llu active_bucket=%u hot_bucket=%u hot_bucket_uses=%llu paged_fused_attempt=%llu paged_fused_hit=%llu paged_fused_fallback=%llu paged_fused_avg_us=%llu\n",
+        "[PERF][decode-graph] lookups=%llu hit=%llu miss=%llu recapture=%llu fallback=%llu sched_reset=%llu active_bucket=%u hot_bucket=%u hot_bucket_uses=%llu\n",
         static_cast<unsigned long long>(decode_graph_lookup_count_),
         static_cast<unsigned long long>(decode_graph_hit_count_),
         static_cast<unsigned long long>(decode_graph_miss_count_),
@@ -611,7 +613,11 @@ void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
         static_cast<unsigned long long>(decode_graph_scheduler_reset_count_),
         cached_decode_signature_valid_ ? cached_decode_signature_.kv_capacity : 0,
         hottest_bucket,
-        static_cast<unsigned long long>(hottest_bucket_count),
+        static_cast<unsigned long long>(hottest_bucket_count)
+    );
+    std::fprintf(
+        stderr,
+        "[PERF][paged-fused] attempt=%llu hit=%llu fallback=%llu avg_decode_us=%llu\n",
         static_cast<unsigned long long>(paged_fused_decode_attempt_count_),
         static_cast<unsigned long long>(paged_fused_decode_hit_count_),
         static_cast<unsigned long long>(paged_fused_decode_fallback_count_),
@@ -778,6 +784,20 @@ void Qwen35moeForwardPass::maybe_log_paged_fused_fallback(const char* reason) {
         paged_fused_last_fallback_reason_ = reason;
         paged_fused_fallback_warned_ = true;
     }
+}
+
+void Qwen35moeForwardPass::maybe_log_paged_fused_activation() {
+    if (!paged_fused_diag_enabled_ || paged_fused_decode_hit_count_ != 1) {
+        return;
+    }
+    std::fprintf(stderr,
+        "[paged-fused] decode fused path active backend=%s flash_attn=1 paged_kv=1\n",
+        ggml_backend_name(model_->get_curr_backend()));
+}
+
+void Qwen35moeForwardPass::record_paged_fused_decode_timing(uint64_t delta_us) {
+    paged_fused_decode_compute_count_++;
+    paged_fused_decode_compute_total_us_ += delta_us;
 }
 
 /**
@@ -1681,11 +1701,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
             return run_prefill(token_vec, pos, slot_idx, scheduler);
         }
         paged_fused_decode_hit_count_++;
-        if (paged_fused_diag_enabled_ && paged_fused_decode_hit_count_ == 1) {
-            std::fprintf(stderr,
-                "[paged-fused] decode fused path active backend=%s flash_attn=1 paged_kv=1\n",
-                ggml_backend_name(model_->get_curr_backend()));
-        }
+        maybe_log_paged_fused_activation();
     }
 
     // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
@@ -1710,13 +1726,12 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
-    const auto decode_start = std::chrono::steady_clock::now();
+    const auto decode_start_time = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
     if (paged_kv_enabled_) {
         const auto decode_end = std::chrono::steady_clock::now();
-        const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-        paged_fused_decode_compute_count_++;
-        paged_fused_decode_compute_total_us_ += static_cast<uint64_t>(std::max<int64_t>(0, dt_us));
+        const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start_time).count();
+        record_paged_fused_decode_timing(static_cast<uint64_t>(dt_us));
     }
 
     if (kv_cache_) {
@@ -1748,11 +1763,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
             return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
         }
         paged_fused_decode_hit_count_++;
-        if (paged_fused_diag_enabled_ && paged_fused_decode_hit_count_ == 1) {
-            std::fprintf(stderr,
-                "[paged-fused] decode fused path active backend=%s flash_attn=1 paged_kv=1\n",
-                ggml_backend_name(model_->get_curr_backend()));
-        }
+        maybe_log_paged_fused_activation();
     }
 
     // Mixed GPU/CPU mode: force segmented eager decode.
@@ -1775,13 +1786,12 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
-    const auto decode_start = std::chrono::steady_clock::now();
+    const auto decode_start_time = std::chrono::steady_clock::now();
     ggml_backend_sched_graph_compute(scheduler, cached_decode_graph_);
     if (paged_kv_enabled_) {
         const auto decode_end = std::chrono::steady_clock::now();
-        const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-        paged_fused_decode_compute_count_++;
-        paged_fused_decode_compute_total_us_ += static_cast<uint64_t>(std::max<int64_t>(0, dt_us));
+        const auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start_time).count();
+        record_paged_fused_decode_timing(static_cast<uint64_t>(dt_us));
     }
 
     if (kv_cache_) {
