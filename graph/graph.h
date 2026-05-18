@@ -373,6 +373,8 @@ private:
     void maybe_log_paged_fused_fallback(const char* reason);
     void maybe_log_paged_fused_activation();
     void record_paged_fused_decode_timing(uint64_t delta_us);
+    bool ensure_cached_decode_copy_ready(uint32_t slot_idx, uint32_t dst_pos);
+    bool commit_cached_decode_step(uint32_t slot_idx, uint32_t dst_pos);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
     std::vector<float> get_output_logits(ggml_cgraph* gf);

@@ -45,6 +45,10 @@ int main() {
     cache.advance(1, 0);
     require(cache.paged_used_blocks() == 2, "slot0 token2 should allocate second block");
     require(cache.logical_to_physical(0, 2) == 2, "slot0 logical2 should map to physical2");
+    require(!cache.has_materialized_logical_pos(0, 6), "logical position should start unmapped");
+    require(!cache.copy_pos(6, 0, 0), "copy_pos should fail gracefully when source mapping is missing");
+    require(cache.ensure_materialized_logical_pos(0, 6), "ensure_materialized_logical_pos should allocate source mapping");
+    require(cache.copy_pos(6, 1, 0), "copy_pos should succeed once source and destination mappings exist");
 
     cache.clear_slot(0);
     require(cache.paged_used_blocks() == 0, "clear_slot should release slot0 blocks");

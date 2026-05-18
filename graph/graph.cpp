@@ -800,6 +800,34 @@ void Qwen35moeForwardPass::record_paged_fused_decode_timing(uint64_t delta_us) {
     paged_fused_decode_compute_total_us_ += delta_us;
 }
 
+bool Qwen35moeForwardPass::ensure_cached_decode_copy_ready(uint32_t slot_idx, uint32_t dst_pos) {
+    if (!paged_kv_enabled_ || !kv_cache_) {
+        return true;
+    }
+    const bool src_ready = kv_cache_->ensure_materialized_logical_pos(slot_idx, cached_decode_scratch_pos_);
+    const bool dst_ready = kv_cache_->ensure_materialized_logical_pos(slot_idx, dst_pos);
+    if (!src_ready || !dst_ready) {
+        std::fprintf(stderr,
+            "[paged-kv] cached decode copy guard fallback: slot=%u src=%u dst=%u src_ready=%d dst_ready=%d\n",
+            slot_idx,
+            cached_decode_scratch_pos_,
+            dst_pos,
+            src_ready ? 1 : 0,
+            dst_ready ? 1 : 0);
+        return false;
+    }
+    return true;
+}
+
+bool Qwen35moeForwardPass::commit_cached_decode_step(uint32_t slot_idx, uint32_t dst_pos) {
+    if (kv_cache_ && !kv_cache_->copy_pos(cached_decode_scratch_pos_, dst_pos, slot_idx)) {
+        return false;
+    }
+    advance_cache(1, slot_idx);
+    maybe_log_decode_graph_stats();
+    return true;
+}
+
 /**
  * @brief 构建 Prefill 阶段计算图
  * 
@@ -1724,6 +1752,10 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
+    if (!ensure_cached_decode_copy_ready(slot_idx, static_cast<uint32_t>(pos))) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, scheduler);
+    }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     const auto decode_start_time = std::chrono::steady_clock::now();
@@ -1734,11 +1766,10 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
         record_paged_fused_decode_timing(static_cast<uint64_t>(dt_us));
     }
 
-    if (kv_cache_) {
-        kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
+    if (!commit_cached_decode_step(slot_idx, static_cast<uint32_t>(pos))) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, scheduler);
     }
-    advance_cache(1, slot_idx);
-    maybe_log_decode_graph_stats();
     return get_output_logits(cached_decode_graph_);
 }
 
@@ -1784,6 +1815,10 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     requested_signature.kv_capacity = decode_cache_bucket_capacity(required_kv);
 
     ensure_cached_decode_graph(scheduler, requested_signature, required_kv);
+    if (!ensure_cached_decode_copy_ready(slot_idx, static_cast<uint32_t>(pos))) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
+    }
 
     set_cached_decode_inputs(cached_decode_graph_, token, pos);
     const auto decode_start_time = std::chrono::steady_clock::now();
@@ -1794,11 +1829,10 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
         record_paged_fused_decode_timing(static_cast<uint64_t>(dt_us));
     }
 
-    if (kv_cache_) {
-        kv_cache_->copy_pos(cached_decode_scratch_pos_, static_cast<uint32_t>(pos), slot_idx);
+    if (!commit_cached_decode_step(slot_idx, static_cast<uint32_t>(pos))) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
     }
-    advance_cache(1, slot_idx);
-    maybe_log_decode_graph_stats();
     return get_output_topk_candidates(cached_decode_graph_, 0);
 }
 
