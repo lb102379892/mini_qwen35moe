@@ -168,6 +168,8 @@ curl -X POST http://localhost:6666/v1/chat/completions \
 | --top-p \<f\> | 0.95 | Top-p sampling nucleus |
 | --top-k \<N\> | 40 | Top-k sampling (0 = off) |
 | --threads \<N\> | 4 | CPU threads |
+| --paged-kv | false | Enable Phase-1 paged KV cache foundation |
+| --paged-kv-block \<N\> | 16 | Paged KV block size in tokens |
 | --no-chat | false | Disable chat template, pass prompt verbatim |
 | --verbose | false | Print tokenization and timing info |
 

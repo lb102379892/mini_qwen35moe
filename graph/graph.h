@@ -39,7 +39,8 @@ public:
     Qwen35moeForwardPass();
     ~Qwen35moeForwardPass();
 
-    int init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model, uint32_t n_batch = 0, uint32_t n_ubatch = 0);
+    int init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model,
+        uint32_t n_batch = 0, uint32_t n_ubatch = 0, bool enable_paged_kv = false, uint32_t paged_kv_block_size = 16);
 
     void reset_context();
     void reset_sequence(uint32_t slot_idx = 0);
@@ -417,6 +418,7 @@ private:
     uint32_t n_batch_tokens_ = 0;
     uint32_t n_ubatch_tokens_ = 0;
     bool use_flash_attention_ = false;
+    bool paged_kv_enabled_ = false;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
     // Set via QWEN35MOE_DEV_CHECK=1 to enable lightweight device-consistency logging

@@ -268,12 +268,15 @@ Qwen35moeForwardPass::~Qwen35moeForwardPass() {
  * 3. 创建 KV 缓存（用于 Full Attention 层）
  * 4. 创建 DeltaNet 状态（用于 DeltaNet 层）
  */
-int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model, uint32_t n_batch, uint32_t n_ubatch) {
+int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_batch_size, std::shared_ptr<Qwen35moeModel> model,
+    uint32_t n_batch, uint32_t n_ubatch, bool enable_paged_kv, uint32_t paged_kv_block_size) {
     model_ = model;
     use_flash_attention_ = env_flag_enabled("QWEN35MOE_FLASH_ATTN");
     decode_graph_diag_enabled_ = env_flag_enabled("QWEN35MOE_DECODE_GRAPH_DIAG");
     decode_graph_diag_interval_ = env_u32_or_default("QWEN35MOE_DECODE_GRAPH_DIAG_INTERVAL", 256);
     dev_check_enabled_ = env_flag_enabled("QWEN35MOE_DEV_CHECK");
+    paged_kv_enabled_ = enable_paged_kv || env_flag_enabled("QWEN35MOE_PAGED_KV");
+    const uint32_t paged_block_size = std::max<uint32_t>(1u, env_u32_or_default("QWEN35MOE_PAGED_BLOCK_SIZE", paged_kv_block_size));
     auto& m = model_->meta_->qwen35moe;
 
     context_len_ = context_len;
@@ -329,8 +332,15 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
         n_embd_k, n_embd_v,                   // K/V 维度
         GGML_TYPE_F16, GGML_TYPE_F16,         // 数据类型
         cache_backend,                        // 默认后端设备
-        kv_layer_backends                     // 每层设备映射
+        kv_layer_backends,                    // 每层设备映射
+        PagedKVConfig{paged_kv_enabled_, paged_block_size, dev_check_enabled_}
     );
+    if (paged_kv_enabled_) {
+        std::fprintf(stderr,
+            "[paged-kv] enabled block_size=%u total_blocks=%u\n",
+            paged_block_size,
+            kv_cache_->paged_total_blocks());
+    }
 
     rebuild_layer_segments();
     if (model_->is_mixed_mode()) {
@@ -1110,11 +1120,17 @@ void Qwen35moeForwardPass::set_batched_inputs(ggml_cgraph* gf, const std::vector
     ggml_tensor* gi = ggml_graph_get_tensor(gf, "gather_indices");
     if (gi) {
         const uint32_t n_kv   = static_cast<uint32_t>(gi->ne[0]) / n_batch;
-        std::vector<int32_t> idx(n_batch * n_kv);
-        for (uint32_t b = 0; b < n_batch; ++b) {
-            const uint32_t slot = slots[b];
-            for (uint32_t j = 0; j < n_kv; ++j)
-                idx[b * n_kv + j] = static_cast<int32_t>(slot * n_kv + j);
+        std::vector<int32_t> idx;
+        if (kv_cache_) {
+            kv_cache_->fill_gather_indices(slots, n_kv, idx);
+        } else {
+            idx.resize(n_batch * n_kv);
+            for (uint32_t b = 0; b < n_batch; ++b) {
+                const uint32_t slot = slots[b];
+                for (uint32_t j = 0; j < n_kv; ++j) {
+                    idx[b * n_kv + j] = static_cast<int32_t>(slot * context_len_ + j);
+                }
+            }
         }
         ggml_backend_tensor_set(gi, idx.data(), 0, idx.size() * sizeof(int32_t));
     }
@@ -1400,6 +1416,14 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
  */
 std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>& tokens, int pos, 
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    if (paged_kv_enabled_ && tokens.size() > 1) {
+        std::vector<float> last_logits;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            std::vector<int32_t> one_token = { tokens[i] };
+            last_logits = run_prefill(one_token, pos + static_cast<int>(i), slot_idx, scheduler);
+        }
+        return last_logits;
+    }
     const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
     if (scheduler != nullptr) {
         if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
@@ -1486,6 +1510,15 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
         throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: empty token input");
     }
 
+    if (paged_kv_enabled_ && tokens.size() > 1) {
+        TopKSampleCandidates last_candidates;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            std::vector<int32_t> one_token = { tokens[i] };
+            last_candidates = run_prefill_topk(one_token, pos + static_cast<int>(i), slot_idx, scheduler);
+        }
+        return last_candidates;
+    }
+
     const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
     if (scheduler != nullptr) {
         if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
@@ -1560,6 +1593,10 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
+    if (paged_kv_enabled_) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill(token_vec, pos, slot_idx, scheduler);
+    }
 
     // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
     // ggml's CUDA-graph capture/replay does not support cross-device operations.
@@ -1603,6 +1640,10 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     }
     if (static_cast<uint32_t>(pos) >= context_len_) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
+    }
+    if (paged_kv_enabled_) {
+        std::vector<int32_t> token_vec = { token };
+        return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
     }
 
     // Mixed GPU/CPU mode: force segmented eager decode.

@@ -51,3 +51,12 @@ add_executable(test_qwen35moe
     main.cpp
 )
 target_link_libraries(test_qwen35moe PRIVATE ggml_core pthread dl m)
+
+enable_testing()
+
+add_executable(paged_kv_cache_test
+    graph/kv_cache_simple.cpp
+    graph/paged_kv_cache_test.cpp
+)
+target_link_libraries(paged_kv_cache_test PRIVATE ggml_core pthread dl m)
+add_test(NAME paged_kv_cache_test COMMAND paged_kv_cache_test)

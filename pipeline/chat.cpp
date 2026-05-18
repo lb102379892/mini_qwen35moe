@@ -13,7 +13,8 @@ ChatEngine::ChatEngine() {
 ChatEngine::~ChatEngine() {
 }
 
-bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k, float temperature, size_t gpu_layer, bool flash_attention, int n_batch, int n_ubatch) {
+bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k,
+    float temperature, size_t gpu_layer, bool flash_attention, int n_batch, int n_ubatch, bool enable_paged_kv, uint32_t paged_kv_block_size) {
     dev_mode_ = dev_mode;
     max_seq_len_= max_seq_len;
     top_p_ = top_p;
@@ -46,7 +47,8 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
     sched_ = model_->get_scheduler();
 
     forward_pass_ = std::make_shared<Qwen35moeForwardPass>();
-    forward_pass_->init(max_seq_len_, 1, model_, static_cast<uint32_t>(n_batch_), static_cast<uint32_t>(n_ubatch_));
+    forward_pass_->init(max_seq_len_, 1, model_, static_cast<uint32_t>(n_batch_), static_cast<uint32_t>(n_ubatch_),
+        enable_paged_kv, paged_kv_block_size);
     if (use_gpu_topk_sampling_) {
         forward_pass_->configure_device_sampling(top_k_, temperature_);
     }

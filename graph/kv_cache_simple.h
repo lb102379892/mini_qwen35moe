@@ -6,13 +6,20 @@
 #include <memory>
 #include <cstdint>
 
+struct PagedKVConfig {
+    bool enabled = false;
+    uint32_t block_size = 16;
+    bool diagnostics = false;
+};
+
 class simple_kv_cache {
 public:
     simple_kv_cache(
         uint32_t n_layers, uint32_t n_ctx_max, uint32_t n_batch_max,
         uint32_t n_embd_k, uint32_t n_embd_v, ggml_type type_k = GGML_TYPE_F16,
         ggml_type type_v = GGML_TYPE_F16, ggml_backend_t backend = nullptr,
-        const std::vector<ggml_backend_t>& layer_backends = {}
+        const std::vector<ggml_backend_t>& layer_backends = {},
+        PagedKVConfig paged_config = {}
     );  
 
     ~simple_kv_cache() = default;
@@ -43,9 +50,7 @@ public:
     // O(1) head-pointer truncation: discard everything after pos.
     // KV data is not zeroed; next writes will overwrite it.
     // Used by grammar backtracking and speculative-decoding rejection.
-    void truncate_to_position(int pos, uint32_t slot_idx = 0) {
-        positions[slot_idx] = static_cast<uint32_t>(pos);
-    }
+    void truncate_to_position(int pos, uint32_t slot_idx = 0);
 
     // SnapKV: compact all layers for a slot, keeping only the listed positions.
     // `retained_positions` must be sorted and unique.
@@ -63,6 +68,12 @@ public:
     ggml_tensor* gather_v(ggml_context* ctx, ggml_cgraph* gf, int32_t il, ggml_tensor* indices, uint32_t n_active, uint32_t n_kv);
 
     uint32_t get_n_ctx_max() const { return n_ctx_max; }
+    bool paged_enabled() const { return paged_enabled_; }
+    uint32_t paged_total_blocks() const { return total_blocks_; }
+    uint32_t paged_used_blocks() const;
+    uint32_t paged_free_blocks() const;
+    uint32_t logical_to_physical(uint32_t slot_idx, uint32_t logical_pos) const;
+    void fill_gather_indices(const std::vector<uint32_t>& slots, uint32_t n_kv, std::vector<int32_t>& out) const;
 
     ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }
     ggml_tensor* get_v_cache_tensor(int layer) { return v_cache[layer]; }
@@ -90,5 +101,22 @@ private:
     std::vector<uint8_t> scratch_buffer_;
     std::unique_ptr<ggml_context, void(*)(ggml_context*)> scratch_ctx;
 
+    PagedKVConfig paged_config_;
+    bool paged_enabled_ = false;
+    uint32_t paged_block_size_ = 0;
+    uint32_t total_token_capacity_ = 0;
+    uint32_t total_blocks_ = 0;
+    std::vector<int32_t> block_owner_;
+    std::vector<std::vector<uint32_t>> slot_block_tables_;
+    std::vector<uint32_t> slot_allocated_blocks_;
+
     void init_cache();
+    void ensure_slot_for_logical_range(uint32_t slot_idx, uint32_t logical_start, uint32_t n_tokens);
+    void ensure_slot_has_block(uint32_t slot_idx, uint32_t logical_block);
+    uint32_t allocate_next_block_for_slot(uint32_t slot_idx);
+    void release_slot_blocks(uint32_t slot_idx);
+    void zero_block(uint32_t block_idx);
+    uint32_t logical_to_physical_internal(uint32_t slot_idx, uint32_t logical_pos, bool allow_pending_pos) const;
+    bool slot_prefix_is_contiguous(uint32_t slot_idx, uint32_t n_tokens) const;
+    void maybe_log_paged_stats(const char* event, uint32_t slot_idx) const;
 };
