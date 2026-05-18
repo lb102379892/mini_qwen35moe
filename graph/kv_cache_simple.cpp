@@ -236,7 +236,10 @@ uint32_t simple_kv_cache::logical_to_physical_internal(uint32_t slot_idx, uint32
         throw std::runtime_error("simple_kv_cache::logical_to_physical: slot_idx out of range");
     }
     const uint32_t current_pos = positions[slot_idx];
-    const bool ok = allow_pending_pos ? (logical_pos <= current_pos) : (logical_pos < current_pos);
+    const bool has_mapping = has_materialized_logical_pos(slot_idx, logical_pos);
+    const bool ok = allow_pending_pos
+        ? (logical_pos <= current_pos || has_mapping)
+        : (logical_pos < current_pos);
     if (!ok) {
         throw std::runtime_error("simple_kv_cache::logical_to_physical: logical position not available in block table");
     }
@@ -485,27 +488,80 @@ void simple_kv_cache::set_pos(uint32_t p, uint32_t slot_idx) {
     positions[slot_idx] = p;
 }
 
-void simple_kv_cache::copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot_idx) {
+bool simple_kv_cache::has_materialized_logical_pos(uint32_t slot_idx, uint32_t logical_pos) const {
+    if (!paged_enabled_) {
+        return slot_idx < n_batch_max && logical_pos < n_ctx_max;
+    }
+    if (slot_idx >= n_batch_max || logical_pos >= n_ctx_max) {
+        return false;
+    }
+    const uint32_t logical_block = logical_pos / paged_block_size_;
+    if (logical_block >= slot_block_tables_[slot_idx].size()) {
+        return false;
+    }
+    const uint32_t physical_block = slot_block_tables_[slot_idx][logical_block];
+    if (physical_block >= block_owner_.size() ||
+        physical_block >= total_blocks_ ||
+        block_owner_[physical_block] != static_cast<int32_t>(slot_idx)) {
+        return false;
+    }
+    const uint32_t offset = logical_pos % paged_block_size_;
+    const uint32_t physical_pos = physical_block * paged_block_size_ + offset;
+    return physical_pos < total_token_capacity_;
+}
+
+bool simple_kv_cache::ensure_materialized_logical_pos(uint32_t slot_idx, uint32_t logical_pos) {
+    if (!paged_enabled_) {
+        return slot_idx < n_batch_max && logical_pos < n_ctx_max;
+    }
+    if (slot_idx >= n_batch_max || logical_pos >= n_ctx_max) {
+        return false;
+    }
+    try {
+        ensure_slot_for_logical_range(slot_idx, logical_pos, 1);
+    } catch (const std::runtime_error&) {
+        return false;
+    }
+    return has_materialized_logical_pos(slot_idx, logical_pos);
+}
+
+bool simple_kv_cache::copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot_idx) {
     GGML_ASSERT(slot_idx < n_batch_max);
     GGML_ASSERT(src_pos < n_ctx_max);
     GGML_ASSERT(dst_pos < n_ctx_max);
     if (src_pos == dst_pos) {
-        return;
+        return true;
     }
 
     GGML_ASSERT(scratch_ctx);
     ggml_reset(scratch_ctx.get());
     ggml_context* scratch = scratch_ctx.get();
 
+    uint32_t src_physical = slot_idx * n_ctx_max + src_pos;
+    uint32_t dst_physical = slot_idx * n_ctx_max + dst_pos;
     if (paged_enabled_) {
-        ensure_slot_for_logical_range(slot_idx, dst_pos, 1);
+        if (!has_materialized_logical_pos(slot_idx, src_pos)) {
+            std::fprintf(stderr,
+                "[paged-kv] copy_pos skipped: source logical position not materialized slot=%u src=%u dst=%u\n",
+                slot_idx, src_pos, dst_pos);
+            return false;
+        }
+        if (!ensure_materialized_logical_pos(slot_idx, dst_pos)) {
+            std::fprintf(stderr,
+                "[paged-kv] copy_pos skipped: destination logical position not materialized slot=%u src=%u dst=%u\n",
+                slot_idx, src_pos, dst_pos);
+            return false;
+        }
+        try {
+            src_physical = logical_to_physical_internal(slot_idx, src_pos, true);
+            dst_physical = logical_to_physical_internal(slot_idx, dst_pos, true);
+        } catch (const std::runtime_error&) {
+            std::fprintf(stderr,
+                "[paged-kv] copy_pos skipped: logical-to-physical mapping unavailable slot=%u src=%u dst=%u\n",
+                slot_idx, src_pos, dst_pos);
+            return false;
+        }
     }
-    const uint32_t src_physical = paged_enabled_
-        ? logical_to_physical_internal(slot_idx, src_pos, true)
-        : (slot_idx * n_ctx_max + src_pos);
-    const uint32_t dst_physical = paged_enabled_
-        ? logical_to_physical_internal(slot_idx, dst_pos, true)
-        : (slot_idx * n_ctx_max + dst_pos);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         ggml_tensor* k_flat = paged_enabled_ ? ggml_reshape_2d(scratch, k_cache[il], n_embd_k, total_token_capacity_) : k_cache[il];
@@ -526,6 +582,7 @@ void simple_kv_cache::copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot
         v_dst->buffer = v_cache[il]->buffer;
         ggml_backend_tensor_copy(v_src, v_dst);
     }
+    return true;
 }
 
 void simple_kv_cache::compact(uint32_t slot_idx, const std::vector<uint32_t>& retained_positions) {
