@@ -500,7 +500,9 @@ bool simple_kv_cache::has_materialized_logical_pos(uint32_t slot_idx, uint32_t l
         return false;
     }
     const uint32_t physical_block = slot_block_tables_[slot_idx][logical_block];
-    if (physical_block >= total_blocks_ || block_owner_[physical_block] != static_cast<int32_t>(slot_idx)) {
+    if (physical_block >= total_blocks_ ||
+        physical_block >= block_owner_.size() ||
+        block_owner_[physical_block] != static_cast<int32_t>(slot_idx)) {
         return false;
     }
     const uint32_t offset = logical_pos % paged_block_size_;
