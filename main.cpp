@@ -60,6 +60,8 @@ static void print_usage(const char* prog) {
         "  --verbose                Show tokenization and timing info\n"
         "  --gpu-mode      <mode>   GPU mode: off|hybrid|full (default: off)\n"
         "  --flash-attn             Use ggml_flash_attn_ext for attention\n"
+        "  --paged-kv               Enable phase-1 paged KV cache\n"
+        "  --paged-kv-block <N>     Paged KV block size in tokens (default: 16)\n"
         "\n"
         "Example:\n"
         "  %s --model model.gguf --prompt \"Hello!\" --ctx-size 128 --temp 0.7\n",
@@ -89,6 +91,8 @@ int main(int argc, char* argv[]) {
     bool        verbose      = true;
     bool        repl_mode    = false;
     bool        flash_attention = false;
+    bool        enable_paged_kv = false;
+    uint32_t    paged_kv_block_size = 16;
     DevMode     dev_mode     = DevMode::CPU_MODE;
     uint64_t    rng_seed     = 79977733;
 
@@ -115,6 +119,8 @@ int main(int argc, char* argv[]) {
         else if (arg("--no-chat"))   use_chat    = false;
         else if (arg("--verbose"))   verbose     = true;
         else if (arg("--flash-attn")) flash_attention = true;
+        else if (arg("--paged-kv")) enable_paged_kv = true;
+        else if (arg("--paged-kv-block")) paged_kv_block_size = static_cast<uint32_t>(std::max(1, atoi(next("--paged-kv-block"))));
         else if (arg("--gpu-layer"))   gpu_layer     = atoi(next("--gpu-layer"));
         else if (arg("--dev-mode")) {
             const char* mode = next("--dev-mode");
@@ -155,7 +161,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
 
     ChatEngine chat;
-    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention, n_batch, n_ubatch)) {
+    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention, n_batch, n_ubatch,
+            enable_paged_kv, paged_kv_block_size)) {
         fprintf(stderr, "Engine initialization failed\n");
         return 1;
     }
