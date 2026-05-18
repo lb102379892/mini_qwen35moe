@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <unordered_map>
+#include <string>
 #include <ggml.h>
 #include <memory>
 #include "model/model.h"
@@ -82,6 +83,7 @@ private:
         uint32_t n_batch_tokens = 0;
         uint32_t n_ubatch_tokens = 0;
         bool use_flash_attention = false;
+        bool paged_fused_decode = false;
         // Mixed-mode guard: when true the scheduler contains both GPU and CPU
         // backends. The cached-decode-graph path is disabled in this mode because
         // ggml's CUDA-graph capture/replay is unreliable across heterogeneous ops.
@@ -367,6 +369,10 @@ private:
     void ensure_cached_decode_graph(ggml_backend_sched_t scheduler, const DecodeGraphSignature& signature, uint32_t required_kv);
     void maybe_log_decode_graph_stats();
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
+    bool can_use_paged_fused_decode(const char** reason) const;
+    void maybe_log_paged_fused_fallback(const char* reason);
+    void maybe_log_paged_fused_activation();
+    void record_paged_fused_decode_timing(uint64_t delta_us);
     uint32_t snapkv_get_seq_pos(uint32_t slot_idx) const;
     void snapkv_advance_seq_pos(uint32_t slot_idx, uint32_t n_tokens);
     std::vector<float> get_output_logits(ggml_cgraph* gf);
@@ -419,7 +425,16 @@ private:
     uint32_t n_ubatch_tokens_ = 0;
     bool use_flash_attention_ = false;
     bool paged_kv_enabled_ = false;
+    bool paged_fused_decode_enabled_ = true;
+    bool paged_fused_diag_enabled_ = false;
     bool paged_prefill_fallback_warned_ = false;
+    bool paged_fused_fallback_warned_ = false;
+    std::string paged_fused_last_fallback_reason_;
+    uint64_t paged_fused_decode_attempt_count_ = 0;
+    uint64_t paged_fused_decode_hit_count_ = 0;
+    uint64_t paged_fused_decode_fallback_count_ = 0;
+    uint64_t paged_fused_decode_compute_count_ = 0;
+    uint64_t paged_fused_decode_compute_total_us_ = 0;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
     // Set via QWEN35MOE_DEV_CHECK=1 to enable lightweight device-consistency logging

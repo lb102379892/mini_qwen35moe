@@ -61,6 +61,14 @@ int main() {
 
     bool threw = false;
     try {
+        cache.fill_gather_indices({2}, 1, indices);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    require(threw, "out-of-range slot index should throw in fill_gather_indices");
+
+    threw = false;
+    try {
         (void) cache.logical_to_physical(1, 4);
     } catch (const std::runtime_error &) {
         threw = true;
