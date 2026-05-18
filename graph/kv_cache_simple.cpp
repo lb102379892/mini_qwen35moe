@@ -278,9 +278,15 @@ bool simple_kv_cache::slot_prefix_is_contiguous(uint32_t slot_idx, uint32_t n_to
 }
 
 void simple_kv_cache::fill_gather_indices(const std::vector<uint32_t>& slots, uint32_t n_kv, std::vector<int32_t>& out) const {
+    if (n_kv > n_ctx_max) {
+        throw std::runtime_error("simple_kv_cache::fill_gather_indices: n_kv exceeds n_ctx_max");
+    }
     out.assign(slots.size() * n_kv, 0);
     for (size_t b = 0; b < slots.size(); ++b) {
         const uint32_t slot = slots[b];
+        if (slot >= n_batch_max) {
+            throw std::runtime_error("simple_kv_cache::fill_gather_indices: slot index out of range");
+        }
         for (uint32_t j = 0; j < n_kv; ++j) {
             const bool allow_pending = true;
             uint32_t mapped = 0;
