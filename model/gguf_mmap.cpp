@@ -438,6 +438,82 @@ void GGUFLoader::get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_
     std::memcpy(src_data.data(), data_ + data_offset_ + tensor->offset, tensor->byte_size);
 }
 
+bool GGUFLoader::is_mmap_active() const {
+    return mmap_base_ != nullptr && mmap_base_ != MAP_FAILED;
+}
+
+ggml_backend_buffer_t GGUFLoader::create_cpu_mmap_buffer() {
+    if (!is_mmap_active()) {
+        return nullptr;
+    }
+
+    // Compute the extent of the tensor data section (offsets are relative to data_offset_).
+    size_t last_byte = 0;
+    for (const auto& t : tensors_layer_) {
+        size_t end = t.offset + t.byte_size;
+        if (end > last_byte) last_byte = end;
+    }
+    for (const auto& kv : tensors_head_) {
+        size_t end = kv.second.offset + kv.second.byte_size;
+        if (end > last_byte) last_byte = end;
+    }
+    if (last_byte == 0) {
+        return nullptr;
+    }
+
+    uint8_t* base = data_ + data_offset_;
+    // ggml_backend_cpu_buffer_from_ptr requires TENSOR_ALIGNMENT (32-byte) alignment.
+    if ((uintptr_t)base % 32 != 0) {
+        fprintf(stderr, "[mmap] data region not 32-byte aligned (addr=%p, data_offset=%zu) – fallback to copy\n",
+                (void*)base, data_offset_);
+        return nullptr;
+    }
+    return ggml_backend_cpu_buffer_from_ptr(base, last_byte);
+}
+
+bool GGUFLoader::bind_tensor_to_mmap(ggml_backend_buffer_t buf, ggml_tensor* dst, bool is_head) {
+    if (!buf || !dst) {
+        return false;
+    }
+
+    const tensor_info* ti = nullptr;
+    if (is_head) {
+        auto it = tensors_head_.find(dst->name);
+        if (it == tensors_head_.end()) {
+            fprintf(stderr, "[mmap] head tensor '%s' not found\n", dst->name);
+            return false;
+        }
+        ti = &it->second;
+    } else {
+        auto it = tensor_layer_index_map_.find(dst->name);
+        if (it == tensor_layer_index_map_.end()) {
+            fprintf(stderr, "[mmap] layer tensor '%s' not found\n", dst->name);
+            return false;
+        }
+        ti = &tensors_layer_[it->second];
+    }
+
+    uint8_t* addr = data_ + data_offset_ + ti->offset;
+
+    // Alignment safety check (TENSOR_ALIGNMENT = 32).
+    if ((uintptr_t)addr % 32 != 0) {
+        fprintf(stderr, "[mmap] tensor '%s' data addr %p not 32-byte aligned – fallback to copy\n",
+                dst->name, (void*)addr);
+        return false;
+    }
+
+    // Bounds check: tensor must fit within the buffer.
+    void* buf_base = ggml_backend_buffer_get_base(buf);
+    size_t buf_size = ggml_backend_buffer_get_size(buf);
+    if ((uintptr_t)addr < (uintptr_t)buf_base ||
+        (uintptr_t)addr + ti->byte_size > (uintptr_t)buf_base + buf_size) {
+        fprintf(stderr, "[mmap] tensor '%s' offset out of buffer bounds\n", dst->name);
+        return false;
+    }
+
+    return ggml_backend_tensor_alloc(buf, dst, addr) == GGML_STATUS_SUCCESS;
+}
+
 bool GGUFLoader::read(bool & dst) const {
     int8_t tmp = -1;
     if (!read(tmp)) {

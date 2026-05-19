@@ -13,6 +13,7 @@
 #include <set>
 #include <stdexcept>
 #include <ggml.h>
+#include <ggml-backend.h>
 #include <gguf.h>
 #include "common.h"
 
@@ -200,6 +201,17 @@ public:
     bool load_tensor_head_data(ggml_tensor* dst);
     bool load_tensor_layer_data(ggml_tensor* dst);
     void get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data);
+
+    // Zero-copy mmap helpers for CPU backend.
+    // Returns true when the mmap region is still open and usable.
+    bool is_mmap_active() const;
+    // Create a CPU backend buffer that wraps the entire mmap tensor-data region.
+    // Returns nullptr on failure (alignment issue, mmap not active, etc.).
+    ggml_backend_buffer_t create_cpu_mmap_buffer();
+    // Bind a single tensor to an existing mmap-backed buffer without copying.
+    // is_head=true  => look up in tensors_head_, false => tensors_layer_.
+    // Returns false when any safety check fails (falls back to copy path).
+    bool bind_tensor_to_mmap(ggml_backend_buffer_t buf, ggml_tensor* dst, bool is_head);
 
     int32_t get_i32_or(const char* key, int default_val);
     uint32_t get_u32_or(const char* key, uint32_t default_val);

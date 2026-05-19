@@ -103,4 +103,8 @@ public:
     ggml_context* gpu_ctx_ = nullptr;
     ggml_context* cpu_ctx_ = nullptr;
     std::vector<ggml_backend_t> layer_device_map_;
+
+    // Set to true when CPU tensors are bound directly to the mmap region (zero-copy).
+    // In that case loader_->unload() must NOT be called so the mmap stays alive.
+    bool mmap_zerocopy_active_ = false;
 };

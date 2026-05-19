@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include "model/model.h"
@@ -64,7 +65,10 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
     rebuild_layer_device_map();
 
     // 权重加载完成释放模型文件占用的内存映射，避免占用过多内存
-    loader_->unload();
+    // Skip unload when mmap zero-copy is active: tensor data pointers reference the mmap region.
+    if (!mmap_zerocopy_active_) {
+        loader_->unload();
+    }
 
     if (dev_mode_ == DevMode::GPU_MODE) {
         ggml_backend_t backends[] = {backend_gpu_, backend_cpu_};
@@ -384,23 +388,64 @@ bool Qwen35moeModel::init_cpu() {
     }
 
     // 在 CPU 上分配 buffer
-    cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
-    if (!cpu_buf_) {
-        fprintf(stderr, "[Loader] ERROR: failed to allocate CPU weight buffer\n");
-        return false;
+    // Try mmap zero-copy path first: bind tensor data pointers directly to the mmap region.
+    // Controlled by MINI_QWEN_MMAP_ZEROCOPY env var (default: enabled).
+    bool zerocopy_ok = false;
+    const char* env_zc = std::getenv("MINI_QWEN_MMAP_ZEROCOPY");
+    bool zerocopy_enabled = (env_zc == nullptr || std::string(env_zc) != "0");
+
+    if (zerocopy_enabled && loader_->is_mmap_active()) {
+        cpu_buf_ = loader_->create_cpu_mmap_buffer();
+        if (cpu_buf_) {
+            bool all_ok = true;
+            for (auto& head_iter : cpu_weights_->heads) {
+                if (!loader_->bind_tensor_to_mmap(cpu_buf_, head_iter.second, true)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                for (auto layer_iter = cpu_weights_->layers.begin();
+                     layer_iter != cpu_weights_->layers.end() && all_ok; ++layer_iter) {
+                    for (auto& layer_info : layer_iter->second->tensors) {
+                        if (!loader_->bind_tensor_to_mmap(cpu_buf_, layer_info.second, false)) {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (all_ok) {
+                zerocopy_ok = true;
+                mmap_zerocopy_active_ = true;
+                printf("[Loader] CPU mmap zero-copy enabled – skipping weight copy\n");
+            } else {
+                // At least one tensor failed; undo the partial buffer and fall through to copy path.
+                ggml_backend_buffer_free(cpu_buf_);
+                cpu_buf_ = nullptr;
+            }
+        }
     }
 
-    for (auto& head_iter : cpu_weights_->heads) {
-        loader_->load_tensor_head_data(head_iter.second);
-    }
-    auto layer_iter = cpu_weights_->layers.begin();
-    for (; layer_iter != cpu_weights_->layers.end(); ++layer_iter) {
-        for (auto& layer_info : layer_iter->second->tensors) {
-            loader_->load_tensor_layer_data(layer_info.second);
+    if (!zerocopy_ok) {
+        cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
+        if (!cpu_buf_) {
+            fprintf(stderr, "[Loader] ERROR: failed to allocate CPU weight buffer\n");
+            return false;
         }
-        printf("Loaded layer %d to CPU\n", layer_iter->first);
+
+        for (auto& head_iter : cpu_weights_->heads) {
+            loader_->load_tensor_head_data(head_iter.second);
+        }
+        auto layer_iter = cpu_weights_->layers.begin();
+        for (; layer_iter != cpu_weights_->layers.end(); ++layer_iter) {
+            for (auto& layer_info : layer_iter->second->tensors) {
+                loader_->load_tensor_layer_data(layer_info.second);
+            }
+            printf("Loaded layer %d to CPU\n", layer_iter->first);
+        }
+        printf("[Loader] CPU weight loading complete\n");
     }
-    printf("[Loader] CPU weight loading complete\n");
 
     return true;
 }
@@ -535,20 +580,51 @@ bool Qwen35moeModel::init_auto_cpu(const std::set<int, std::less<int>>& gpu_laye
     }
 
     // 在 CPU 上分配 buffer
-    cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
-    if (!cpu_buf_) {
-        fprintf(stderr, "[Loader] ERROR: failed to allocate auto CPU weight buffer\n");
-        return false;
+    // Try mmap zero-copy for CPU layer tensors in AUTO_MODE.
+    bool zerocopy_ok = false;
+    const char* env_zc = std::getenv("MINI_QWEN_MMAP_ZEROCOPY");
+    bool zerocopy_enabled = (env_zc == nullptr || std::string(env_zc) != "0");
+
+    if (zerocopy_enabled && loader_->is_mmap_active()) {
+        cpu_buf_ = loader_->create_cpu_mmap_buffer();
+        if (cpu_buf_) {
+            bool all_ok = true;
+            for (auto layer_iter = cpu_weights_->layers.begin();
+                 layer_iter != cpu_weights_->layers.end() && all_ok; ++layer_iter) {
+                for (auto& layer_info : layer_iter->second->tensors) {
+                    if (!loader_->bind_tensor_to_mmap(cpu_buf_, layer_info.second, false)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (all_ok) {
+                zerocopy_ok = true;
+                mmap_zerocopy_active_ = true;
+                printf("[Loader] auto-CPU mmap zero-copy enabled – skipping weight copy\n");
+            } else {
+                ggml_backend_buffer_free(cpu_buf_);
+                cpu_buf_ = nullptr;
+            }
+        }
     }
 
-    auto layer_iter = cpu_weights_->layers.begin();
-    for (; layer_iter != cpu_weights_->layers.end(); ++layer_iter) {
-        for (auto& layer_info : layer_iter->second->tensors) {
-            loader_->load_tensor_layer_data(layer_info.second);
+    if (!zerocopy_ok) {
+        cpu_buf_ = ggml_backend_alloc_ctx_tensors(cpu_ctx_, backend_cpu_);
+        if (!cpu_buf_) {
+            fprintf(stderr, "[Loader] ERROR: failed to allocate auto CPU weight buffer\n");
+            return false;
         }
-        printf("Loaded layer blk.%d.* to auto CPU\n", layer_iter->first);
+
+        auto layer_iter = cpu_weights_->layers.begin();
+        for (; layer_iter != cpu_weights_->layers.end(); ++layer_iter) {
+            for (auto& layer_info : layer_iter->second->tensors) {
+                loader_->load_tensor_layer_data(layer_info.second);
+            }
+            printf("Loaded layer blk.%d.* to auto CPU\n", layer_iter->first);
+        }
+        printf("[Loader] auto CPU weight loading complete\n");
     }
-    printf("[Loader] auto CPU weight loading complete\n");
 
     return true;
 }
