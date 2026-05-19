@@ -418,7 +418,7 @@ bool Qwen35moeModel::init_cpu() {
             if (all_ok) {
                 zerocopy_ok = true;
                 mmap_zerocopy_active_ = true;
-                printf("[Loader] CPU mmap zero-copy enabled – skipping weight copy\n");
+                printf("[Loader] CPU mmap zero-copy enabled -- skipping weight copy\n");
             } else {
                 // At least one tensor failed; undo the partial buffer and fall through to copy path.
                 ggml_backend_buffer_free(cpu_buf_);
@@ -601,7 +601,7 @@ bool Qwen35moeModel::init_auto_cpu(const std::set<int, std::less<int>>& gpu_laye
             if (all_ok) {
                 zerocopy_ok = true;
                 mmap_zerocopy_active_ = true;
-                printf("[Loader] auto-CPU mmap zero-copy enabled – skipping weight copy\n");
+                printf("[Loader] auto-CPU mmap zero-copy enabled -- skipping weight copy\n");
             } else {
                 ggml_backend_buffer_free(cpu_buf_);
                 cpu_buf_ = nullptr;

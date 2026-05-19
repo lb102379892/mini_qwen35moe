@@ -464,7 +464,7 @@ ggml_backend_buffer_t GGUFLoader::create_cpu_mmap_buffer() {
     uint8_t* base = data_ + data_offset_;
     // ggml_backend_cpu_buffer_from_ptr requires TENSOR_ALIGNMENT (32-byte) alignment.
     if ((uintptr_t)base % 32 != 0) {
-        fprintf(stderr, "[mmap] data region not 32-byte aligned (addr=%p, data_offset=%zu) – fallback to copy\n",
+        fprintf(stderr, "[mmap] data region not 32-byte aligned (addr=%p, data_offset=%zu) -- fallback to copy\n",
                 (void*)base, data_offset_);
         return nullptr;
     }
@@ -497,7 +497,7 @@ bool GGUFLoader::bind_tensor_to_mmap(ggml_backend_buffer_t buf, ggml_tensor* dst
 
     // Alignment safety check (TENSOR_ALIGNMENT = 32).
     if ((uintptr_t)addr % 32 != 0) {
-        fprintf(stderr, "[mmap] tensor '%s' data addr %p not 32-byte aligned – fallback to copy\n",
+        fprintf(stderr, "[mmap] tensor '%s' data addr %p not 32-byte aligned -- fallback to copy\n",
                 dst->name, (void*)addr);
         return false;
     }
