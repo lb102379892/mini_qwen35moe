@@ -49,6 +49,13 @@ bool backend_name_contains_cuda(ggml_backend_t backend) {
     const char* name = ggml_backend_name(backend);
     return name != nullptr && std::strstr(name, CUDA_BACKEND_NAME) != nullptr;
 }
+
+bool tensor_on_backend(const ggml_tensor* tensor, ggml_backend_t backend) {
+    if (!tensor || !backend || !tensor->buffer) {
+        return true;
+    }
+    return ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_get_default_buffer_type(backend);
+}
 }
 
 uint32_t Qwen35moeForwardPass::decode_cache_bucket_capacity(uint32_t required_kv) const {
@@ -213,14 +220,23 @@ void Qwen35moeForwardPass::prepare_first_segment_hidden_from_token(
         throw std::runtime_error(std::string(where) + ": token embedding weight missing");
     }
 
-    reset_context();
-    ggml_cgraph* gf = new_graph();
-    ggml_tensor* tok_t = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
+    std::vector<uint8_t> bridge_ctx_buffer(FP_GRAPH_SIZE_METADATA);
+    ggml_init_params bridge_params = {
+        .mem_size = bridge_ctx_buffer.size(),
+        .mem_buffer = bridge_ctx_buffer.data(),
+        .no_alloc = true,
+    };
+    ggml_context* bridge_ctx = ggml_init(bridge_params);
+    if (!bridge_ctx) {
+        throw std::runtime_error(std::string(where) + ": token embedding bridge ggml_init failed");
+    }
+    ggml_cgraph* gf = ggml_new_graph_custom(bridge_ctx, FP_GRAPH_SIZE, false);
+    ggml_tensor* tok_t = ggml_new_tensor_1d(bridge_ctx, GGML_TYPE_I32, 1);
     ggml_set_input(tok_t);
     set_tensor_name(tok_t, "tokens");
     ggml_build_forward_expand(gf, tok_t);
 
-    ggml_tensor* hidden_out = ggml_get_rows(ctx_, token_embedding, tok_t);
+    ggml_tensor* hidden_out = ggml_get_rows(bridge_ctx, token_embedding, tok_t);
     set_tensor_name(hidden_out, "segment_hidden_out");
     ggml_build_forward_expand(gf, hidden_out);
 
@@ -232,6 +248,7 @@ void Qwen35moeForwardPass::prepare_first_segment_hidden_from_token(
     ggml_gallocr_t embed_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(embed_backend));
     if (!ggml_gallocr_alloc_graph(embed_alloc, gf)) {
         ggml_gallocr_free(embed_alloc);
+        ggml_free(bridge_ctx);
         throw std::runtime_error(std::string(where) + ": token embedding graph alloc failed");
     }
 
@@ -240,6 +257,7 @@ void Qwen35moeForwardPass::prepare_first_segment_hidden_from_token(
     ggml_backend_graph_compute(embed_backend, gf);
     read_segment_hidden_out(where, &first_segment, gf, hidden_data, hidden_type);
     ggml_gallocr_free(embed_alloc);
+    ggml_free(bridge_ctx);
 
     if (dev_check_enabled_) {
         std::fprintf(
@@ -261,6 +279,7 @@ Qwen35moeForwardPass::Qwen35moeForwardPass() {
  * @brief 析构函数：释放 ggml 上下文资源
  */
 Qwen35moeForwardPass::~Qwen35moeForwardPass() {
+    invalidate_segmented_decode_cache();
     if (ctx_) {
         ggml_free(ctx_);
     }
@@ -331,8 +350,7 @@ int Qwen35moeForwardPass::init(const uint32_t context_len, const uint32_t max_ba
     }
     if (model_->is_mixed_mode()) {
         std::fprintf(stderr,
-            "[dev-mode=auto] mixed GPU/CPU detected (device_map_hash=0x%llx): "
-            "decode cached-graph disabled, using eager execution per step.\n",
+            "[dev-mode=auto] mixed GPU/CPU weights detected (device_map_hash=0x%llx)\n",
             static_cast<unsigned long long>(model_->compute_device_map_hash()));
     }
 
@@ -416,6 +434,16 @@ void Qwen35moeForwardPass::configure_device_sampling(int top_k, float temperatur
  * 在每次构建新的计算图前调用，确保上下文干净
  */
 void Qwen35moeForwardPass::reset_context() {
+    invalidate_segmented_decode_cache();
+    cached_decode_graph_ = nullptr;
+    cached_decode_graph_allocated_ = false;
+    cached_decode_signature_valid_ = false;
+    cached_decode_tokens_tensor_ = nullptr;
+    cached_decode_pos_tensor_ = nullptr;
+    cached_decode_mask_tensors_.clear();
+    cached_decode_mask_f32_.clear();
+    cached_decode_mask_f16_.clear();
+    cached_decode_last_mask_pos_ = -1;
     if (ctx_) {
         ggml_free(ctx_);
     }
@@ -759,7 +787,7 @@ bool Qwen35moeForwardPass::can_use_paged_fused_decode(const char** reason) const
         if (reason) *reason = "cuda-backend-unavailable";
         return false;
     }
-    if (model_->is_mixed_mode()) {
+    if (should_force_segmented_decode_path()) {
         if (reason) *reason = "mixed-mode-unsupported";
         return false;
     }
@@ -1020,6 +1048,192 @@ void Qwen35moeForwardPass::rebuild_layer_segments() {
     }
 }
 
+bool Qwen35moeForwardPass::can_use_cached_decode_path_in_auto_mode() const {
+    if (!model_->is_mixed_mode()) {
+        return true;
+    }
+    const ggml_backend_t decode_backend = model_->get_curr_backend();
+    if (!backend_name_contains_cuda(decode_backend)) {
+        return false;
+    }
+    if (layer_segments_.empty()) {
+        return false;
+    }
+    for (const auto& segment : layer_segments_) {
+        if (!backend_name_contains_cuda(segment.backend)) {
+            return false;
+        }
+    }
+
+    if (!tensor_on_backend(model_->get_token_embedding_weight(), decode_backend) ||
+        !tensor_on_backend(model_->get_output_norm_weight(), decode_backend) ||
+        !tensor_on_backend(model_->get_output_weight(), decode_backend)) {
+        return false;
+    }
+    return true;
+}
+
+bool Qwen35moeForwardPass::should_force_segmented_decode_path() const {
+    return model_->is_mixed_mode() && !can_use_cached_decode_path_in_auto_mode();
+}
+
+bool Qwen35moeForwardPass::is_segmented_decode_cache_compatible(const SegmentedDecodeSignature& signature) const {
+    return segmented_decode_signature_valid_ &&
+           segmented_decode_signature_.slot_idx == signature.slot_idx &&
+           segmented_decode_signature_.context_len == signature.context_len &&
+           segmented_decode_signature_.n_batch_tokens == signature.n_batch_tokens &&
+           segmented_decode_signature_.n_ubatch_tokens == signature.n_ubatch_tokens &&
+           segmented_decode_signature_.use_flash_attention == signature.use_flash_attention &&
+           segmented_decode_signature_.is_mixed_mode == signature.is_mixed_mode &&
+           segmented_decode_signature_.device_map_hash == signature.device_map_hash &&
+           segmented_decode_signature_.topk_enabled == signature.topk_enabled &&
+           segmented_decode_signature_.topk_k == signature.topk_k &&
+           !segmented_decode_graph_cache_.empty() &&
+           segmented_decode_head_graph_logits_ != nullptr &&
+           segmented_decode_head_alloc_logits_ != nullptr &&
+           (!signature.topk_enabled || (segmented_decode_head_graph_topk_ != nullptr && segmented_decode_head_alloc_topk_ != nullptr));
+}
+
+void Qwen35moeForwardPass::invalidate_segmented_decode_cache() {
+    if (segmented_decode_head_alloc_logits_) {
+        ggml_gallocr_free(segmented_decode_head_alloc_logits_);
+        segmented_decode_head_alloc_logits_ = nullptr;
+    }
+    if (segmented_decode_head_alloc_topk_) {
+        ggml_gallocr_free(segmented_decode_head_alloc_topk_);
+        segmented_decode_head_alloc_topk_ = nullptr;
+    }
+    for (auto& item : segmented_decode_graph_cache_) {
+        if (item.allocr) {
+            ggml_gallocr_free(item.allocr);
+            item.allocr = nullptr;
+        }
+    }
+    segmented_decode_graph_cache_.clear();
+    segmented_decode_head_graph_logits_ = nullptr;
+    segmented_decode_head_graph_topk_ = nullptr;
+    segmented_decode_signature_valid_ = false;
+}
+
+void Qwen35moeForwardPass::ensure_segmented_decode_cache(uint32_t slot_idx, bool need_topk) {
+    // Segmented cache key includes slot/layout invariants and device partition hash.
+    // If any of these change, graphs/allocators are rebuilt for correctness.
+    SegmentedDecodeSignature signature{};
+    signature.slot_idx = slot_idx;
+    signature.context_len = context_len_;
+    signature.n_batch_tokens = n_batch_tokens_;
+    signature.n_ubatch_tokens = n_ubatch_tokens_;
+    signature.use_flash_attention = use_flash_attention_;
+    signature.is_mixed_mode = model_->is_mixed_mode();
+    signature.device_map_hash = model_->compute_device_map_hash();
+    signature.topk_enabled = need_topk;
+    signature.topk_k = need_topk ? sampling_top_k_ : 0;
+
+    segmented_decode_cache_lookup_count_++;
+    if (is_segmented_decode_cache_compatible(signature)) {
+        segmented_decode_cache_hit_count_++;
+        return;
+    }
+
+    segmented_decode_cache_miss_count_++;
+    if (segmented_decode_signature_valid_) {
+        segmented_decode_cache_evict_count_++;
+    }
+    invalidate_segmented_decode_cache();
+
+    // Single-entry cache by design to keep memory bounded: one active segmented
+    // execution signature (slot/layout/device map) is retained and replaced on miss.
+    reset_context();
+    ggml_type hidden_type = GGML_TYPE_F32;
+    segmented_decode_graph_cache_.reserve(layer_segments_.size());
+    for (size_t i = 0; i < layer_segments_.size(); ++i) {
+        const LayerSegment& segment = layer_segments_[i];
+        const bool first = i == 0;
+        const bool first_uses_token_input = first && can_run_token_embedding_on_backend(segment.backend);
+        ggml_cgraph* gf = build_decode_segment_graph(
+            0,
+            0,
+            slot_idx,
+            segment,
+            first_uses_token_input,
+            false,
+            hidden_type,
+            false
+        );
+
+        ggml_gallocr_t seg_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(segment.backend));
+        if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::ensure_segmented_decode_cache: segment alloc failed");
+        }
+
+        ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "segment_hidden_out");
+        if (!hidden_out) {
+            ggml_gallocr_free(seg_alloc);
+            throw std::runtime_error("Qwen35moeForwardPass::ensure_segmented_decode_cache: segment hidden output missing");
+        }
+
+        SegmentedDecodeGraphCacheEntry entry{};
+        entry.segment = segment;
+        entry.graph = gf;
+        entry.allocr = seg_alloc;
+        entry.first_uses_token_input = first_uses_token_input;
+        entry.hidden_input_type = hidden_type;
+        entry.hidden_output_type = hidden_out->type;
+        entry.reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
+        segmented_decode_graph_cache_.push_back(entry);
+        hidden_type = hidden_out->type;
+    }
+
+    segmented_decode_head_graph_logits_ = build_output_head_graph_from_hidden(hidden_type, false);
+    segmented_decode_head_alloc_logits_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_->get_curr_backend()));
+    if (!ggml_gallocr_alloc_graph(segmented_decode_head_alloc_logits_, segmented_decode_head_graph_logits_)) {
+        throw std::runtime_error("Qwen35moeForwardPass::ensure_segmented_decode_cache: head logits alloc failed");
+    }
+
+    if (need_topk) {
+        segmented_decode_head_graph_topk_ = build_output_head_graph_from_hidden(hidden_type, false);
+        segmented_decode_head_alloc_topk_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_->get_curr_backend()));
+        if (!ggml_gallocr_alloc_graph(segmented_decode_head_alloc_topk_, segmented_decode_head_graph_topk_)) {
+            throw std::runtime_error("Qwen35moeForwardPass::ensure_segmented_decode_cache: head topk alloc failed");
+        }
+    }
+
+    segmented_decode_final_hidden_type_ = hidden_type;
+    segmented_decode_signature_ = signature;
+    segmented_decode_signature_valid_ = true;
+    segmented_decode_cache_rebuild_count_++;
+}
+
+void Qwen35moeForwardPass::maybe_log_segmented_decode_cache_stats() {
+    if (!decode_graph_diag_enabled_ && !dev_check_enabled_) {
+        return;
+    }
+    if (segmented_decode_cache_lookup_count_ == 0) {
+        return;
+    }
+    bool interval_reached = false;
+    if (decode_graph_diag_interval_ > 0) {
+        interval_reached = (segmented_decode_cache_lookup_count_ % decode_graph_diag_interval_) == 0;
+    }
+    if (!interval_reached && segmented_decode_cache_lookup_count_ == segmented_decode_last_logged_lookup_) {
+        return;
+    }
+    size_t staged_capacity = segmented_decode_hidden_staging_.capacity();
+    std::fprintf(
+        stderr,
+        "[PERF][segmented-cache] lookups=%llu hit=%llu miss=%llu rebuild=%llu evict=%llu staged_hidden_capacity=%zu signature_hash=0x%llx\n",
+        static_cast<unsigned long long>(segmented_decode_cache_lookup_count_),
+        static_cast<unsigned long long>(segmented_decode_cache_hit_count_),
+        static_cast<unsigned long long>(segmented_decode_cache_miss_count_),
+        static_cast<unsigned long long>(segmented_decode_cache_rebuild_count_),
+        static_cast<unsigned long long>(segmented_decode_cache_evict_count_),
+        staged_capacity,
+        static_cast<unsigned long long>(segmented_decode_signature_.device_map_hash)
+    );
+    segmented_decode_last_logged_lookup_ = segmented_decode_cache_lookup_count_;
+}
+
 /**
  * @brief 构建 Decode 阶段计算图（支持多序列并行）
  * 
@@ -1278,10 +1492,13 @@ ggml_cgraph* Qwen35moeForwardPass::build_decode_segment_graph(
     const LayerSegment& segment,
     bool is_first_segment,
     bool is_last_segment,
-    ggml_type hidden_type
+    ggml_type hidden_type,
+    bool reset_ctx
 ) {
     (void)is_last_segment;
-    reset_context();
+    if (reset_ctx) {
+        reset_context();
+    }
     ggml_cgraph* gf = new_graph();
 
     ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
@@ -1309,8 +1526,10 @@ ggml_cgraph* Qwen35moeForwardPass::build_decode_segment_graph(
     return gf;
 }
 
-ggml_cgraph* Qwen35moeForwardPass::build_output_head_graph_from_hidden(ggml_type hidden_type) {
-    reset_context();
+ggml_cgraph* Qwen35moeForwardPass::build_output_head_graph_from_hidden(ggml_type hidden_type, bool reset_ctx) {
+    if (reset_ctx) {
+        reset_context();
+    }
     ggml_cgraph* gf = new_graph();
     const int64_t n_embd = static_cast<int64_t>(model_->meta_->qwen35moe.embedding_length);
     ggml_tensor* inpL = ggml_new_tensor_2d(ctx_, hidden_type, n_embd, 1);
@@ -1381,73 +1600,57 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
         std::vector<int32_t> token_vec = { token };
         return run_prefill(token_vec, pos, slot_idx, nullptr);
     }
+    ensure_segmented_decode_cache(slot_idx, false);
 
-    std::vector<uint8_t> hidden_data;
+    std::vector<uint8_t>& hidden_data = segmented_decode_hidden_staging_;
+    hidden_data.clear();
     ggml_type hidden_type = GGML_TYPE_F32;
-    for (size_t i = 0; i < layer_segments_.size(); ++i) {
+    for (size_t i = 0; i < segmented_decode_graph_cache_.size(); ++i) {
+        auto& cached = segmented_decode_graph_cache_[i];
         const bool first = i == 0;
-        const LayerSegment& segment = layer_segments_[i];
-        const bool first_uses_token_input = first && can_run_token_embedding_on_backend(segment.backend);
-        if (first && !first_uses_token_input) {
+        if (first && !cached.first_uses_token_input) {
             prepare_first_segment_hidden_from_token(
                 "Qwen35moeForwardPass::run_decode_segmented",
                 token,
-                segment,
+                cached.segment,
                 hidden_data,
                 hidden_type
             );
         }
-        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, segment, first_uses_token_input, false, hidden_type);
-
-        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(segment.backend);
-        ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
-        if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
-            ggml_gallocr_free(seg_alloc);
-            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: segment alloc failed");
-        }
-        const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
-        // std::fprintf(stderr,
-        //     "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
-        //     i,
-        //     layer_segments_[i].l0,
-        //     layer_segments_[i].l1,
-        //     ggml_backend_name(layer_segments_[i].backend),
-        //     reserve_bytes);
-
-        set_segment_inputs(gf, token, pos, hidden_type, first_uses_token_input ? nullptr : &hidden_data, &segment, segment.l0, segment.l1);
-        ggml_backend_graph_compute(segment.backend, gf);
-        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented", &segment, gf, hidden_data, hidden_type);
-        ggml_gallocr_free(seg_alloc);
+        set_segment_inputs(
+            cached.graph,
+            token,
+            pos,
+            cached.hidden_input_type,
+            cached.first_uses_token_input ? nullptr : &hidden_data,
+            &cached.segment,
+            cached.segment.l0,
+            cached.segment.l1
+        );
+        ggml_backend_graph_compute(cached.segment.backend, cached.graph);
+        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented", &cached.segment, cached.graph, hidden_data, hidden_type);
     }
-
-    ggml_cgraph* gf_head = build_output_head_graph_from_hidden(hidden_type);
+    ggml_cgraph* gf_head = segmented_decode_head_graph_logits_;
     ggml_backend_t head_backend = model_->get_curr_backend();
-    ggml_gallocr_t head_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(head_backend));
-    if (!ggml_gallocr_alloc_graph(head_alloc, gf_head)) {
-        ggml_gallocr_free(head_alloc);
-        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head alloc failed");
-    }
     if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
         if (hidden_data.empty()) {
-            ggml_gallocr_free(head_alloc);
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: head hidden mismatch");
         }
-        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented: head", hidden_in, hidden_type, hidden_data.size());
+        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented: head", hidden_in, segmented_decode_final_hidden_type_, hidden_data.size());
         maybe_log_segment_tensor("head_segment_hidden_in", nullptr, hidden_in);
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
-    const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
+    const size_t head_reserve = ggml_gallocr_get_buffer_size(segmented_decode_head_alloc_logits_, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
     ggml_tensor* head_logits = ggml_graph_get_tensor(gf_head, "logits");
     if (!head_logits) {
-        ggml_gallocr_free(head_alloc);
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented: logits tensor missing in head graph");
     }
     maybe_log_segment_tensor("head_logits", nullptr, head_logits);
     std::vector<float> logits = get_output_logits(gf_head);
-    ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
+    maybe_log_segmented_decode_cache_stats();
     return logits;
 }
 
@@ -1459,75 +1662,60 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
         std::vector<int32_t> token_vec = { token };
         return run_prefill_topk(token_vec, pos, slot_idx, nullptr);
     }
+    ensure_segmented_decode_cache(slot_idx, true);
 
-    std::vector<uint8_t> hidden_data;
+    std::vector<uint8_t>& hidden_data = segmented_decode_hidden_staging_;
+    hidden_data.clear();
     ggml_type hidden_type = GGML_TYPE_F32;
-    for (size_t i = 0; i < layer_segments_.size(); ++i) {
+    for (size_t i = 0; i < segmented_decode_graph_cache_.size(); ++i) {
+        auto& cached = segmented_decode_graph_cache_[i];
         const bool first = i == 0;
-        const LayerSegment& segment = layer_segments_[i];
-        const bool first_uses_token_input = first && can_run_token_embedding_on_backend(segment.backend);
-        if (first && !first_uses_token_input) {
+        if (first && !cached.first_uses_token_input) {
             prepare_first_segment_hidden_from_token(
                 "Qwen35moeForwardPass::run_decode_segmented_topk",
                 token,
-                segment,
+                cached.segment,
                 hidden_data,
                 hidden_type
             );
         }
-        ggml_cgraph* gf = build_decode_segment_graph(token, pos, slot_idx, segment, first_uses_token_input, false, hidden_type);
-
-        const ggml_backend_buffer_type_t seg_buft = ggml_backend_get_default_buffer_type(segment.backend);
-        ggml_gallocr_t seg_alloc = ggml_gallocr_new(seg_buft);
-        if (!ggml_gallocr_alloc_graph(seg_alloc, gf)) {
-            ggml_gallocr_free(seg_alloc);
-            throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: segment alloc failed");
-        }
-        const size_t reserve_bytes = ggml_gallocr_get_buffer_size(seg_alloc, 0);
-        // std::fprintf(stderr,
-        //     "[dev-mode=auto] segmented reserve segment[%zu]=[%u,%u) backend=%s bytes=%zu\n",
-        //     i,
-        //     layer_segments_[i].l0,
-        //     layer_segments_[i].l1,
-        //     ggml_backend_name(layer_segments_[i].backend),
-        //     reserve_bytes);
-
-        set_segment_inputs(gf, token, pos, hidden_type, first_uses_token_input ? nullptr : &hidden_data, &segment, segment.l0, segment.l1);
-        ggml_backend_graph_compute(segment.backend, gf);
-        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented_topk", &segment, gf, hidden_data, hidden_type);
-        ggml_gallocr_free(seg_alloc);
+        set_segment_inputs(
+            cached.graph,
+            token,
+            pos,
+            cached.hidden_input_type,
+            cached.first_uses_token_input ? nullptr : &hidden_data,
+            &cached.segment,
+            cached.segment.l0,
+            cached.segment.l1
+        );
+        ggml_backend_graph_compute(cached.segment.backend, cached.graph);
+        read_segment_hidden_out("Qwen35moeForwardPass::run_decode_segmented_topk", &cached.segment, cached.graph, hidden_data, hidden_type);
     }
 
-    ggml_cgraph* gf_head = build_output_head_graph_from_hidden(hidden_type);
+    ggml_cgraph* gf_head = segmented_decode_head_graph_topk_;
     ggml_backend_t head_backend = model_->get_curr_backend();
-    ggml_gallocr_t head_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(head_backend));
-    if (!ggml_gallocr_alloc_graph(head_alloc, gf_head)) {
-        ggml_gallocr_free(head_alloc);
-        throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head alloc failed");
-    }
     if (ggml_tensor* hidden_in = ggml_graph_get_tensor(gf_head, "segment_hidden_in")) {
         if (hidden_data.empty()) {
-            ggml_gallocr_free(head_alloc);
             throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: head hidden mismatch");
         }
-        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented_topk: head", hidden_in, hidden_type, hidden_data.size());
+        validate_handoff_tensor("Qwen35moeForwardPass::run_decode_segmented_topk: head", hidden_in, segmented_decode_final_hidden_type_, hidden_data.size());
         maybe_log_segment_tensor("head_segment_hidden_in", nullptr, hidden_in);
         ggml_backend_tensor_set(hidden_in, hidden_data.data(), 0, hidden_data.size());
     }
-    const size_t head_reserve = ggml_gallocr_get_buffer_size(head_alloc, 0);
+    const size_t head_reserve = ggml_gallocr_get_buffer_size(segmented_decode_head_alloc_topk_, 0);
     //std::fprintf(stderr, "[dev-mode=auto] segmented reserve output_head backend=%s bytes=%zu\n", ggml_backend_name(head_backend), head_reserve);
     ggml_backend_graph_compute(head_backend, gf_head);
     ggml_tensor* logits_scaled = ggml_graph_get_tensor(gf_head, "logits_scaled");
     ggml_tensor* topk_idx = ggml_graph_get_tensor(gf_head, "sample_topk_idx");
     if (!logits_scaled || !topk_idx) {
-        ggml_gallocr_free(head_alloc);
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: missing logits_scaled or sample_topk_idx in head graph");
     }
     maybe_log_segment_tensor("head_logits_scaled", nullptr, logits_scaled);
     maybe_log_segment_tensor("head_topk_idx", nullptr, topk_idx);
     TopKSampleCandidates result = get_output_topk_candidates(gf_head, 0);
-    ggml_gallocr_free(head_alloc);
     advance_cache(1, slot_idx);
+    maybe_log_segmented_decode_cache_stats();
     return result;
 }
 
@@ -1713,11 +1901,16 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
         }
     }
 
-    // Mixed GPU/CPU mode: the cached-decode-graph optimisation is unsafe because
-    // ggml's CUDA-graph capture/replay does not support cross-device operations.
-    // Force segmented eager execution with per-backend allocators.
-    if (model_->is_mixed_mode()) {
+    // AUTO mixed mode only forces segmented decode when the active placement
+    // actually spans CPU+GPU for decode. If all decode-critical tensors are on
+    // CUDA, keep using the cached decode graph path for throughput.
+    if (should_force_segmented_decode_path()) {
         return run_decode_segmented(token, pos, slot_idx);
+    }
+    if (model_->is_mixed_mode() && !mixed_mode_cached_decode_logged_) {
+        std::fprintf(stderr,
+            "[dev-mode=auto] mixed weights detected but decode path is fully CUDA-capable; using cached decode graph path.\n");
+        mixed_mode_cached_decode_logged_ = true;
     }
 
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
@@ -1778,9 +1971,13 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
         }
     }
 
-    // Mixed GPU/CPU mode: force segmented eager decode.
-    if (model_->is_mixed_mode()) {
+    if (should_force_segmented_decode_path()) {
         return run_decode_segmented_topk(token, pos, slot_idx);
+    }
+    if (model_->is_mixed_mode() && !mixed_mode_cached_decode_logged_) {
+        std::fprintf(stderr,
+            "[dev-mode=auto] mixed weights detected but decode path is fully CUDA-capable; using cached decode graph path.\n");
+        mixed_mode_cached_decode_logged_ = true;
     }
 
     const uint32_t required_kv = static_cast<uint32_t>(pos) + 1;
