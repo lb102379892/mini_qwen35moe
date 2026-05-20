@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <cstdio>
+#include "pipeline/context_limit.h"
 
 ChatEngine::ChatEngine() {
     std::random_device rd;
@@ -112,9 +113,10 @@ int ChatEngine::sample_from_topk_candidates(const TopKSampleCandidates& candidat
     return sorted[dist(gpu_sampling_rng_)].first;
 }
 
-bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response) {
+bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, std::string& response, std::string* finish_reason) {
     printf("run_complete: prompt='%s', max_tokens=%d\n", prompt.c_str(), max_tokens);
     auto m = model_->meta_;
+    std::string finish_reason_local = "stop";
     forward_pass_->reset_sequence(0);
 
     std::vector<int32_t> tokens = tokenizer_->encode(prompt);
@@ -154,8 +156,13 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     // PLD state for single-prompt mode
     std::vector<int32_t> prompt_tokens_for_pld = tokens;  // Original prompt
     std::vector<int32_t> generated_tokens;
-    tokens.reserve(tokens.size() + static_cast<size_t>(max_tokens));
-    generated_tokens.reserve(static_cast<size_t>(max_tokens));
+    const uint32_t requested_tokens = max_tokens > 0 ? static_cast<uint32_t>(max_tokens) : 0;
+    const uint32_t initial_cache_pos = forward_pass_->get_cache_pos(0);
+    const uint32_t context_budget = qwen35moe_clamp_generation_tokens(
+        initial_cache_pos, forward_pass_->get_context_len(), requested_tokens);
+    const bool context_budget_limited = context_budget < requested_tokens;
+    tokens.reserve(tokens.size() + static_cast<size_t>(context_budget));
+    generated_tokens.reserve(static_cast<size_t>(context_budget));
 
     double decode_tok_decode_ms = 0.0;
     double decode_forward_ms = 0.0;
@@ -164,7 +171,13 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     size_t perf_steps = 0;
 
     auto t_decode_start = Clock::now();
-    for (int i = 0; i < max_tokens; ++i) {
+    for (uint32_t i = 0; i < context_budget; ++i) {
+        const uint32_t current_pos = forward_pass_->get_cache_pos(0);
+        if (!forward_pass_->can_decode_at_position(current_pos)) {
+            finish_reason_local = "length";
+            break;
+        }
+
         if (next_token_id == eos_token_id ||
             (has_im_end_token_id && next_token_id == im_end_token_id) ||
             (has_endoftext_token_id && next_token_id == endoftext_token_id)) {
@@ -186,13 +199,15 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         generated_tokens.push_back(next_token_id);
 
         // --- Normal decode path ---
-        int current_pos = forward_pass_->get_cache_pos(0); // Slot 0
-
         if (use_gpu_topk_sampling_) {
             auto t2 = Clock::now();
             TopKSampleCandidates decode_candidates =
                 forward_pass_->run_decode_cached_topk(next_token_id, current_pos, 0, sched_);
             auto t3 = Clock::now();
+            if (decode_candidates.token_ids.empty()) {
+                finish_reason_local = "length";
+                break;
+            }
 
             next_token_id = sample_from_topk_candidates(decode_candidates, top_p_);
             auto t4 = Clock::now();
@@ -202,7 +217,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
             if (i < 8 || ((i + 1) % 64 == 0)) {
                 std::printf("[PERF][decode step=%d pos=%d][gpu-topk] forward=%.3f ms sample_cpu=%.3f ms k=%zu\n",
-                    i, current_pos,
+                    static_cast<int>(i), static_cast<int>(current_pos),
                     std::chrono::duration<double, std::milli>(t3 - t2).count(),
                     std::chrono::duration<double, std::milli>(t4 - t3).count(),
                     decode_candidates.token_ids.size());
@@ -212,6 +227,10 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
             std::vector<float> token_logits =
                 forward_pass_->run_decode_cached(next_token_id, current_pos, 0, sched_);
             auto t3 = Clock::now();
+            if (token_logits.empty()) {
+                finish_reason_local = "length";
+                break;
+            }
 
             last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
             auto t4 = Clock::now();
@@ -225,7 +244,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
             if (i < 8 || ((i + 1) % 64 == 0)) {
                 std::printf("[PERF][decode step=%d pos=%d][cpu-sample] forward=%.3f ms logits_copy=%.3f ms sample=%.3f ms vocab=%zu\n",
-                    i, current_pos,
+                    static_cast<int>(i), static_cast<int>(current_pos),
                     std::chrono::duration<double, std::milli>(t3 - t2).count(),
                     std::chrono::duration<double, std::milli>(t4 - t3).count(),
                     std::chrono::duration<double, std::milli>(t5 - t4).count(),
@@ -234,6 +253,9 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
         }
 
         perf_steps++;
+    }
+    if (context_budget_limited && generated_tokens.size() == context_budget) {
+        finish_reason_local = "length";
     }
     auto t_decode_end = Clock::now();
     printf("response: [%s].\n", response.c_str());
@@ -257,6 +279,10 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
             decode_logits_copy_ms / perf_steps,
             decode_sample_ms / perf_steps
         );
+    }
+
+    if (finish_reason) {
+        *finish_reason = finish_reason_local;
     }
 
     return true;

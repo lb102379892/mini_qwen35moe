@@ -403,7 +403,8 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
 
     std::string generated_text;
-    engine_->run_complete(prompt, max_tokens, generated_text);
+    std::string finish_reason = "stop";
+    engine_->run_complete(prompt, max_tokens, generated_text, &finish_reason);
     std::string escaped_content = json_escape(generated_text);
 
     // Build OpenAI-compatible response
@@ -415,7 +416,7 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
         << "\"choices\":[{"
         << "\"index\":0,"
         << "\"message\":{\"role\":\"assistant\",\"content\":\"" << escaped_content << "\"},"
-        << "\"finish_reason\":\"stop\""
+        << "\"finish_reason\":\"" << json_escape(finish_reason) << "\""
         << "}]"
         << "}";
 
