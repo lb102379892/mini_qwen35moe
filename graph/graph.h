@@ -68,9 +68,6 @@ public:
     void configure_device_sampling(int top_k, float temperature);
 
     uint32_t get_cache_pos(uint32_t slot_idx) const;
-    uint32_t get_context_len() const;
-    bool can_decode_at_position(uint32_t pos) const;
-    bool can_decode_at_position(int pos) const;
 
 private:
     struct LayerSegment {
@@ -87,34 +84,13 @@ private:
         uint32_t n_ubatch_tokens = 0;
         bool use_flash_attention = false;
         bool paged_fused_decode = false;
-        // Mixed-mode marker: used in cache signatures so graph capture is only
-        // reused when AUTO placement mode is unchanged.
+        // Mixed-mode guard: when true the scheduler contains both GPU and CPU
+        // backends. The cached-decode-graph path is disabled in this mode because
+        // ggml's CUDA-graph capture/replay is unreliable across heterogeneous ops.
         bool is_mixed_mode = false;
         // FNV-1a hash of the current layer→device assignment in AUTO_MODE.
         // Any change in layer placement forces a full graph recapture.
         uint64_t device_map_hash = 0;
-    };
-
-    struct SegmentedDecodeSignature {
-        uint32_t slot_idx = 0;
-        uint32_t context_len = 0;
-        uint32_t n_batch_tokens = 0;
-        uint32_t n_ubatch_tokens = 0;
-        bool use_flash_attention = false;
-        bool is_mixed_mode = false;
-        uint64_t device_map_hash = 0;
-        bool topk_enabled = false;
-        int topk_k = 0;
-    };
-
-    struct SegmentedDecodeGraphCacheEntry {
-        LayerSegment segment{};
-        ggml_cgraph* graph = nullptr;
-        ggml_gallocr_t allocr = nullptr;
-        bool first_uses_token_input = false;
-        ggml_type hidden_input_type = GGML_TYPE_F32;
-        ggml_type hidden_output_type = GGML_TYPE_F32;
-        size_t reserve_bytes = 0;
     };
 
     // Create a new graph
@@ -137,10 +113,9 @@ private:
         const LayerSegment& segment,
         bool is_first_segment,
         bool is_last_segment,
-        ggml_type hidden_type,
-        bool reset_ctx = true
+        ggml_type hidden_type
     );
-    ggml_cgraph* build_output_head_graph_from_hidden(ggml_type hidden_type, bool reset_ctx = true);
+    ggml_cgraph* build_output_head_graph_from_hidden(ggml_type hidden_type);
     bool can_run_token_embedding_on_backend(ggml_backend_t backend) const;
     ggml_backend_t find_backend_for_tensor(const ggml_tensor* tensor) const;
     void maybe_log_segment_tensor(
@@ -181,12 +156,6 @@ private:
     std::vector<float> run_decode_segmented(int32_t token, int pos, uint32_t slot_idx);
     TopKSampleCandidates run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx);
     void rebuild_layer_segments();
-    bool can_use_cached_decode_path_in_auto_mode() const;
-    bool should_force_segmented_decode_path() const;
-    bool is_segmented_decode_cache_compatible(const SegmentedDecodeSignature& signature) const;
-    void invalidate_segmented_decode_cache();
-    void ensure_segmented_decode_cache(uint32_t slot_idx, bool need_topk);
-    void maybe_log_segmented_decode_cache_stats();
 
     // Inline MoE FFN for one physical layer, after the pre-FFN norm has been applied.
     // Returns the FFN output (before residual). il is the physical layer index.
@@ -398,7 +367,6 @@ private:
     uint32_t decode_cache_bucket_capacity(uint32_t required_kv) const;
     bool is_cached_decode_graph_compatible(const DecodeGraphSignature& signature, uint32_t required_kv) const;
     void ensure_cached_decode_graph(ggml_backend_sched_t scheduler, const DecodeGraphSignature& signature, uint32_t required_kv);
-    void invalidate_cached_decode_graph_state();
     void maybe_log_decode_graph_stats();
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     bool can_use_paged_fused_decode(const char** reason) const;
@@ -470,22 +438,6 @@ private:
     uint64_t paged_fused_decode_compute_total_us_ = 0;
     int sampling_top_k_ = 0;
     float sampling_temperature_ = 0.0f;
-    bool mixed_mode_cached_decode_logged_ = false;
-    SegmentedDecodeSignature segmented_decode_signature_{};
-    bool segmented_decode_signature_valid_ = false;
-    std::vector<SegmentedDecodeGraphCacheEntry> segmented_decode_graph_cache_;
-    ggml_cgraph* segmented_decode_head_graph_logits_ = nullptr;
-    ggml_gallocr_t segmented_decode_head_alloc_logits_ = nullptr;
-    ggml_cgraph* segmented_decode_head_graph_topk_ = nullptr;
-    ggml_gallocr_t segmented_decode_head_alloc_topk_ = nullptr;
-    ggml_type segmented_decode_final_hidden_type_ = GGML_TYPE_F32;
-    std::vector<uint8_t> segmented_decode_hidden_staging_;
-    uint64_t segmented_decode_cache_lookup_count_ = 0;
-    uint64_t segmented_decode_cache_hit_count_ = 0;
-    uint64_t segmented_decode_cache_miss_count_ = 0;
-    uint64_t segmented_decode_cache_rebuild_count_ = 0;
-    uint64_t segmented_decode_cache_evict_count_ = 0;
-    uint64_t segmented_decode_last_logged_lookup_ = 0;
     // Set via QWEN35MOE_DEV_CHECK=1 to enable lightweight device-consistency logging
     // on key layer boundaries (attention + ffn entry). Disabled by default so that
     // release performance is unaffected.

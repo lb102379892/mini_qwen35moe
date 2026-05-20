@@ -26,8 +26,9 @@ public:
     ggml_backend_t get_curr_backend();
     ggml_backend_sched_t get_scheduler() const;
 
-    // Returns true when both GPU and CPU layers are present (AUTO_MODE with partial offload).
-    // Decode path selection uses this together with runtime placement checks.
+    // Returns true when both GPU and CPU layers are present (AUTO_MODE with partial GPU offload).
+    // In this case the cached-decode-graph optimisation must be disabled to avoid device
+    // mismatch errors and incorrect CUDA-graph capture/replay.
     bool is_mixed_mode() const;
 
     // Compute a stable hash of the current layer→device assignment.

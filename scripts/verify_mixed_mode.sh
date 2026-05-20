@@ -45,10 +45,10 @@ fi
 pass "pure GPU mode completed without errors."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 2: Mixed GPU/CPU mode — adaptive decode path selection
+# Test 2: Mixed GPU/CPU mode — eager decode path (primary fix)
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 2: mixed GPU/CPU mode (--dev-mode=auto), adaptive decode ==="
+echo "=== Test 2: mixed GPU/CPU mode (--dev-mode=auto), eager decode ==="
 OUTPUT=$(timeout 180 "$BIN" \
     --model "$MODEL" \
     --prompt "$PROMPT" \
@@ -61,15 +61,12 @@ OUTPUT=$(timeout 180 "$BIN" \
 if echo "$OUTPUT" | grep -qiE "CUDA error|illegal memory access|device mismatch|Segmentation fault|Aborted"; then
     fail "mixed GPU/CPU mode produced an error:\n$OUTPUT"
 fi
-if echo "$OUTPUT" | grep -q "mixed GPU/CPU weights detected"; then
-    pass "mixed mode detected."
+if echo "$OUTPUT" | grep -q "mixed GPU/CPU detected"; then
+    pass "mixed mode detected and eager decode fallback active."
 else
     echo "[INFO] Model may be fully GPU-resident (no CPU offload needed). Verify with a larger model."
 fi
-if echo "$OUTPUT" | grep -q "fully CUDA-capable; using cached decode graph path"; then
-    pass "AUTO mode used cached decode graph path when decode placement was fully CUDA-capable."
-fi
-pass "mixed GPU/CPU mode (adaptive decode) completed without errors."
+pass "mixed GPU/CPU mode (eager) completed without errors."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 3: Mixed GPU/CPU mode with device-check logging enabled
@@ -117,29 +114,6 @@ if echo "$OUTPUT" | grep -q "\[PERF\]\[decode-graph\]"; then
     echo "[INFO] decode-graph hit count at end of run: $HITS"
 fi
 pass "decode graph reuse (pure GPU) completed without errors."
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test 5: Segmented decode cache reuse diagnostics in AUTO mode
-# ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "=== Test 5: segmented decode cache reuse diagnostics in AUTO mode ==="
-OUTPUT=$(timeout 180 QWEN35MOE_DECODE_GRAPH_DIAG=1 QWEN35MOE_DECODE_GRAPH_DIAG_INTERVAL=1 "$BIN" \
-    --model "$MODEL" \
-    --prompt "$PROMPT" \
-    --dev-mode auto \
-    --ctx-size "$CTX" \
-    --threads "$THREADS" \
-    --no-chat \
-    --temp 0.0 2>&1 || true)
-
-if echo "$OUTPUT" | grep -qiE "CUDA error|illegal memory access|Segmentation fault|Aborted"; then
-    fail "mixed AUTO mode with segmented cache diag produced an error:\n$OUTPUT"
-fi
-if echo "$OUTPUT" | grep -q "\[PERF\]\[segmented-cache\]"; then
-    LAST_LINE=$(echo "$OUTPUT" | grep "\[PERF\]\[segmented-cache\]" | tail -1)
-    echo "[INFO] segmented cache stats: $LAST_LINE"
-fi
-pass "segmented decode cache diagnostics completed without errors."
 
 echo ""
 echo "All tests passed."
