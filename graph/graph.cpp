@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include "pipeline/context_limit.h"
 
 namespace {
 constexpr const char* CUDA_BACKEND_NAME = "CUDA";
@@ -1602,6 +1603,9 @@ void Qwen35moeForwardPass::set_segment_inputs(
 }
 
 std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int pos, uint32_t slot_idx) {
+    if (!can_decode_at_position(pos)) {
+        return {};
+    }
     if (layer_segments_.empty()) {
         std::vector<int32_t> token_vec = { token };
         return run_prefill(token_vec, pos, slot_idx, nullptr);
@@ -1663,6 +1667,9 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
 TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx) {
     if (sampling_top_k_ <= 0) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: device sampling not configured");
+    }
+    if (!can_decode_at_position(pos)) {
+        return {};
     }
     if (layer_segments_.empty()) {
         std::vector<int32_t> token_vec = { token };
@@ -1888,12 +1895,12 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
 
 std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int pos,
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
+    if (!can_decode_at_position(pos)) {
+        return {};
+    }
     if (scheduler == nullptr) {
         std::vector<int32_t> token_vec = { token };
         return run_prefill(token_vec, pos, slot_idx, scheduler);
-    }
-    if (static_cast<uint32_t>(pos) >= context_len_) {
-        throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached: position exceeds context_len_");
     }
     if (paged_kv_enabled_) {
         paged_fused_decode_attempt_count_++;
@@ -1958,12 +1965,12 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token,
     if (sampling_top_k_ <= 0) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: device sampling not configured");
     }
+    if (!can_decode_at_position(pos)) {
+        return {};
+    }
     if (scheduler == nullptr) {
         std::vector<int32_t> token_vec = { token };
         return run_prefill_topk(token_vec, pos, slot_idx, scheduler);
-    }
-    if (static_cast<uint32_t>(pos) >= context_len_) {
-        throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: position exceeds context_len_");
     }
     if (paged_kv_enabled_) {
         paged_fused_decode_attempt_count_++;
@@ -2024,6 +2031,14 @@ uint32_t Qwen35moeForwardPass::get_cache_pos(uint32_t slot_idx) const {
     uint32_t seq = snapkv_get_seq_pos(slot_idx);
     if (seq > 0) return seq;
     return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
+}
+
+uint32_t Qwen35moeForwardPass::get_context_len() const {
+    return context_len_;
+}
+
+bool Qwen35moeForwardPass::can_decode_at_position(int pos) const {
+    return qwen35moe_can_decode_at_position(pos, context_len_);
 }
 
 ggml_cgraph* Qwen35moeForwardPass::new_graph() {

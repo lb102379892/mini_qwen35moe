@@ -15,7 +15,7 @@ public:
     ~ChatEngine();
 
     bool init(const CParam& param);
-    bool run_complete(const std::string& prompt, const int max_tokens, std::string& response);
+    bool run_complete(const std::string& prompt, const int max_tokens, std::string& response, std::string* finish_reason = nullptr);
 
 private:
     int sample_from_topk_candidates(const TopKSampleCandidates& candidates, float top_p);

@@ -60,3 +60,9 @@ add_executable(paged_kv_cache_test
 )
 target_link_libraries(paged_kv_cache_test PRIVATE ggml_core pthread dl m)
 add_test(NAME paged_kv_cache_test COMMAND paged_kv_cache_test)
+
+add_executable(context_limit_test
+    pipeline/context_limit_test.cpp
+)
+target_link_libraries(context_limit_test PRIVATE ggml_core pthread dl m)
+add_test(NAME context_limit_test COMMAND context_limit_test)
