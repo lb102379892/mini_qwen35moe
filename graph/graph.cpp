@@ -51,7 +51,13 @@ bool backend_name_contains_cuda(ggml_backend_t backend) {
 }
 
 bool tensor_on_backend(const ggml_tensor* tensor, ggml_backend_t backend) {
-    if (!tensor || !backend || !tensor->buffer) {
+    if (!backend) {
+        return false;
+    }
+    if (!tensor) {
+        return false;
+    }
+    if (!tensor->buffer) {
         return true;
     }
     return ggml_backend_buffer_get_type(tensor->buffer) == ggml_backend_get_default_buffer_type(backend);
@@ -220,6 +226,8 @@ void Qwen35moeForwardPass::prepare_first_segment_hidden_from_token(
         throw std::runtime_error(std::string(where) + ": token embedding weight missing");
     }
 
+    // Use a dedicated temporary context for token-embedding bridging so we do
+    // not reset/invalidate the reusable segmented decode graph cache context.
     std::vector<uint8_t> bridge_ctx_buffer(FP_GRAPH_SIZE_METADATA);
     ggml_init_params bridge_params = {
         .mem_size = bridge_ctx_buffer.size(),
@@ -435,33 +443,14 @@ void Qwen35moeForwardPass::configure_device_sampling(int top_k, float temperatur
  */
 void Qwen35moeForwardPass::reset_context() {
     invalidate_segmented_decode_cache();
-    cached_decode_graph_ = nullptr;
-    cached_decode_graph_allocated_ = false;
-    cached_decode_signature_valid_ = false;
-    cached_decode_tokens_tensor_ = nullptr;
-    cached_decode_pos_tensor_ = nullptr;
-    cached_decode_mask_tensors_.clear();
-    cached_decode_mask_f32_.clear();
-    cached_decode_mask_f16_.clear();
-    cached_decode_last_mask_pos_ = -1;
+    invalidate_cached_decode_graph_state();
     if (ctx_) {
         ggml_free(ctx_);
     }
-    cached_decode_graph_ = nullptr;
-    cached_decode_graph_allocated_ = false;
-    cached_decode_kv_capacity_ = 0;
-    cached_decode_scratch_pos_ = 0;
-    cached_decode_last_mask_pos_ = -1;
-    cached_decode_mask_tensors_.clear();
-    cached_decode_tokens_tensor_ = nullptr;
-    cached_decode_pos_tensor_ = nullptr;
-    cached_decode_mask_f32_.clear();
-    cached_decode_mask_f16_.clear();
-    cached_decode_signature_valid_ = false;
     struct ggml_init_params params = {
         .mem_size   = ctx_buffer_.size(),
         .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true, 
+        .no_alloc   = true,
     };
     ctx_ = ggml_init(params);
 }
@@ -602,6 +591,20 @@ void Qwen35moeForwardPass::ensure_cached_decode_graph(ggml_backend_sched_t sched
         decode_graph_fallback_count_++;
         prepare_cached_decode_graph(scheduler, signature.slot_idx, fallback_capacity);
     }
+}
+
+void Qwen35moeForwardPass::invalidate_cached_decode_graph_state() {
+    cached_decode_graph_ = nullptr;
+    cached_decode_graph_allocated_ = false;
+    cached_decode_signature_valid_ = false;
+    cached_decode_kv_capacity_ = 0;
+    cached_decode_scratch_pos_ = 0;
+    cached_decode_last_mask_pos_ = -1;
+    cached_decode_tokens_tensor_ = nullptr;
+    cached_decode_pos_tensor_ = nullptr;
+    cached_decode_mask_tensors_.clear();
+    cached_decode_mask_f32_.clear();
+    cached_decode_mask_f16_.clear();
 }
 
 void Qwen35moeForwardPass::maybe_log_decode_graph_stats() {
@@ -1065,9 +1068,10 @@ bool Qwen35moeForwardPass::can_use_cached_decode_path_in_auto_mode() const {
         }
     }
 
+    ggml_tensor* output_weight = model_->get_output_weight();
     if (!tensor_on_backend(model_->get_token_embedding_weight(), decode_backend) ||
         !tensor_on_backend(model_->get_output_norm_weight(), decode_backend) ||
-        !tensor_on_backend(model_->get_output_weight(), decode_backend)) {
+        (output_weight && !tensor_on_backend(output_weight, decode_backend))) {
         return false;
     }
     return true;
@@ -1216,7 +1220,9 @@ void Qwen35moeForwardPass::maybe_log_segmented_decode_cache_stats() {
     if (decode_graph_diag_interval_ > 0) {
         interval_reached = (segmented_decode_cache_lookup_count_ % decode_graph_diag_interval_) == 0;
     }
-    if (!interval_reached && segmented_decode_cache_lookup_count_ == segmented_decode_last_logged_lookup_) {
+    const bool first_log = segmented_decode_last_logged_lookup_ == 0;
+    if (!interval_reached && !first_log &&
+        segmented_decode_cache_lookup_count_ == segmented_decode_last_logged_lookup_) {
         return;
     }
     size_t staged_capacity = segmented_decode_hidden_staging_.capacity();

@@ -395,6 +395,7 @@ private:
     uint32_t decode_cache_bucket_capacity(uint32_t required_kv) const;
     bool is_cached_decode_graph_compatible(const DecodeGraphSignature& signature, uint32_t required_kv) const;
     void ensure_cached_decode_graph(ggml_backend_sched_t scheduler, const DecodeGraphSignature& signature, uint32_t required_kv);
+    void invalidate_cached_decode_graph_state();
     void maybe_log_decode_graph_stats();
     void set_cached_decode_inputs(ggml_cgraph* gf, int32_t token, int pos);
     bool can_use_paged_fused_decode(const char** reason) const;
