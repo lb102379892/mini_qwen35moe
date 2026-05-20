@@ -2041,6 +2041,10 @@ bool Qwen35moeForwardPass::can_decode_at_position(int pos) const {
     return qwen35moe_can_decode_at_position(pos, context_len_);
 }
 
+bool Qwen35moeForwardPass::can_decode_at_position(uint32_t pos) const {
+    return qwen35moe_can_decode_at_position(pos, context_len_);
+}
+
 ggml_cgraph* Qwen35moeForwardPass::new_graph() {
     return ggml_new_graph_custom(ctx_, FP_GRAPH_SIZE, false);
 }

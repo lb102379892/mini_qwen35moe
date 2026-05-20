@@ -69,6 +69,7 @@ public:
 
     uint32_t get_cache_pos(uint32_t slot_idx) const;
     uint32_t get_context_len() const;
+    bool can_decode_at_position(uint32_t pos) const;
     bool can_decode_at_position(int pos) const;
 
 private:

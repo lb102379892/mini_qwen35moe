@@ -160,7 +160,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     std::vector<int32_t> prompt_tokens_for_pld = tokens;  // Original prompt
     std::vector<int32_t> generated_tokens;
     const uint32_t requested_tokens = max_tokens > 0 ? static_cast<uint32_t>(max_tokens) : 0;
-    const int initial_cache_pos = static_cast<int>(forward_pass_->get_cache_pos(0));
+    const uint32_t initial_cache_pos = forward_pass_->get_cache_pos(0);
     const uint32_t context_budget = qwen35moe_clamp_generation_tokens(
         initial_cache_pos, forward_pass_->get_context_len(), requested_tokens);
     const bool context_budget_limited = context_budget < requested_tokens;
@@ -175,7 +175,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
     auto t_decode_start = Clock::now();
     for (uint32_t i = 0; i < context_budget; ++i) {
-        const int current_pos = static_cast<int>(forward_pass_->get_cache_pos(0));
+        const uint32_t current_pos = forward_pass_->get_cache_pos(0);
         if (!forward_pass_->can_decode_at_position(current_pos)) {
             finish_reason_local = "length";
             break;
@@ -220,7 +220,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
             if (i < 8 || ((i + 1) % 64 == 0)) {
                 std::printf("[PERF][decode step=%d pos=%d][gpu-topk] forward=%.3f ms sample_cpu=%.3f ms k=%zu\n",
-                    static_cast<int>(i), current_pos,
+                    static_cast<int>(i), static_cast<int>(current_pos),
                     std::chrono::duration<double, std::milli>(t3 - t2).count(),
                     std::chrono::duration<double, std::milli>(t4 - t3).count(),
                     decode_candidates.token_ids.size());
@@ -247,7 +247,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
             if (i < 8 || ((i + 1) % 64 == 0)) {
                 std::printf("[PERF][decode step=%d pos=%d][cpu-sample] forward=%.3f ms logits_copy=%.3f ms sample=%.3f ms vocab=%zu\n",
-                    static_cast<int>(i), current_pos,
+                    static_cast<int>(i), static_cast<int>(current_pos),
                     std::chrono::duration<double, std::milli>(t3 - t2).count(),
                     std::chrono::duration<double, std::milli>(t4 - t3).count(),
                     std::chrono::duration<double, std::milli>(t5 - t4).count(),
@@ -257,7 +257,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
         perf_steps++;
     }
-    if (finish_reason_local == "stop" && context_budget_limited && generated_tokens.size() >= context_budget) {
+    if (finish_reason_local == "stop" && context_budget_limited && generated_tokens.size() == context_budget) {
         finish_reason_local = "length";
     }
     auto t_decode_end = Clock::now();
