@@ -854,6 +854,11 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
     reset_context();
 
     const uint32_t n_tok = static_cast<uint32_t>(tokens.size());
+    if (n_tok == 0) {
+        throw std::runtime_error(
+            "Qwen35moeForwardPass::build_prefill_graph: empty token input"
+        );
+    }
     if (static_cast<uint32_t>(pos) + n_tok > context_len_) {
         throw std::runtime_error(
             "Qwen35moeForwardPass::build_prefill_graph: input exceeds context_len_"
@@ -877,8 +882,21 @@ ggml_cgraph* Qwen35moeForwardPass::build_prefill_graph(const std::vector<int32_t
     // 3. Transformer 层循环
     inpL = build_layer_range(gf, inpL, inp_pos, n_tok, slot_idx, 0, m.block_count);
 
-    // 4. 最终归一化 + LM Head（输出 logits）
-    build_output_head(gf, inpL);
+    // 4. 最终归一化 + LM Head。Prefill 只需要最后一个 token 的 logits
+    // 来采样首个 decode token，避免对整段 prompt 做 vocab 投影。
+    ggml_tensor* last_token = inpL;
+    if (n_tok > 1) {
+        last_token = ggml_view_2d(
+            ctx_,
+            inpL,
+            inpL->ne[0],
+            1,
+            inpL->nb[1],
+            static_cast<size_t>(n_tok - 1) * inpL->nb[1]
+        );
+        set_tensor_name(last_token, "prefill_last_hidden");
+    }
+    build_output_head(gf, last_token);
 
     return gf;
 }
@@ -1434,7 +1452,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_segmented(int32_t token, int
 }
 
 TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t token, int pos, uint32_t slot_idx) {
-    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+    if (sampling_top_k_ <= 0) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_segmented_topk: device sampling not configured");
     }
     if (layer_segments_.empty()) {
@@ -1533,19 +1551,6 @@ TopKSampleCandidates Qwen35moeForwardPass::run_decode_segmented_topk(int32_t tok
  */
 std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>& tokens, int pos, 
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
-    if (paged_kv_enabled_ && tokens.size() > 1) {
-        if (!paged_prefill_fallback_warned_) {
-            std::fprintf(stderr,
-                "[paged-kv] prefill fallback enabled: processing multi-token prefill as single-token steps in phase-1 mode\n");
-            paged_prefill_fallback_warned_ = true;
-        }
-        std::vector<float> last_logits;
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            std::vector<int32_t> one_token = { tokens[i] };
-            last_logits = run_prefill(one_token, pos + static_cast<int>(i), slot_idx, scheduler);
-        }
-        return last_logits;
-    }
     const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
     if (scheduler != nullptr) {
         if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
@@ -1561,11 +1566,7 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
             return get_output_logits(gf);
         }
 
-        std::vector<float> all_logits;
-        const size_t vocab_size = model_->meta_->tokenizer.ggml_tokens.size();
-        if (vocab_size > 0) {
-            all_logits.reserve(tokens.size() * vocab_size);
-        }
+        std::vector<float> last_logits;
         for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
             const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
             std::vector<int32_t> chunk_tokens(tokens.begin() + start, tokens.begin() + start + chunk_size);
@@ -1580,20 +1581,15 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
             ggml_backend_sched_graph_compute(scheduler, gf);
             advance_cache(chunk_size, slot_idx);
 
-            std::vector<float> chunk_logits = get_output_logits(gf);
-            all_logits.insert(all_logits.end(), chunk_logits.begin(), chunk_logits.end());
+            last_logits = get_output_logits(gf);
         }
-        return all_logits;
+        return last_logits;
     } else {
         // 直接执行（不使用调度器）
         auto backend = model_->get_curr_backend();
         auto buf_type = ggml_backend_get_default_buffer_type(backend);
         ggml_gallocr_t allocr_prefill = ggml_gallocr_new(buf_type);
         std::vector<float> result;
-        const size_t vocab_size = model_->meta_->tokenizer.ggml_tokens.size();
-        if (vocab_size > 0) {
-            result.reserve(tokens.size() * vocab_size);
-        }
         if (chunk_limit == 0 || tokens.size() <= chunk_limit) {
             ggml_cgraph* gf = build_prefill_graph(tokens, pos, slot_idx);
             ggml_gallocr_alloc_graph(allocr_prefill, gf);
@@ -1613,8 +1609,7 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
                 ggml_backend_graph_compute(backend, gf);
                 advance_cache(chunk_size, slot_idx);
 
-                std::vector<float> chunk_logits = get_output_logits(gf);
-                result.insert(result.end(), chunk_logits.begin(), chunk_logits.end());
+                result = get_output_logits(gf);
             }
         }
         if (allocr_prefill) 
@@ -1625,25 +1620,11 @@ std::vector<float> Qwen35moeForwardPass::run_prefill(const std::vector<int32_t>&
 
 TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<int32_t>& tokens, int pos,
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
-    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+    if (sampling_top_k_ <= 0) {
         throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: device sampling not configured");
     }
     if (tokens.empty()) {
         throw std::runtime_error("Qwen35moeForwardPass::run_prefill_topk: empty token input");
-    }
-
-    if (paged_kv_enabled_ && tokens.size() > 1) {
-        if (!paged_prefill_fallback_warned_) {
-            std::fprintf(stderr,
-                "[paged-kv] prefill fallback enabled: processing multi-token prefill as single-token steps in phase-1 mode\n");
-            paged_prefill_fallback_warned_ = true;
-        }
-        TopKSampleCandidates last_candidates;
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            std::vector<int32_t> one_token = { tokens[i] };
-            last_candidates = run_prefill_topk(one_token, pos + static_cast<int>(i), slot_idx, scheduler);
-        }
-        return last_candidates;
     }
 
     const uint32_t chunk_limit = n_batch_tokens_ > 0 ? n_batch_tokens_ : context_len_;
@@ -1657,7 +1638,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
             set_inputs(gf, tokens, pos);
             ggml_backend_sched_graph_compute(scheduler, gf);
             advance_cache(tokens.size(), slot_idx);
-            return get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+            return get_output_topk_candidates(gf, 0);
         }
 
         TopKSampleCandidates result;
@@ -1675,7 +1656,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
             ggml_backend_sched_graph_compute(scheduler, gf);
             advance_cache(chunk_size, slot_idx);
 
-            result = get_output_topk_candidates(gf, static_cast<uint32_t>(chunk_size - 1));
+            result = get_output_topk_candidates(gf, 0);
         }
         return result;
     } else {
@@ -1689,7 +1670,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
             set_inputs(gf, tokens, pos);
             ggml_backend_graph_compute(backend, gf);
             advance_cache(tokens.size(), slot_idx);
-            result = get_output_topk_candidates(gf, static_cast<uint32_t>(tokens.size() - 1));
+            result = get_output_topk_candidates(gf, 0);
         } else {
             for (size_t start = 0; start < tokens.size(); start += chunk_limit) {
                 const size_t chunk_size = std::min(static_cast<size_t>(chunk_limit), tokens.size() - start);
@@ -1701,7 +1682,7 @@ TopKSampleCandidates Qwen35moeForwardPass::run_prefill_topk(const std::vector<in
                 set_inputs(gf, chunk_tokens, chunk_pos);
                 ggml_backend_graph_compute(backend, gf);
                 advance_cache(chunk_size, slot_idx);
-                result = get_output_topk_candidates(gf, static_cast<uint32_t>(chunk_size - 1));
+                result = get_output_topk_candidates(gf, 0);
             }
         }
         if (allocr_prefill) {
@@ -1775,7 +1756,7 @@ std::vector<float> Qwen35moeForwardPass::run_decode_cached(int32_t token, int po
 
 TopKSampleCandidates Qwen35moeForwardPass::run_decode_cached_topk(int32_t token, int pos,
     uint32_t slot_idx, ggml_backend_sched_t scheduler) {
-    if (sampling_top_k_ <= 0 || sampling_temperature_ <= 0.0f) {
+    if (sampling_top_k_ <= 0) {
         throw std::runtime_error("Qwen35moeForwardPass::run_decode_cached_topk: device sampling not configured");
     }
     if (scheduler == nullptr) {
@@ -1937,15 +1918,9 @@ ggml_tensor* Qwen35moeForwardPass::build_moe_layer(
     ggml_tensor* logits = ggml_mul_mat(ctx, ffn_gate_inp, input);
     set_tensor_name(logits, "moe_logits", il);
 
-    // 获取 top-k 专家的索引
-    // sorted_idx: [n_experts, n_tokens] I32 — 按降序排序
-    ggml_tensor* sorted_idx = ggml_argsort(ctx, logits, GGML_SORT_ORDER_DESC);
-    // expert_idx: [top_k, n_tokens] I32 — 只取前 top-k
-    ggml_tensor* expert_idx = ggml_view_2d(ctx, sorted_idx,
-        top_k, n_tokens,
-        sorted_idx->nb[1],
-        0
-    );
+    // 获取 top-k 专家的索引。相比 argsort + view，这里只选择需要的专家，
+    // 避免对全部 expert 做完整排序。
+    ggml_tensor* expert_idx = ggml_top_k(ctx, logits, top_k);
     set_tensor_name(expert_idx, "moe_idx", il);
 
     // 收集 top-k 专家对应的实际 logit 值
@@ -3063,24 +3038,36 @@ void Qwen35moeForwardPass::build_output_head(ggml_cgraph* gf, ggml_tensor* cur) 
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
 
-    if (sampling_top_k_ > 0 && sampling_temperature_ > 0.0f) {
-        const float inv_temp = 1.0f / sampling_temperature_;
-        if (!std::isfinite(inv_temp)) {
-            throw std::runtime_error("invalid sampling temperature for device-side scaling");
+    if (sampling_top_k_ > 0) {
+        ggml_tensor* sampling_logits = cur;
+        if (sampling_temperature_ > 0.0f) {
+            const float inv_temp = 1.0f / sampling_temperature_;
+            if (!std::isfinite(inv_temp)) {
+                throw std::runtime_error("invalid sampling temperature for device-side scaling");
+            }
+            sampling_logits = ggml_scale(ctx_, cur, inv_temp);
+            set_tensor_name(sampling_logits, "logits_scaled");
+            ggml_build_forward_expand(gf, sampling_logits);
         }
-        ggml_tensor* scaled_logits = ggml_scale(ctx_, cur, inv_temp);
-        set_tensor_name(scaled_logits, "logits_scaled");
-        ggml_build_forward_expand(gf, scaled_logits);
 
-        const int64_t n_vocab = scaled_logits->ne[0];
+        const int64_t n_vocab = sampling_logits->ne[0];
         int64_t k = sampling_top_k_;
         if (k > n_vocab) {
             k = n_vocab;
         }
         if (k > 0) {
-            ggml_tensor* topk_indices = ggml_top_k(ctx_, scaled_logits, static_cast<int32_t>(k));
+            ggml_tensor* topk_indices = ggml_top_k(ctx_, sampling_logits, static_cast<int32_t>(k));
             set_tensor_name(topk_indices, "sample_topk_idx");
             ggml_build_forward_expand(gf, topk_indices);
+
+            if (sampling_temperature_ > 0.0f && k > 1) {
+                const int64_t n_tokens = sampling_logits->ne[1];
+                ggml_tensor* logits_3d = ggml_reshape_3d(ctx_, sampling_logits, 1, n_vocab, n_tokens);
+                ggml_tensor* topk_logits = ggml_get_rows(ctx_, logits_3d, topk_indices);
+                topk_logits = ggml_reshape_2d(ctx_, topk_logits, k, n_tokens);
+                set_tensor_name(topk_logits, "sample_topk_logits");
+                ggml_build_forward_expand(gf, topk_logits);
+            }
         }
     }
 }
@@ -3182,10 +3169,6 @@ std::vector<float> Qwen35moeForwardPass::get_output_logits(ggml_cgraph* gf) {
 }
 
 TopKSampleCandidates Qwen35moeForwardPass::get_output_topk_candidates(ggml_cgraph* gf, uint32_t token_col) {
-    ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits_scaled");
-    if (!logits) {
-        throw std::runtime_error("logits_scaled tensor not found in graph");
-    }
     ggml_tensor* topk_idx = ggml_graph_get_tensor(gf, "sample_topk_idx");
     if (!topk_idx) {
         throw std::runtime_error("sample_topk_idx tensor not found in graph");
@@ -3206,18 +3189,19 @@ TopKSampleCandidates Qwen35moeForwardPass::get_output_topk_candidates(ggml_cgrap
     const size_t idx_bytes = static_cast<size_t>(k) * sizeof(int32_t);
     ggml_backend_tensor_get(topk_idx, result.token_ids.data(), idx_offset, idx_bytes);
 
-    const size_t logits_col_offset = static_cast<size_t>(token_col) * logits->nb[1];
-    for (uint32_t i = 0; i < k; ++i) {
-        const int32_t token_id = result.token_ids[i];
-        if (token_id < 0 || token_id >= logits->ne[0]) {
-            throw std::runtime_error(
-                "invalid top-k token index: " + std::to_string(token_id) +
-                ", valid range: [0, " + std::to_string(logits->ne[0]) + ")");
+    ggml_tensor* topk_logits = ggml_graph_get_tensor(gf, "sample_topk_logits");
+    if (topk_logits) {
+        if (topk_logits->type != GGML_TYPE_F32) {
+            throw std::runtime_error("sample_topk_logits tensor type mismatch");
         }
-        float value = 0.0f;
-        const size_t logit_offset = logits_col_offset + static_cast<size_t>(token_id) * sizeof(float);
-        ggml_backend_tensor_get(logits, &value, logit_offset, sizeof(float));
-        result.logits[i] = value;
+        if (token_col >= static_cast<uint32_t>(topk_logits->ne[1]) ||
+            topk_logits->ne[0] != static_cast<int64_t>(k)) {
+            throw std::runtime_error("sample_topk_logits tensor shape mismatch");
+        }
+        const size_t logits_offset = static_cast<size_t>(token_col) * topk_logits->nb[1];
+        ggml_backend_tensor_get(topk_logits, result.logits.data(), logits_offset, k * sizeof(float));
+    } else {
+        result.logits.clear();
     }
 
     return result;

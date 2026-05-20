@@ -37,6 +37,7 @@
 #include "model/model.h"
 #include "pipeline/chat.h"
 #include "api/http_server.h"
+#include "model/common.h"
 
 // ============================================================
 // CLI helpers
@@ -77,24 +78,7 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     // ---- Defaults ----
-    std::string model_path;
-    std::string prompt;
-    float       temperature  = 0.7f;
-    float       top_p        = 0.9f;
-    int         top_k        = 50;
-    int         n_threads    = 4;
-    int         ctx_size     = 4096;
-    int         n_batch      = -1;
-    int         n_ubatch     = -1;
-    size_t      gpu_layer    = 0;
-    bool        use_chat     = true;
-    bool        verbose      = true;
-    bool        repl_mode    = false;
-    bool        flash_attention = false;
-    bool        enable_paged_kv = false;
-    uint32_t    paged_kv_block_size = 16;
-    DevMode     dev_mode     = DevMode::CPU_MODE;
-    uint64_t    rng_seed     = 79977733;
+    CParam param;
 
     // ---- Parse args ----
     for (int i = 1; i < argc; i++) {
@@ -107,31 +91,48 @@ int main(int argc, char* argv[]) {
             exit(1);
         };
 
-        if (arg("--model"))          model_path  = next("--model");
-        else if (arg("--temp"))      { temperature = (float)atof(next("--temp")); }
-        else if (arg("--top-p"))     { top_p = (float)atof(next("--top-p")); }
-        else if (arg("--top-k"))     { top_k = atoi(next("--top-k")); }
-        else if (arg("--threads"))        n_threads   = atoi(next("--threads"));
-        else if (arg("--ctx-size"))   ctx_size     = atoi(next("--ctx-size"));
-        else if (arg("--n-batch"))   n_batch      = atoi(next("--n-batch"));
-        else if (arg("--n-ubatch"))  n_ubatch     = atoi(next("--n-ubatch"));
-        else if (arg("--seed"))      rng_seed    = (uint64_t)atoll(next("--seed"));
-        else if (arg("--no-chat"))   use_chat    = false;
-        else if (arg("--verbose"))   verbose     = true;
-        else if (arg("--flash-attn")) flash_attention = true;
-        else if (arg("--paged-kv")) enable_paged_kv = true;
-        else if (arg("--paged-kv-block")) paged_kv_block_size = static_cast<uint32_t>(std::max(1, atoi(next("--paged-kv-block"))));
-        else if (arg("--gpu-layer"))   gpu_layer     = atoi(next("--gpu-layer"));
+        if (arg("--model"))          
+            param.model_path  = next("--model");
+        else if (arg("--temp")) { 
+            param.temperature = (float)atof(next("--temp")); 
+        } else if (arg("--top-p")) { 
+            param.top_p = (float)atof(next("--top-p")); 
+        } else if (arg("--top-k")) { 
+            param.top_k = atoi(next("--top-k")); 
+        } else if (arg("--threads"))
+            param.n_threads = atoi(next("--threads"));
+        else if (arg("--ctx-size"))
+            param.ctx_size = atoi(next("--ctx-size"));
+        else if (arg("--n-batch"))
+            param.n_batch = atoi(next("--n-batch"));
+        else if (arg("--n-ubatch"))
+            param.n_ubatch = atoi(next("--n-ubatch"));
+        else if (arg("--seed"))
+            param.rng_seed = (uint64_t)atoll(next("--seed"));
+        else if (arg("--no-chat"))
+            param.use_chat = false;
+        else if (arg("--verbose"))
+            param.verbose = true;
+        else if (arg("--flash-attn"))
+            param.flash_attention = true;
+        else if (arg("--paged-kv"))
+            param.enable_paged_kv = true;
+        else if (arg("--no-mmap"))
+            param.no_mmap = true;
+        else if (arg("--paged-kv-block"))
+            param.paged_kv_block_size = static_cast<uint32_t>(std::max(1, atoi(next("--paged-kv-block"))));
+        else if (arg("--gpu-layer"))
+            param.gpu_layer = atoi(next("--gpu-layer"));
         else if (arg("--dev-mode")) {
             const char* mode = next("--dev-mode");
             if (strcmp(mode, "cpu") == 0) {
-                dev_mode = DevMode::CPU_MODE;
+                param.dev_mode = DevMode::CPU_MODE;
             } else if (strcmp(mode, "gpu") == 0) {
-                dev_mode = DevMode::GPU_MODE;
+                param.dev_mode = DevMode::GPU_MODE;
             } else if (strcmp(mode, "auto") == 0) {
-                dev_mode = DevMode::AUTO_MODE;
+                param.dev_mode = DevMode::AUTO_MODE;
             } else {
-                dev_mode = DevMode::AUTO_MODE;
+                param.dev_mode = DevMode::AUTO_MODE;
             }
         }
         else if (arg("-h") || arg("--help")) {
@@ -142,27 +143,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (model_path.empty()) {
+    if (param.model_path.empty()) {
         fprintf(stderr, "ERROR: --model is required\n\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    if (prompt.empty()) {
-        repl_mode = true;
+    if (param.prompt.empty()) {
+        param.repl_mode = true;
     }
-    if (n_batch <= 0) {
-        n_batch = ctx_size;
+    if (param.n_batch <= 0) {
+        param.n_batch = param.ctx_size;
     }
-    if (n_ubatch <= 0) {
-        n_ubatch = n_batch;
+    if (param.n_ubatch <= 0) {
+        param.n_ubatch = param.n_batch;
     }
 
-    fprintf(stderr, "[main] Loading model: %s\n", model_path.c_str());
+    fprintf(stderr, "[main] Loading model: %s\n", param.model_path.c_str());
 
     ChatEngine chat;
-    if (!chat.init(model_path, dev_mode, n_threads, ctx_size, top_p, top_k, temperature, gpu_layer, flash_attention, n_batch, n_ubatch,
-            enable_paged_kv, paged_kv_block_size)) {
+    if (!chat.init(param)) {
         fprintf(stderr, "Engine initialization failed\n");
         return 1;
     }

@@ -1,6 +1,7 @@
 #include "graph/kv_cache_simple.h"
 
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -78,6 +79,40 @@ int main() {
         threw = true;
     }
     require(threw, "out-of-range logical position should throw");
+
+    simple_kv_cache write_cache(
+        1, 8, 1,
+        4, 4,
+        GGML_TYPE_F16,
+        GGML_TYPE_F16,
+        nullptr,
+        {},
+        PagedKVConfig{true, 2, false}
+    );
+
+    std::vector<uint8_t> ggml_buf(1024 * 1024);
+    ggml_init_params params {
+        .mem_size   = ggml_buf.size(),
+        .mem_buffer = ggml_buf.data(),
+        .no_alloc   = true,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create ggml test context");
+
+    ggml_tensor* k_cur = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, 4, 1, 3);
+    ggml_tensor* v_cur = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, 4, 1, 3);
+    require(write_cache.cpy_k(ctx.get(), k_cur, 0, 0) != nullptr, "multi-token paged K write should build");
+    require(write_cache.cpy_v(ctx.get(), v_cur, 0, 0) != nullptr, "multi-token paged V write should build");
+    require(write_cache.paged_used_blocks() == 2, "three-token write should allocate two paged blocks");
+    require(write_cache.has_materialized_logical_pos(0, 2), "pending multi-token write should materialize final logical position");
+
+    ggml_tensor* k_full = write_cache.get_k(ctx.get(), 0, 3, 0);
+    ggml_tensor* v_full = write_cache.get_v(ctx.get(), 0, 3, 0);
+    require(k_full->ne[0] == 4 && k_full->ne[1] == 3, "multi-token paged K prefix view shape mismatch");
+    require(v_full->ne[0] == 4 && v_full->ne[1] == 3, "multi-token paged V prefix view shape mismatch");
+
+    write_cache.advance(3, 0);
+    require(write_cache.logical_to_physical(0, 2) == 2, "multi-token paged write should keep logical positions contiguous");
 
     std::cout << "paged_kv_cache_test: OK" << std::endl;
     return 0;

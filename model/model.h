@@ -11,23 +11,18 @@
 #include "model/metadata.h"
 #include "model/weights.h"
 #include "model/gguf_mmap.h"
+#include "common.h"
 
 #ifndef QWEN_DEFAULT_GRAPH_SIZE
 #define QWEN_DEFAULT_GRAPH_SIZE 16384
 #endif
-
-enum class DevMode {
-    CPU_MODE,
-    GPU_MODE,
-    AUTO_MODE,
-};
 
 class Qwen35moeModel {
 public:
     Qwen35moeModel();
     ~Qwen35moeModel();
 
-    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, size_t gpu_layer = 0);
+    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, size_t gpu_layer = 0, bool no_mmap = false);
     ggml_backend_t get_curr_backend();
     ggml_backend_sched_t get_scheduler() const;
 
@@ -104,7 +99,5 @@ public:
     ggml_context* cpu_ctx_ = nullptr;
     std::vector<ggml_backend_t> layer_device_map_;
 
-    // Set to true when CPU tensors are bound directly to the mmap region (zero-copy).
-    // In that case loader_->unload() must NOT be called so the mmap stays alive.
-    bool mmap_zerocopy_active_ = false;
+    bool no_mmap_ = true;
 };

@@ -37,11 +37,12 @@ Qwen35moeModel::~Qwen35moeModel() {
     }
 }
 
-bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int n_threads, size_t gpu_layer) {
+bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int n_threads, size_t gpu_layer, bool no_mmap) {
     printf("\n===================Loading Qwen35moe Model=====================\n");
     dev_mode_ = dev_mode;
     n_threads_ = n_threads;
     gpu_layer_ = gpu_layer;
+    no_mmap_ = no_mmap;
     loader_ = std::make_shared<GGUFLoader>();
     meta_ = std::make_shared<MetaDataInfo>();
 
@@ -64,9 +65,8 @@ bool Qwen35moeModel::init(const std::string& model_path_, DevMode dev_mode, int 
     init_gpu();
     rebuild_layer_device_map();
 
-    // 权重加载完成释放模型文件占用的内存映射，避免占用过多内存
-    // Skip unload when mmap zero-copy is active: tensor data pointers reference the mmap region.
-    if (!mmap_zerocopy_active_) {
+    if (no_mmap_) {
+        // 权重加载完成释放模型文件占用的内存映射，避免占用过多内存
         loader_->unload();
     }
 
@@ -391,10 +391,7 @@ bool Qwen35moeModel::init_cpu() {
     // Try mmap zero-copy path first: bind tensor data pointers directly to the mmap region.
     // Controlled by MINI_QWEN_MMAP_ZEROCOPY env var (default: enabled).
     bool zerocopy_ok = false;
-    const char* env_zc = std::getenv("MINI_QWEN_MMAP_ZEROCOPY");
-    bool zerocopy_enabled = (env_zc == nullptr || std::string(env_zc) != "0");
-
-    if (zerocopy_enabled && loader_->is_mmap_active()) {
+    if (false == no_mmap_ && loader_->is_mmap_active()) {
         cpu_buf_ = loader_->create_cpu_mmap_buffer();
         if (cpu_buf_) {
             bool all_ok = true;
@@ -417,7 +414,6 @@ bool Qwen35moeModel::init_cpu() {
             }
             if (all_ok) {
                 zerocopy_ok = true;
-                mmap_zerocopy_active_ = true;
                 printf("[Loader] CPU mmap zero-copy enabled -- skipping weight copy\n");
             } else {
                 // At least one tensor failed; undo the partial buffer and fall through to copy path.
@@ -582,10 +578,7 @@ bool Qwen35moeModel::init_auto_cpu(const std::set<int, std::less<int>>& gpu_laye
     // 在 CPU 上分配 buffer
     // Try mmap zero-copy for CPU layer tensors in AUTO_MODE.
     bool zerocopy_ok = false;
-    const char* env_zc = std::getenv("MINI_QWEN_MMAP_ZEROCOPY");
-    bool zerocopy_enabled = (env_zc == nullptr || std::string(env_zc) != "0");
-
-    if (zerocopy_enabled && loader_->is_mmap_active()) {
+    if (false == no_mmap_ && loader_->is_mmap_active()) {
         cpu_buf_ = loader_->create_cpu_mmap_buffer();
         if (cpu_buf_) {
             bool all_ok = true;
@@ -600,7 +593,6 @@ bool Qwen35moeModel::init_auto_cpu(const std::set<int, std::less<int>>& gpu_laye
             }
             if (all_ok) {
                 zerocopy_ok = true;
-                mmap_zerocopy_active_ = true;
                 printf("[Loader] auto-CPU mmap zero-copy enabled -- skipping weight copy\n");
             } else {
                 ggml_backend_buffer_free(cpu_buf_);

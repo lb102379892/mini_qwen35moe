@@ -164,7 +164,7 @@ bool MetaDataInfo::load_from_gguf(GGUFLoader* load) {
     qwen35moe.load_from_gguf(load);
     tokenizer.load_from_gguf(load);
     quantize.load_from_gguf(load);
-    print();
+    //print();
     return true;
 }
 

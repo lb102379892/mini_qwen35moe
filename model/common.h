@@ -75,5 +75,33 @@ static std::map<std::string, EN_WEIGHT_TYPE> g_tensor_head_names = {
     {WEIGHT_OUTPUT_NORM_NAME, EN_WEIGHT_TYPE_OUTPUT_NORM}
 };
 
+enum class DevMode {
+    CPU_MODE,
+    GPU_MODE,
+    AUTO_MODE,
+};
+
+struct CParam {
+    std::string model_path = "";
+    std::string prompt = "";
+    float temperature = 0.7f;
+    float top_p = 0.9f;
+    int top_k = 50;
+    int n_threads = 4;
+    int ctx_size = 4096;
+    int n_batch = -1;
+    int n_ubatch = -1;
+    size_t gpu_layer = 0;
+    bool use_chat = true;
+    bool verbose = true;
+    bool repl_mode = false;
+    bool flash_attention = false;
+    bool enable_paged_kv = false;
+    uint32_t paged_kv_block_size = 16;
+    DevMode dev_mode = DevMode::CPU_MODE;
+    uint64_t rng_seed = 79977733;
+    bool no_mmap = false;
+};
+
 extern int extractNumber(const std::string& str);
 extern std::string getAfterNumber(const std::string& str);

@@ -349,11 +349,14 @@ ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uin
         if (slot_idx >= n_batch_max) {
             throw std::runtime_error("simple_kv_cache::get_k: slot_idx out of range");
         }
-        if (n_kv > positions[slot_idx] + 1) {
-            throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds logical cache position");
+        if (n_kv > n_ctx_max) {
+            throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds n_ctx_max");
+        }
+        if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
+            throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds materialized paged prefix");
         }
         if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
-            throw std::runtime_error("simple_kv_cache::get_k: non-contiguous paged prefix is not supported in phase-1 path");
+            throw std::runtime_error("simple_kv_cache::get_k: non-contiguous paged prefix is not supported");
         }
         const uint32_t first_block = n_kv == 0 ? 0 : slot_block_tables_[slot_idx][0];
         const size_t token_offset = static_cast<size_t>(first_block) * paged_block_size_ * k_cache[il]->nb[1];
@@ -374,11 +377,14 @@ ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uin
         if (slot_idx >= n_batch_max) {
             throw std::runtime_error("simple_kv_cache::get_v: slot_idx out of range");
         }
-        if (n_kv > positions[slot_idx] + 1) {
-            throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds logical cache position");
+        if (n_kv > n_ctx_max) {
+            throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds n_ctx_max");
+        }
+        if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
+            throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds materialized paged prefix");
         }
         if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
-            throw std::runtime_error("simple_kv_cache::get_v: non-contiguous paged prefix is not supported in phase-1 path");
+            throw std::runtime_error("simple_kv_cache::get_v: non-contiguous paged prefix is not supported");
         }
         const uint32_t first_block = n_kv == 0 ? 0 : slot_block_tables_[slot_idx][0];
         const size_t token_offset = static_cast<size_t>(first_block) * paged_block_size_ * v_cache[il]->nb[1];
@@ -402,10 +408,13 @@ ggml_tensor * simple_kv_cache::cpy_k(ggml_context * ctx_compute, ggml_tensor * k
 
     GGML_ASSERT(positions[slot_idx] + n_tokens <= n_ctx_max);
     if (paged_enabled_) {
-        if (n_tokens != 1) {
-            throw std::runtime_error("simple_kv_cache::cpy_k: paged mode phase-1 only supports single-token writes");
+        if (n_tokens == 0) {
+            throw std::runtime_error("simple_kv_cache::cpy_k: empty token write");
         }
         ensure_slot_for_logical_range(slot_idx, positions[slot_idx], n_tokens);
+        if (!slot_prefix_is_contiguous(slot_idx, positions[slot_idx] + n_tokens)) {
+            throw std::runtime_error("simple_kv_cache::cpy_k: non-contiguous paged write range is not supported");
+        }
         const uint32_t physical_pos = logical_to_physical_internal(slot_idx, positions[slot_idx], true);
         ggml_tensor* flat = ggml_reshape_2d(ctx_compute, k_cache[il], n_embd_k, total_token_capacity_);
         ggml_tensor* k_dst = ggml_view_2d(ctx_compute, flat,
@@ -431,10 +440,13 @@ ggml_tensor * simple_kv_cache::cpy_v(ggml_context * ctx_compute, ggml_tensor * v
 
     GGML_ASSERT(positions[slot_idx] + n_tokens <= n_ctx_max);
     if (paged_enabled_) {
-        if (n_tokens != 1) {
-            throw std::runtime_error("simple_kv_cache::cpy_v: paged mode phase-1 only supports single-token writes");
+        if (n_tokens == 0) {
+            throw std::runtime_error("simple_kv_cache::cpy_v: empty token write");
         }
         ensure_slot_for_logical_range(slot_idx, positions[slot_idx], n_tokens);
+        if (!slot_prefix_is_contiguous(slot_idx, positions[slot_idx] + n_tokens)) {
+            throw std::runtime_error("simple_kv_cache::cpy_v: non-contiguous paged write range is not supported");
+        }
         const uint32_t physical_pos = logical_to_physical_internal(slot_idx, positions[slot_idx], true);
         ggml_tensor* flat = ggml_reshape_2d(ctx_compute, v_cache[il], n_embd_v, total_token_capacity_);
         ggml_tensor* v_dst = ggml_view_2d(ctx_compute, flat,

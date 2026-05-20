@@ -14,16 +14,13 @@ public:
     ChatEngine();
     ~ChatEngine();
 
-    bool init(const std::string& model_path_, DevMode dev_mode = DevMode::CPU_MODE, int n_threads = 1, int max_seq_len = 2048,
-        float top_p = -1.0f, int top_k = -1, float temperature = -1.0f, size_t gpu_layer = 0, bool flash_attention = false,
-        int n_batch = -1, int n_ubatch = -1, bool enable_paged_kv = false, uint32_t paged_kv_block_size = 16);
+    bool init(const CParam& param);
     bool run_complete(const std::string& prompt, const int max_tokens, std::string& response);
 
 private:
     int sample_from_topk_candidates(const TopKSampleCandidates& candidates, float top_p);
 
 private:
-    int max_seq_len_ = 2048;
     DevMode dev_mode_ = DevMode::CPU_MODE;
     float top_p_ = 0.95f;
     int top_k_ = 40;

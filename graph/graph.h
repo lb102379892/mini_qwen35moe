@@ -429,7 +429,6 @@ private:
     bool paged_kv_enabled_ = false;
     bool paged_fused_decode_enabled_ = true;
     bool paged_fused_diag_enabled_ = false;
-    bool paged_prefill_fallback_warned_ = false;
     bool paged_fused_fallback_warned_ = false;
     std::string paged_fused_last_fallback_reason_;
     uint64_t paged_fused_decode_attempt_count_ = 0;

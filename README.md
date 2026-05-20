@@ -45,7 +45,7 @@ date && curl http://localhost:8080/v1/chat/completions \
     "max_tokens": 4096,
     "stream": false
   }' && date
- ./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode gpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4
+ ./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode gpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --paged-kv --paged-kv-block 16
 date && curl -X POST http://localhost:6666/v1/chat/completions   -H "Content-Type: application/json"   -d '{
     "messages":[{"role":"user","content":"写个linux用c++语言实现的server示例，只要求代码"}],
     "temperature": 0.01,
@@ -63,7 +63,10 @@ date && curl -X POST http://localhost:6666/v1/chat/completions   -H "Content-Typ
     "enable_thinking": true
   }' && date
 
- ./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode auto   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --gpu-layer 200
+./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode auto   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --gpu-layer 600 --paged-kv --paged-kv-block 16 --no-mmap
+./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode cpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --paged-kv --paged-kv-block 16 --no-mmap
+./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode gpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --paged-kv --paged-kv-block 16 --no-mmap
+./test_qwen35moe   --model /home/xc/3rd/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf   --dev-mode gpu   --flash-attn   --temp 0.01   --top-p 1   --top-k 1   --ctx-size 4096   --threads 4 --n-batch 512 --n-ubatch 512 --no-mmap
 ```
 
 Requires: CMake >= 3.14, C++17, Linux or macOS.

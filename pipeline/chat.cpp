@@ -13,22 +13,21 @@ ChatEngine::ChatEngine() {
 ChatEngine::~ChatEngine() {
 }
 
-bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_threads, int max_seq_len, float top_p, int top_k,
-    float temperature, size_t gpu_layer, bool flash_attention, int n_batch, int n_ubatch, bool enable_paged_kv, uint32_t paged_kv_block_size) {
-    dev_mode_ = dev_mode;
-    max_seq_len_= max_seq_len;
-    top_p_ = top_p;
-    top_k_ = top_k;
-    temperature_ = temperature;
-    n_batch_ = n_batch > 0 ? n_batch : max_seq_len_;
-    n_ubatch_ = n_ubatch > 0 ? n_ubatch : n_batch_;
-    use_gpu_topk_sampling_ = (dev_mode_ != DevMode::CPU_MODE && temperature_ > 0.0f && top_k_ > 0);
+bool ChatEngine::init(const CParam& param) {
+    dev_mode_ = param.dev_mode;
+    top_p_ = param.top_p;
+    top_k_ = param.top_k;
+    temperature_ = param.temperature;
+    n_batch_ = param.n_batch > 0 ? param.n_batch : param.ctx_size;
+    n_ubatch_ = param.n_ubatch > 0 ? param.n_ubatch : n_batch_;
+    use_gpu_topk_sampling_ = (dev_mode_ != DevMode::CPU_MODE &&
+        ((temperature_ > 0.0f && top_k_ > 0) || temperature_ <= 0.0f));
 
     ggml_backend_load_all();
 
     model_ = std::make_shared<Qwen35moeModel>();
-    if (!model_->init(model_path_, dev_mode, n_threads, gpu_layer)) {
-        fprintf(stderr, "ERROR: Failed to init model from %s\n", model_path_.c_str());
+    if (!model_->init(param.model_path, param.dev_mode, param.n_threads, param.gpu_layer, param.no_mmap)) {
+        fprintf(stderr, "ERROR: Failed to init model from %s\n", param.model_path.c_str());
         return false;
     }
 
@@ -38,8 +37,8 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
         return false;
     }
 
-    if (temperature > 0.0f) {
-        sampler_ = std::make_shared<TemperatureSampler>(temperature, 1.1f, 64, top_k, top_p);
+    if (param.temperature > 0.0f) {
+        sampler_ = std::make_shared<TemperatureSampler>(param.temperature, 1.1f, 64, param.top_k, param.top_p);
     } else {
         sampler_ = std::make_shared<GreedySampler>();
     }
@@ -47,12 +46,13 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
     sched_ = model_->get_scheduler();
 
     forward_pass_ = std::make_shared<Qwen35moeForwardPass>();
-    forward_pass_->init(max_seq_len_, 1, model_, static_cast<uint32_t>(n_batch_), static_cast<uint32_t>(n_ubatch_),
-        enable_paged_kv, paged_kv_block_size);
+    forward_pass_->init(param.ctx_size, 1, model_, static_cast<uint32_t>(n_batch_), static_cast<uint32_t>(n_ubatch_),
+        param.enable_paged_kv, param.paged_kv_block_size);
     if (use_gpu_topk_sampling_) {
-        forward_pass_->configure_device_sampling(top_k_, temperature_);
+        const int device_top_k = temperature_ > 0.0f ? top_k_ : 1;
+        forward_pass_->configure_device_sampling(device_top_k, temperature_);
     }
-    if (flash_attention) {
+    if (param.flash_attention) {
         forward_pass_->set_flash_attention_enabled(true);
     }
 
@@ -60,6 +60,9 @@ bool ChatEngine::init(const std::string& model_path_, DevMode dev_mode, int n_th
 }
 
 int ChatEngine::sample_from_topk_candidates(const TopKSampleCandidates& candidates, float top_p) {
+    if (!candidates.token_ids.empty() && (temperature_ <= 0.0f || candidates.token_ids.size() == 1)) {
+        return candidates.token_ids[0];
+    }
     if (candidates.token_ids.empty() || candidates.token_ids.size() != candidates.logits.size()) {
         throw std::runtime_error("Invalid top-k candidates");
     }
