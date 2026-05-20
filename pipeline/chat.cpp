@@ -117,9 +117,6 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
     printf("run_complete: prompt='%s', max_tokens=%d\n", prompt.c_str(), max_tokens);
     auto m = model_->meta_;
     std::string finish_reason_local = "stop";
-    if (finish_reason) {
-        *finish_reason = finish_reason_local;
-    }
     forward_pass_->reset_sequence(0);
 
     std::vector<int32_t> tokens = tokenizer_->encode(prompt);
@@ -257,7 +254,7 @@ bool ChatEngine::run_complete(const std::string& prompt, const int max_tokens, s
 
         perf_steps++;
     }
-    if (finish_reason_local == "stop" && context_budget_limited && generated_tokens.size() == context_budget) {
+    if (context_budget_limited && generated_tokens.size() == context_budget) {
         finish_reason_local = "length";
     }
     auto t_decode_end = Clock::now();
