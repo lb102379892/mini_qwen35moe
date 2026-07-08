@@ -1,0 +1,4 @@
+upstream=https://github.com/pybind/pybind11
+version=v2.13.6
+vendored_for=strata-runtime ggml_moe pybind extension (QWEN35MOE_PYTHON)
+note=Header-only CMake subproject; do not FetchContent at build time.

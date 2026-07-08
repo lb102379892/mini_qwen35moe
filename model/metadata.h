@@ -46,6 +46,66 @@
 //         quantize.imatrix.dataset	/home/hauhaucs/llama.cpp/groups_merged.txt
 //         quantize.imatrix.entries_count	510
 //         quantize.imatrix.chunks_count	93
+// 下面是使用Qwen3.5-35B-A3B-UD-Q5_K_M.gguf模型的参数：
+//     metadata:
+//         version	3
+//         tensor_count	753
+//         kv_count	54
+//         general.architecture	qwen35moe
+//         general.type	model
+//         general.sampling.top_k	20
+//         general.sampling.top_p	0.949999988079071
+//         general.sampling.temp	1
+//         general.name	Qwen3.5-35B-A3B
+//         general.basename	Qwen3.5-35B-A3B
+//         general.quantized_by	Unsloth
+//         general.size_label	35B-A3B
+//         general.license	apache-2.0
+//         general.license.link	https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/LICENSE
+//         general.repo_url	https://huggingface.co/unsloth
+//         general.base_model.count	1
+//         general.base_model.0.name	Qwen3.5 35B A3B
+//         general.base_model.0.organization	Qwen
+//         general.base_model.0.repo_url	https://huggingface.co/Qwen/Qwen3.5-35B-A3B
+//         general.tags	[unsloth, image-text-to-text]
+//         general.quantization_version	2
+//         general.file_type	Q5_K_M
+//         qwen35moe.block_count	41
+//         qwen35moe.context_length	262144
+//         qwen35moe.embedding_length	2048
+//         qwen35moe.attention.head_count	16
+//         qwen35moe.attention.head_count_kv	2
+//         qwen35moe.attention.layer_norm_rms_epsilon	9.999999974752427e-7
+//         qwen35moe.attention.key_length	256
+//         qwen35moe.attention.value_length	256
+//         qwen35moe.rope.dimension_sections	[11, 11, 10, 0]
+//         qwen35moe.rope.freq_base	10000000
+//         qwen35moe.rope.dimension_count	64
+//         qwen35moe.expert_count	256
+//         qwen35moe.expert_used_count	8
+//         qwen35moe.expert_feed_forward_length	512
+//         qwen35moe.expert_shared_feed_forward_length	512
+//         qwen35moe.ssm.conv_kernel	4
+//         qwen35moe.ssm.state_size	128
+//         qwen35moe.ssm.group_count	16
+//         qwen35moe.ssm.time_step_rank	32
+//         qwen35moe.ssm.inner_size	4096
+//         qwen35moe.full_attention_interval	4
+//         qwen35moe.nextn_predict_layers	1
+//         tokenizer.ggml.model	gpt2
+//         tokenizer.ggml.pre	qwen35
+//         tokenizer.ggml.tokens	[!, ", #, $, %, ...]
+//         tokenizer.ggml.token_type	[1, 1, 1, 1, 1, ...]
+//         tokenizer.ggml.merges	[Ġ Ġ, ĠĠ ĠĠ, i n, Ġ t, ĠĠĠĠ ĠĠĠĠ, ...]
+//         tokenizer.ggml.eos_token_id	248046
+//         tokenizer.ggml.padding_token_id	248055
+//         tokenizer.ggml.add_bos_token	false
+//         tokenizer.chat_template	
+//         quantize.imatrix.file	Qwen3.5-35B-A3B-GGUF/imatrix_unsloth.gguf
+//         quantize.imatrix.dataset	unsloth_calibration_Qwen3.5-35B-A3B.txt
+//         quantize.imatrix.entries_count	510
+//         quantize.imatrix.chunks_count	77
+
 #pragma once
 
 #include <gguf.h>
@@ -76,10 +136,20 @@ public:
     float sampling_top_p = 0.0;
     float sampling_temp = 0.0;
     std::string name = "";
+    std::string basename = "";
+    std::string quantized_by = "";
     std::string finetune = "";
     uint32_t quantization_version = 0;
     uint32_t file_type = 0;
     std::string size_label = "";
+    std::string license = "";
+    std::string license_link = "";
+    std::string repo_url = "";
+    uint32_t base_model_count = 0;
+    std::string base_model_0_name = "";
+    std::string base_model_0_organization = "";
+    std::string base_model_0_repo_url = "";
+    std::vector<std::string> tags;
 
     void load_from_gguf(GGUFLoader* load);
     void print() const;
@@ -112,6 +182,7 @@ public:
     uint32_t time_step_rank = 0;
     uint32_t inner_size = 0;
     uint32_t full_attention_interval = 0;
+    uint32_t nextn_predict_layers = 0;
     
     void load_from_gguf(GGUFLoader* load);
     void print() const;
@@ -130,6 +201,7 @@ public:
     uint32_t ggml_eos_token_id = 0;
     uint32_t ggml_padding_token_id = 0;
     uint32_t ggml_bos_token_id = 0;
+    bool ggml_add_bos_token = false;
     std::string chat_template = "";
 
     void load_from_gguf(GGUFLoader* load);

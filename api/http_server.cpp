@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -162,12 +163,10 @@ void HttpServer::run() {
         ::inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         printf("Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
 
-        // Handle synchronously (single-threaded for inference serialization).
-        // A production server would use a thread pool, but the engine is not
-        // thread-safe, so sequential handling avoids contention.
-        handle_connection(client_fd);
-
-        ::close(client_fd);
+        std::thread([this, client_fd]() {
+            handle_connection(client_fd);
+            ::close(client_fd);
+        }).detach();
     }
 
     printf("HTTP server stopped\n");
@@ -217,6 +216,9 @@ void HttpServer::handle_connection(int client_fd) {
         if (!stream) {
             std::string response = handle_chat_completions(body);
             send_response(client_fd, 200, "application/json", response);
+        } else {
+            send_response(client_fd, 400, "application/json",
+                R"({"error":{"message":"stream=true is not supported by this server yet","type":"invalid_request"}})");
         }
     } else if (method == "GET" && path == "/v1/models") {
         std::string response = handle_models();
@@ -310,9 +312,9 @@ bool HttpServer::parse_request(int client_fd, std::string& method, std::string& 
 // ---------------------------------------------------------------------------
 void HttpServer::serve_web_ui(int client_fd) {
     // Try loading web/index.html from the working directory.
-    // NOTE: cached_html is safe because handle_connection runs single-threaded.
-    // If the server becomes multi-threaded, protect with std::once_flag.
     static std::string cached_html;
+    static std::mutex cached_html_mutex;
+    std::lock_guard<std::mutex> lock(cached_html_mutex);
     if (cached_html.empty()) {
         const char* paths[] = { "web/index.html", "/home/xc/code/my_llama-copy-update.cpp/web/index.html", nullptr };
         for (int i = 0; paths[i]; ++i) {
@@ -390,23 +392,29 @@ bool HttpServer::send_all(int fd, const char* data, size_t len) {
 // Route handlers
 // ---------------------------------------------------------------------------
 std::string HttpServer::handle_chat_completions(const std::string& body) {
-    std::string prompt = build_chatml_prompt(body);
-    if (prompt.empty()) {
-        std::string user_content = extract_last_user_content(body);
-        if (user_content.empty()) {
-            return R"({"error":{"message":"No user message found","type":"invalid_request"}})";
-        }
-        prompt = "<|im_start|>user\n" + user_content + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!engine_->chat_template_ready()) {
+        return R"({"error":{"message":"Chat template not available","type":"server_error"}})";
+    }
+
+    const ChatTemplateApplyResult templated = engine_->build_chat_prompt(body);
+    if (!templated.ok) {
+        const std::string msg = templated.error.empty() ? "Invalid chat request" : templated.error;
+        return make_error_response(msg, "invalid_request");
     }
 
     int max_tokens = extract_json_int(body, "max_tokens", kMaxGenerateTokens);
     if (max_tokens <= 0 || max_tokens > kMaxGenerateTokens) max_tokens = kMaxGenerateTokens;
 
     std::string generated_text;
-    engine_->run_complete(prompt, max_tokens, generated_text);
-    std::string escaped_content = json_escape(generated_text);
+    if (!engine_->run_complete(templated.prompt, max_tokens, generated_text)) {
+        return R"({"error":{"message":"Generation failed","type":"server_error"}})";
+    }
 
-    // Build OpenAI-compatible response
+    const ChatTemplateParseResult parsed =
+        engine_->parse_chat_response(generated_text, templated.enable_thinking);
+    std::string escaped_content = json_escape(parsed.content);
+    std::string escaped_reasoning = json_escape(parsed.reasoning_content);
+
     std::ostringstream oss;
     oss << "{"
         << "\"id\":\"chatcmpl-phantom\","
@@ -414,7 +422,11 @@ std::string HttpServer::handle_chat_completions(const std::string& body) {
         << "\"model\":\"" << kModelId << "\","
         << "\"choices\":[{"
         << "\"index\":0,"
-        << "\"message\":{\"role\":\"assistant\",\"content\":\"" << escaped_content << "\"},"
+        << "\"message\":{\"role\":\"assistant\",\"content\":\"" << escaped_content << "\"";
+    if (!parsed.reasoning_content.empty()) {
+        oss << ",\"reasoning_content\":\"" << escaped_reasoning << "\"";
+    }
+    oss << "},"
         << "\"finish_reason\":\"stop\""
         << "}]"
         << "}";
@@ -626,116 +638,4 @@ std::string HttpServer::extract_last_user_content(const std::string& json) {
     }
 
     return result;
-}
-
-std::string HttpServer::build_chatml_prompt(const std::string& json) {
-    const bool enable_thinking = extract_json_bool(json, "enable_thinking", false);
-    const std::string messages_key = "\"messages\"";
-    size_t key_pos = json.find(messages_key);
-    if (key_pos == std::string::npos) return "";
-
-    size_t colon_pos = json.find(':', key_pos + messages_key.size());
-    if (colon_pos == std::string::npos) return "";
-
-    size_t array_start = colon_pos + 1;
-    while (array_start < json.size() &&
-            (json[array_start] == ' ' || json[array_start] == '\t' ||
-             json[array_start] == '\n' || json[array_start] == '\r')) {
-        array_start++;
-    }
-    if (array_start >= json.size() || json[array_start] != '[') return "";
-
-    std::string prompt;
-    prompt.reserve(1024);
-    bool saw_user = false;
-    size_t last_user_content_start = std::string::npos;
-    size_t last_user_content_end = std::string::npos;
-
-    size_t pos = array_start + 1;
-    while (pos < json.size()) {
-        while (pos < json.size() &&
-                (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' ||
-                 json[pos] == '\r' || json[pos] == ',')) {
-            pos++;
-        }
-        if (pos >= json.size()) break;
-        if (json[pos] == ']') break;
-        if (json[pos] != '{') return "";
-
-        size_t obj_start = pos;
-        size_t obj_end = std::string::npos;
-        int depth = 0;
-        bool in_string = false;
-        bool escaped = false;
-        for (size_t i = pos; i < json.size(); ++i) {
-            char c = json[i];
-            if (in_string) {
-                if (escaped) {
-                    escaped = false;
-                } else if (c == '\\') {
-                    escaped = true;
-                } else if (c == '"') {
-                    in_string = false;
-                }
-                continue;
-            }
-            if (c == '"') {
-                in_string = true;
-                continue;
-            }
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0) {
-                    obj_end = i;
-                    break;
-                }
-            }
-        }
-
-        if (obj_end == std::string::npos) return "";
-
-        std::string message_obj = json.substr(obj_start, obj_end - obj_start + 1);
-        std::string role = extract_json_string(message_obj, "role");
-        std::string content = extract_json_string(message_obj, "content");
-
-        // OpenAI-compatible "developer" instructions should precede user turns,
-        // so normalize them to ChatML's "system" role.
-        if (role == "developer") role = "system";
-        if ((role == "system" || role == "user" || role == "assistant")) {
-            prompt += "<|im_start|>";
-            prompt += role;
-            prompt += "\n";
-            const size_t content_start = prompt.size();
-            prompt += content;
-            const size_t content_end = prompt.size();
-            prompt += "<|im_end|>\n";
-            if (role == "user") {
-                saw_user = true;
-                last_user_content_start = content_start;
-                last_user_content_end = content_end;
-            }
-        }
-
-        pos = obj_end + 1;
-    }
-
-    if (!saw_user) return "";
-    if (!enable_thinking &&
-        last_user_content_start != std::string::npos &&
-        last_user_content_end != std::string::npos) {
-        const size_t think_pos = prompt.find("/think", last_user_content_start);
-        const size_t no_think_pos = prompt.find("/no_think", last_user_content_start);
-        const bool has_think = (think_pos != std::string::npos && think_pos < last_user_content_end);
-        const bool has_no_think = (no_think_pos != std::string::npos && no_think_pos < last_user_content_end);
-        if (!has_think && !has_no_think) {
-            const bool ends_with_newline =
-                last_user_content_end > last_user_content_start &&
-                prompt[last_user_content_end - 1] == '\n';
-            prompt.insert(last_user_content_end, ends_with_newline ? "/no_think" : "\n/no_think");
-        }
-    }
-    prompt += "<|im_start|>assistant\n";
-    return prompt;
 }

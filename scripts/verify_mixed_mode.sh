@@ -45,10 +45,10 @@ fi
 pass "pure GPU mode completed without errors."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 2: Mixed GPU/CPU mode — eager decode path (primary fix)
+# Test 2: Mixed GPU/CPU mode — segmented cached decode path
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 2: mixed GPU/CPU mode (--dev-mode=auto), eager decode ==="
+echo "=== Test 2: mixed GPU/CPU mode (--dev-mode=auto), segmented cached decode ==="
 OUTPUT=$(timeout 180 "$BIN" \
     --model "$MODEL" \
     --prompt "$PROMPT" \
@@ -62,11 +62,11 @@ if echo "$OUTPUT" | grep -qiE "CUDA error|illegal memory access|device mismatch|
     fail "mixed GPU/CPU mode produced an error:\n$OUTPUT"
 fi
 if echo "$OUTPUT" | grep -q "mixed GPU/CPU detected"; then
-    pass "mixed mode detected and eager decode fallback active."
+    pass "mixed mode detected and segmented decode path active."
 else
     echo "[INFO] Model may be fully GPU-resident (no CPU offload needed). Verify with a larger model."
 fi
-pass "mixed GPU/CPU mode (eager) completed without errors."
+pass "mixed GPU/CPU mode (segmented cached) completed without errors."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 3: Mixed GPU/CPU mode with device-check logging enabled

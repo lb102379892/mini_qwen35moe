@@ -64,6 +64,26 @@ int main() {
     require(indices[0] == 0 && indices[1] == 1 && indices[2] == 2 && indices[3] == 3,
         "gather index mapping mismatch");
 
+    // set_pos() must allocate blocks through the destination logical index so
+    // batched decode gather at positions[slot] never throws.
+    simple_kv_cache boundary_cache(
+        1, 32, 1,
+        4, 4,
+        GGML_TYPE_F16,
+        GGML_TYPE_F16,
+        nullptr,
+        {},
+        PagedKVConfig{true, 16, false}
+    );
+    boundary_cache.set_pos(16, 0);
+    std::vector<int32_t> boundary_indices;
+    boundary_cache.fill_gather_indices({0}, 20, boundary_indices);
+    require(boundary_indices.size() == 20, "boundary gather index size mismatch");
+    require(boundary_cache.has_materialized_logical_pos(0, 16),
+        "set_pos across block boundary should materialize logical position 16");
+    require(static_cast<uint32_t>(boundary_indices[16]) == boundary_cache.logical_to_physical(0, 16),
+        "gather index at block boundary mismatch");
+
     bool threw = false;
     try {
         cache.fill_gather_indices({2}, 1, indices);

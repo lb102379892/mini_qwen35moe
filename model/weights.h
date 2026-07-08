@@ -45,6 +45,60 @@
 //             blk.3.ffn_up_shexp.weight	[2048, 512]	Q5_K
 //             blk.3.post_attention_norm.weight	[2048]	F32
 //             blk.3.attn_output.weight	[4096, 2048]	Q5_K
+// 下面是使用Qwen3.5-35B-A3B-UD-Q5_K_M.gguf模型的参数：
+// tensors:
+//     token_embd.weight	[2048, 248320]	Q8_0
+//     output.weight	[2048, 248320]	Q8_0
+//     output_norm.weight	[2048]	F32
+//     blk.*，*是0/1/2/4/5/6/8/9/10/12/13/14/17/18/20/21/22/24/25/26/28/29/30/32/33/34/36/37/38时是下面的参数：
+//     blk
+//         blk.0
+//             blk.0.attn_gate.weight	[2048, 4096]	Q8_0
+//             blk.0.attn_norm.weight	[2048]	F32
+//             blk.0.attn_qkv.weight	[2048, 8192]	Q8_0
+//             blk.0.ffn_down_exps.weight	[512, 2048, 256]	Q6_K
+//             blk.0.ffn_down_shexp.weight	[512, 2048]	Q8_0
+//             blk.0.ffn_gate_exps.weight	[2048, 512, 256]	Q5_K
+//             blk.0.ffn_gate_inp.weight	[2048, 256]	F32
+//             blk.0.ffn_gate_inp_shexp.weight	[2048]	F32
+//             blk.0.ffn_gate_shexp.weight	[2048, 512]	Q8_0
+//             blk.0.ffn_up_exps.weight	[2048, 512, 256]	Q5_K
+//             blk.0.ffn_up_shexp.weight	[2048, 512]	Q8_0
+//             blk.0.post_attention_norm.weight	[2048]	F32
+//             blk.0.ssm_a	[32]	F32
+//             blk.0.ssm_alpha.weight	[2048, 32]	Q5_K
+//             blk.0.ssm_beta.weight	[2048, 32]	Q5_K
+//             blk.0.ssm_conv1d.weight	[4, 8192]	F32
+//             blk.0.ssm_dt.bias	[32]	F32
+//             blk.0.ssm_norm.weight	[128]	F32
+//             blk.0.ssm_out.weight	[4096, 2048]	Q8_0
+
+//     blk.*，*是3/7/11/15/19/23/27/31/35/39/40时是下面的参数：
+//     blk
+//         blk.3
+//             blk.3.attn_k.weight	[2048, 512]	Q8_0
+//             blk.3.attn_k_norm.weight	[256]	F32
+//             blk.3.attn_norm.weight	[2048]	F32
+//             blk.3.attn_q.weight	[2048, 8192]	Q8_0
+//             blk.3.attn_q_norm.weight	[256]	F32
+//             blk.3.attn_v.weight	[2048, 512]	Q8_0
+//             blk.3.ffn_down_exps.weight	[512, 2048, 256]	Q6_K
+//             blk.3.ffn_down_shexp.weight	[512, 2048]	Q8_0
+//             blk.3.ffn_gate_exps.weight	[2048, 512, 256]	Q5_K
+//             blk.3.ffn_gate_inp.weight	[2048, 256]	F32
+//             blk.3.ffn_gate_inp_shexp.weight	[2048]	F32
+//             blk.3.ffn_gate_shexp.weight	[2048, 512]	Q8_0
+//             blk.3.ffn_up_exps.weight	[2048, 512, 256]	Q5_K
+//             blk.3.ffn_up_shexp.weight	[2048, 512]	Q8_0
+//             blk.3.post_attention_norm.weight	[2048]	F32
+//             blk.3.attn_output.weight	[4096, 2048]	Q8_0
+//     blk.*，*是40时除了上面还有特有的下面的参数：
+//     blk
+//         blk.40
+//             blk.40.nextn.shared_head_norm.weight	[2 048]	F32
+//             blk.40.nextn.eh_proj.weight	[4 096, 2 048]	Q8_0
+//             blk.40.nextn.enorm.weight	[2 048]	F32
+//             blk.40.nextn.hnorm.weight	[2 048]	F32
 #pragma once
 
 #include <ggml.h>

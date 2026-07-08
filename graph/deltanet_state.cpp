@@ -11,7 +11,7 @@
 
 DeltaNetState::DeltaNetState(const DeltaNetStateParams& hp)
     : hp_(hp)
-    , rec_slot_floats_(static_cast<size_t>(hp.head_v_dim) * hp.head_k_dim * hp.num_v_heads)
+    , rec_slot_floats_(static_cast<size_t>(hp.head_v_dim) * hp.head_v_dim * hp.num_v_heads)
     , conv_slot_floats_(static_cast<size_t>(hp.conv_kernel > 0 ? hp.conv_kernel - 1 : 0) * hp.conv_channels)
 {
     if (hp_.n_dn_layers == 0)
@@ -180,6 +180,24 @@ void DeltaNetState::clone_slot(uint32_t src_slot, uint32_t dst_slot) {
         if (conv_slot_floats_ > 0) {
             get_conv(il, src_slot, buf_c.data());
             set_conv(il, dst_slot, buf_c.data());
+        }
+    }
+}
+
+void DeltaNetState::copy_all_from(const DeltaNetState& src) {
+    if (src.hp_.n_dn_layers != hp_.n_dn_layers ||
+        src.rec_slot_floats_ != rec_slot_floats_ ||
+        src.conv_slot_floats_ != conv_slot_floats_ ||
+        src.hp_.n_slots != hp_.n_slots) {
+        throw std::runtime_error("deltanet_state::copy_all_from: geometry mismatch");
+    }
+    for (uint32_t il = 0; il < hp_.n_dn_layers; ++il) {
+        // ggml_backend_tensor_copy performs a device-to-device copy when both
+        // tensors live on the same backend (CPU→CPU memcpy or CUDA→CUDA DMA),
+        // avoiding the host staging that get/set would force.
+        ggml_backend_tensor_copy(src.rec_tensors_[il], rec_tensors_[il]);
+        if (conv_slot_floats_ > 0) {
+            ggml_backend_tensor_copy(src.conv_tensors_[il], conv_tensors_[il]);
         }
     }
 }

@@ -25,16 +25,25 @@ public:
     ~simple_kv_cache() = default;
 
     // Get a full view of cached K for layer il and slot_idx: [n_embd_k, n_kv]
-    ggml_tensor* get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t slot_idx = 0);
+    ggml_tensor* get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t slot_idx = 0,
+        bool relax_paged_prefix_checks = false);
 
     // Get a full view of cached V for layer il and slot_idx: [n_embd_v, n_kv]
-    ggml_tensor* get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t slot_idx = 0);
+    ggml_tensor* get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t slot_idx = 0,
+        bool relax_paged_prefix_checks = false);
 
-    // Copy k_cur into cache for slot_idx at current position
+    // Copy k_cur into cache for slot_idx at positions[slot_idx] (baked at graph build time).
     ggml_tensor* cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t slot_idx = 0);
 
-    // Copy v_cur into cache for slot_idx at current position
+    // Copy v_cur into cache for slot_idx at positions[slot_idx] (baked at graph build time).
     ggml_tensor* cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx = 0);
+
+    // Decode-cache path: write rows via ggml_set_rows using write_row_idx (I32, ne[0]==n_tokens).
+    // Non-paged: logical row index (inp_pos). Paged: physical row in the flat cache (kv_write_phys).
+    ggml_tensor* cpy_k(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t slot_idx,
+        ggml_tensor * write_row_idx);
+    ggml_tensor* cpy_v(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t slot_idx,
+        ggml_tensor * write_row_idx);
 
     // LayerState interface.
     void reset_sequence(int seq_id) { clear_slot(static_cast<uint32_t>(seq_id)); }
@@ -47,6 +56,8 @@ public:
     uint32_t get_pos(uint32_t slot_idx = 0) const { return positions[slot_idx]; }
     bool copy_pos(uint32_t src_pos, uint32_t dst_pos, uint32_t slot_idx = 0);
     bool ensure_materialized_logical_pos(uint32_t slot_idx, uint32_t logical_pos);
+    // Grow a contiguous paged prefix [0, n_kv) one block at a time (for FA graph bucket width).
+    void ensure_contiguous_kv_prefix(uint32_t slot_idx, uint32_t n_kv);
     bool has_materialized_logical_pos(uint32_t slot_idx, uint32_t logical_pos) const;
 
     // O(1) head-pointer truncation: discard everything after pos.
@@ -75,6 +86,10 @@ public:
     uint32_t paged_used_blocks() const;
     uint32_t paged_free_blocks() const;
     uint32_t logical_to_physical(uint32_t slot_idx, uint32_t logical_pos) const;
+    // Map the pending write index positions[slot] (logical_pos == current head).
+    uint32_t logical_to_physical_for_write(uint32_t slot_idx, uint32_t logical_pos) const;
+    // O(1) row index when the slot has a contiguous paged prefix (decode fast path).
+    uint32_t physical_row_for_contiguous_write(uint32_t slot_idx, uint32_t logical_pos) const;
     void fill_gather_indices(const std::vector<uint32_t>& slots, uint32_t n_kv, std::vector<int32_t>& out) const;
 
     ggml_tensor* get_k_cache_tensor(int layer) { return k_cache[layer]; }

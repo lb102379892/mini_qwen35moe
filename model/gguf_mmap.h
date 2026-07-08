@@ -198,9 +198,10 @@ public:
     void unload();
     size_t get_all_tensor_bytesize();
     size_t get_tensor_bytesize(const tensor_info& tensor);
-    bool load_tensor_head_data(ggml_tensor* dst);
-    bool load_tensor_layer_data(ggml_tensor* dst);
+    bool load_tensor_head_data(ggml_tensor* dst, ggml_backend_t upload_backend = nullptr);
+    bool load_tensor_layer_data(ggml_tensor* dst, ggml_backend_t upload_backend = nullptr);
     void get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data);
+    const uint8_t* get_tensor_file_ptr(const tensor_info& tensor) const;
 
     // Zero-copy mmap helpers for CPU backend.
     // Returns true when the mmap region is still open and usable.
@@ -217,6 +218,7 @@ public:
     uint32_t get_u32_or(const char* key, uint32_t default_val);
     float get_f32_or(const char* key, float default_val);
     std::string get_str_or(const char* key, const char* default_val);
+    bool get_bool_or(const char* key, bool default_val);
     std::vector<std::string> get_arrary_string_or(const char* key);
     std::vector<uint32_t> get_arrary_u32_or(const char* key);
     std::vector<int32_t> get_arrary_i32_or(const char* key);

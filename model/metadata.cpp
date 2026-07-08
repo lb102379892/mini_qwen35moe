@@ -4,8 +4,8 @@ void HeadInfo::print() const {
     printf("\n--- head ---\n");
     printf(" magic:%s\n", magic.c_str());
     printf(" version:%u\n", version);
-    printf(" tensor_count:%lld\n", tensor_count);
-    printf(" kv_count:%lld\n", kv_count);
+    printf(" tensor_count:%ld\n", tensor_count);
+    printf(" kv_count:%ld\n", kv_count);
 }
 
 void GeneralInfo::load_from_gguf(GGUFLoader* load) {
@@ -15,10 +15,20 @@ void GeneralInfo::load_from_gguf(GGUFLoader* load) {
     sampling_top_p = load->get_f32_or("general.sampling.top_p", 0.0);
     sampling_temp = load->get_f32_or("general.sampling.temp", 0.0);
     name = load->get_str_or("general.name", "");
+    basename = load->get_str_or("general.basename", "");
+    quantized_by = load->get_str_or("general.quantized_by", "");
     finetune = load->get_str_or("general.finetune", "");
     quantization_version = load->get_u32_or("general.quantization_version", 0);
     file_type = load->get_u32_or("general.file_type", 0);
     size_label = load->get_str_or("general.size_label", "");
+    license = load->get_str_or("general.license", "");
+    license_link = load->get_str_or("general.license.link", "");
+    repo_url = load->get_str_or("general.repo_url", "");
+    base_model_count = load->get_u32_or("general.base_model.count", 0);
+    base_model_0_name = load->get_str_or("general.base_model.0.name", "");
+    base_model_0_organization = load->get_str_or("general.base_model.0.organization", "");
+    base_model_0_repo_url = load->get_str_or("general.base_model.0.repo_url", "");
+    tags = load->get_arrary_string_or("general.tags");
 }
 
 void GeneralInfo::print() const {
@@ -29,10 +39,27 @@ void GeneralInfo::print() const {
     printf(" general.sampling.top_p:%f\n", sampling_top_p);
     printf(" general.sampling.temp:%f\n", sampling_temp);
     printf(" general.name:%s\n", name.c_str());
+    printf(" general.basename:%s\n", basename.c_str());
     printf(" general.finetune:%s\n", finetune.c_str());
     printf(" general.quantization_version:%d\n", quantization_version);
     printf(" general.file_type:%d\n", file_type);
     printf(" general.size_label:%s\n", size_label.c_str());
+    printf(" general.license:%s\n", license.c_str());
+    printf(" general.license.link:%s\n", license_link.c_str());
+    printf(" general.repo_url:%s\n", repo_url.c_str());
+    printf(" general.base_model.count:%d\n", base_model_count);
+    printf(" general.base_model.0.:%s\n", base_model_0_name.c_str());
+    printf(" general.base_model.0.:%s\n", base_model_0_organization.c_str());
+    printf(" general.base_model.0.:%s\n", base_model_0_repo_url.c_str());
+    printf(" general.tags[size:%zu,list(", tags.size());
+    for (size_t i = 0; i < tags.size(); ++i) {
+        if (0 == i) {
+            printf("%s", tags[i].c_str());
+        } else {
+            printf(",%s", tags[i].c_str());
+        }
+    }
+    printf(")]\n");
 }
 
 void Qwen35moeInfo::load_from_gguf(GGUFLoader* load) {
@@ -57,6 +84,7 @@ void Qwen35moeInfo::load_from_gguf(GGUFLoader* load) {
     time_step_rank = load->get_u32_or("qwen35moe.ssm.time_step_rank", 0);
     inner_size = load->get_u32_or("qwen35moe.ssm.inner_size", 0);
     full_attention_interval = load->get_u32_or("qwen35moe.full_attention_interval", 0);
+    nextn_predict_layers = load->get_u32_or("qwen35moe.nextn_predict_layers", 0);
 }
 
 void Qwen35moeInfo::print() const {
@@ -84,6 +112,7 @@ void Qwen35moeInfo::print() const {
     printf(" qwen35moe.time_step_rank:%d\n", time_step_rank);
     printf(" qwen35moe.inner_size:%d\n", inner_size);
     printf(" qwen35moe.full_attention_interval:%d\n", full_attention_interval);
+    printf(" qwen35moe.nextn_predict_layers:%d\n", nextn_predict_layers);
 }
 
 void TokenizerInfo::load_from_gguf(GGUFLoader* load) {
@@ -95,6 +124,7 @@ void TokenizerInfo::load_from_gguf(GGUFLoader* load) {
     ggml_eos_token_id = load->get_u32_or("tokenizer.ggml.eos_token_id", 0);
     ggml_padding_token_id = load->get_u32_or("tokenizer.ggml.padding_token_id", 0);
     ggml_bos_token_id = load->get_u32_or("tokenizer.ggml.bos_token_id", 0);
+    ggml_add_bos_token = load->get_bool_or("tokenizer.add_bos_token", false);
     chat_template = load->get_str_or("tokenizer.chat_template", "");
 }
 
@@ -132,6 +162,7 @@ void TokenizerInfo::print() const {
     printf(" tokenizer.ggml.eos_token_id:%d\n", ggml_eos_token_id);
     printf(" tokenizer.ggml.padding_token_id:%d\n", ggml_padding_token_id);
     printf(" tokenizer.ggml.bos_token_id:%d\n", ggml_bos_token_id);
+    printf(" tokenizer.ggml.add_bos_token:%d\n", ggml_add_bos_token);
     printf(" tokenizer.chat_template:%s\n", chat_template.c_str());
 }
 

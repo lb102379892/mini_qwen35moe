@@ -43,8 +43,13 @@ void GGUFLoader::unload() {
     if (mmap_base_ && mmap_base_ != MAP_FAILED) {
         munmap(mmap_base_, mmap_size_);
     }
+    mmap_base_ = nullptr;
+    mmap_size_ = 0;
+    data_ = nullptr;
+    nbytes_remain_ = 0;
     if (fd_ >= 0) {
         close(fd_);
+        fd_ = -1;
     }
 }
 
@@ -75,6 +80,13 @@ std::string GGUFLoader::get_str_or(const char* key, const char* default_val) {
     if (idx < 0) 
         return default_val;
     return kv_[idx].get_val<std::string>();
+}
+
+bool GGUFLoader::get_bool_or(const char* key, bool default_val) {
+    int idx = find_key(key);
+    if (idx < 0) 
+        return default_val;
+    return kv_[idx].get_val<bool>();
 }
 
 std::vector<std::string> GGUFLoader::get_arrary_string_or(const char* key) {
@@ -209,14 +221,14 @@ bool GGUFLoader::prase_model_file() {
             std::string key;
             rnt = read(key);
             if (false == rnt) {
-                printf("%s: failed to read key(i:%lld)\n", __func__, i);
+                printf("%s: failed to read key(i:%ld)\n", __func__, i);
                 return false;
             }
 
             gguf_type type = gguf_type(-1);
             rnt = read(type);
             if (false == rnt) {
-                printf("%s: failed to read type(i:%lld,key:%s)\n", __func__, i, key.c_str());
+                printf("%s: failed to read type(i:%ld,key:%s)\n", __func__, i, key.c_str());
                 return false;
             }
 
@@ -225,12 +237,12 @@ bool GGUFLoader::prase_model_file() {
             if (type == GGUF_TYPE_ARRAY) {
                 rnt = read(type);
                 if (false == rnt) {
-                    printf("%s: failed to read array type(i:%lld,key:%s)\n", __func__, i, key.c_str());
+                    printf("%s: failed to read array type(i:%ld,key:%s)\n", __func__, i, key.c_str());
                     return false;
                 }
                 rnt = read(array_n);
                 if (false == rnt) {
-                    printf("%s: failed to read array size(i:%lld,type:%d,key:%s)\n", __func__, i, type, key.c_str());
+                    printf("%s: failed to read array size(i:%ld,type:%d,key:%s)\n", __func__, i, type, key.c_str());
                     return false;
                 }
                 is_array = true;
@@ -281,7 +293,7 @@ bool GGUFLoader::prase_model_file() {
                     } break;
             }
             if (false == rnt) {
-                printf("%s: failed to read kv(i:%lld,type:%d,key:%s,is_array:%d,array_n:%llu)\n", __func__, i, type, key.c_str(), is_array, array_n);
+                printf("%s: failed to read kv(i:%ld,type:%d,key:%s,is_array:%d,array_n:%lu)\n", __func__, i, type, key.c_str(), is_array, array_n);
                 return false;
             }
         }
@@ -301,18 +313,18 @@ bool GGUFLoader::prase_model_file() {
             // 张量名称
             rnt = read(info.name);
             if (false == rnt) {
-                printf("%s: failed to read tensor name(i:%lld)\n", __func__, i);
+                printf("%s: failed to read tensor name(i:%ld)\n", __func__, i);
                 return false;
             }
 
             // 张量维度
             rnt = read(info.n_dims);
             if (false == rnt) {
-                printf("%s: failed to read tensor n_dims(i:%lld,name:%s)\n", __func__, i, info.name.c_str());
+                printf("%s: failed to read tensor n_dims(i:%ld,name:%s)\n", __func__, i, info.name.c_str());
                 return false;
             }
             if (info.n_dims > GGML_MAX_DIMS) {
-                printf("%s: tensor n_dims is not invaild(i:%lld,name:%s,n_dims:%u)\n", __func__, i, info.name.c_str(), info.n_dims);
+                printf("%s: tensor n_dims is not invaild(i:%ld,name:%s,n_dims:%u)\n", __func__, i, info.name.c_str(), info.n_dims);
                 return false;
             }
 
@@ -321,11 +333,11 @@ bool GGUFLoader::prase_model_file() {
                 info.dims[j] = 1;
                 rnt = read(info.dims[j]);
                 if (false == rnt) {
-                    printf("%s: failed to read tensor dims(i:%lld,j:%u,name:%s)\n", __func__, i, j, info.name.c_str());
+                    printf("%s: failed to read tensor dims(i:%ld,j:%u,name:%s)\n", __func__, i, j, info.name.c_str());
                     return false;
                 }
                 if (info.dims[j] < 0) {
-                    printf("%s: dims is not invaild(i:%lld,j:%u,name:%s,dims:%lld)\n", __func__, i, j, info.name.c_str(), info.dims[j]);
+                    printf("%s: dims is not invaild(i:%ld,j:%u,name:%s,dims:%ld)\n", __func__, i, j, info.name.c_str(), info.dims[j]);
                     return false;
                 }
             }
@@ -333,18 +345,18 @@ bool GGUFLoader::prase_model_file() {
             // 张量类型
             rnt = read(info.type);
             if (false == rnt) {
-                printf("%s: failed to read tensor type(i:%lld,name:%s)\n", __func__, i, info.name.c_str());
+                printf("%s: failed to read tensor type(i:%ld,name:%s)\n", __func__, i, info.name.c_str());
                 return false;
             }
             if (info.type < 0 || info.type >= GGML_TYPE_COUNT) {
-                printf("%s: tensor type is not invaild(i:%lld,name:%s,type:%d)\n", __func__, i, info.name.c_str(), info.type);
+                printf("%s: tensor type is not invaild(i:%ld,name:%s,type:%d)\n", __func__, i, info.name.c_str(), info.type);
                 return false;
             }
             info.type_size = ggml_type_size(info.type);
             info.blck_size = ggml_blck_size(info.type);
             // 检查行大小是否能被块大小整除
             if (info.blck_size == 0 || info.dims[0] % info.blck_size != 0) {
-                printf("%s: tensor %s of type %d (%s) has %lld elements per row, not a multiple of block size (%lld)\n",
+                printf("%s: tensor %s of type %d (%s) has %ld elements per row, not a multiple of block size (%ld)\n",
                     __func__, info.name.c_str(), (int)info.type, ggml_type_name(info.type), info.dims[0], info.blck_size);
                 return false;
             }
@@ -359,7 +371,7 @@ bool GGUFLoader::prase_model_file() {
             // 张量数据偏移量
             rnt = read(info.offset);
             if (false == rnt) {
-                printf("%s: failed to read tensor offset(i:%lld,name:%s)\n", __func__, i, info.name.c_str());
+                printf("%s: failed to read tensor offset(i:%ld,name:%s)\n", __func__, i, info.name.c_str());
                 return false;
             }
 
@@ -419,23 +431,67 @@ size_t GGUFLoader::get_tensor_bytesize(const tensor_info& tensor) {
     return total;
 }
 
-bool GGUFLoader::load_tensor_head_data(ggml_tensor* dst) {
-    auto* tensor_info = &tensors_head_[dst->name];
+static void upload_tensor_from_file(
+    ggml_tensor* dst,
+    const void* src,
+    size_t nbytes,
+    ggml_backend_t upload_backend
+) {
+    if (upload_backend != nullptr) {
+        ggml_backend_tensor_set_async(upload_backend, dst, src, 0, nbytes);
+    } else {
+        ggml_backend_tensor_set(dst, src, 0, nbytes);
+    }
+}
 
-    ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
+bool GGUFLoader::load_tensor_head_data(ggml_tensor* dst, ggml_backend_t upload_backend) {
+    // find() is used (instead of operator[]) so the lookup is read-only and
+    // safe to call concurrently from multiple threads on a fully-parsed loader
+    // (operator[] could insert a default entry on a missing key).
+    auto it = tensors_head_.find(dst->name);
+    if (it == tensors_head_.end()) {
+        return false;
+    }
+    const tensor_info* tensor_info = &it->second;
+    const void* src = get_tensor_file_ptr(*tensor_info);
+    if (!src) {
+        return false;
+    }
+    upload_tensor_from_file(dst, src, tensor_info->byte_size, upload_backend);
     return true;
 }
 
-bool GGUFLoader::load_tensor_layer_data(ggml_tensor* dst) {
-    auto index = tensor_layer_index_map_[dst->name];
-    auto* tensor_info = &tensors_layer_[index];
-
-    ggml_backend_tensor_set(dst, data_ + data_offset_ + tensor_info->offset, 0, tensor_info->byte_size);
+bool GGUFLoader::load_tensor_layer_data(ggml_tensor* dst, ggml_backend_t upload_backend) {
+    auto idx_it = tensor_layer_index_map_.find(dst->name);
+    if (idx_it == tensor_layer_index_map_.end()) {
+        return false;
+    }
+    const auto index = idx_it->second;
+    if (index >= tensors_layer_.size()) {
+        return false;
+    }
+    const tensor_info* tensor_info = &tensors_layer_[index];
+    const void* src = get_tensor_file_ptr(*tensor_info);
+    if (!src) {
+        return false;
+    }
+    upload_tensor_from_file(dst, src, tensor_info->byte_size, upload_backend);
     return true;
+}
+
+const uint8_t* GGUFLoader::get_tensor_file_ptr(const tensor_info& tensor) const {
+    if (!data_) {
+        return nullptr;
+    }
+    return data_ + data_offset_ + tensor.offset;
 }
 
 void GGUFLoader::get_tensor_data(tensor_info* tensor, std::vector<uint8_t>& src_data) {
-    std::memcpy(src_data.data(), data_ + data_offset_ + tensor->offset, tensor->byte_size);
+    const uint8_t* src = get_tensor_file_ptr(*tensor);
+    if (!src) {
+        return;
+    }
+    std::memcpy(src_data.data(), src, tensor->byte_size);
 }
 
 bool GGUFLoader::is_mmap_active() const {
@@ -573,8 +629,8 @@ bool GGUFLoader::read(void * dst, const size_t size) const {
 
 void GGUFLoader::print_prase_info() const {
     printf("version: %u\n", version_);
-    printf("n_tensors: %lld\n", n_tensors_);
-    printf("n_kv: %lld\n", n_kv_);
+    printf("n_tensors: %ld\n", n_tensors_);
+    printf("n_kv: %ld\n", n_kv_);
 
     for (size_t i = 0; i < kv_.size(); ++i) {
         const auto& kv = kv_[i];
@@ -585,24 +641,24 @@ void GGUFLoader::print_prase_info() const {
         const auto& t = info.second;
         printf("tensor: name='%s', n_dims=%u, dims=[", t.name.c_str(), t.n_dims);
         for (uint32_t d = 0; d < t.n_dims; ++d) {
-            printf("%lld", t.dims[d]);
+            printf("%ld", t.dims[d]);
             if (d < t.n_dims - 1) {
                 printf(", ");
             }
         }
-        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu, layer_idx=%d, weight_type=%d\n",
+        printf("], type=%d, type_size=%zu, blck_size=%ld, byte_size=%zu, data_offset=%lu, file_offset=%lu, layer_idx=%d, weight_type=%d\n",
             t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset, t.layer_idx, t.weight_type);
     }
     for (size_t i = 0; i < tensors_layer_.size(); ++i) {
         const auto& t = tensors_layer_[i];
         printf("tensor[%zu]: name='%s', n_dims=%u, dims=[", i, t.name.c_str(), t.n_dims);
         for (uint32_t d = 0; d < t.n_dims; ++d) {
-            printf("%lld", t.dims[d]);
+            printf("%ld", t.dims[d]);
             if (d < t.n_dims - 1) {
                 printf(", ");
             }
         }
-        printf("], type=%d, type_size=%zu, blck_size=%lld, byte_size=%zu, data_offset=%llu, file_offset=%llu, layer_idx=%d, weight_type=%d\n",
+        printf("], type=%d, type_size=%zu, blck_size=%ld, byte_size=%zu, data_offset=%lu, file_offset=%lu, layer_idx=%d, weight_type=%d\n",
             t.type, t.type_size, t.blck_size, t.byte_size, t.offset, data_offset_ + t.offset, t.layer_idx, t.weight_type);
     }
 }

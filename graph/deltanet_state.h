@@ -102,6 +102,13 @@ public:
     // Copy all state from src_slot to dst_slot across all layers.
     void clone_slot(uint32_t src_slot, uint32_t dst_slot);
 
+    // Device-to-device copy of the entire recurrent + conv state from another
+    // DeltaNetState with identical geometry. Used by MTP speculative decoding to
+    // snapshot / restore the trunk DeltaNet state around a verify forward without
+    // a host round-trip (the state is ~60MB; a host copy would dominate the step).
+    // Both instances must share the same layer geometry and backends.
+    void copy_all_from(const DeltaNetState& src);
+
     uint32_t n_dn_layers()     const { return hp_.n_dn_layers; }
     uint32_t n_slots_count()   const { return hp_.n_slots; }
     size_t   rec_slot_floats() const { return rec_slot_floats_; }
@@ -112,7 +119,7 @@ public:
 
 private:
     DeltaNetStateParams hp_;
-    size_t rec_slot_floats_;    // head_v_dim * head_k_dim * num_v_heads
+    size_t rec_slot_floats_;    // head_v_dim * head_v_dim * num_v_heads (S_v*S_v per head)
     size_t conv_slot_floats_;   // (conv_kernel - 1) * conv_channels
 
     std::vector<std::unique_ptr<ggml_context, void(*)(ggml_context*)>> layer_ctxs_;

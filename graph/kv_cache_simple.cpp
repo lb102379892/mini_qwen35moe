@@ -239,7 +239,7 @@ uint32_t simple_kv_cache::logical_to_physical_internal(uint32_t slot_idx, uint32
     const bool has_mapping = has_materialized_logical_pos(slot_idx, logical_pos);
     const bool ok = allow_pending_pos
         ? (logical_pos <= current_pos || has_mapping)
-        : (logical_pos < current_pos);
+        : (logical_pos < current_pos || (logical_pos == current_pos && has_mapping));
     if (!ok) {
         throw std::runtime_error("simple_kv_cache::logical_to_physical: logical position not available in block table");
     }
@@ -258,6 +258,28 @@ uint32_t simple_kv_cache::logical_to_physical_internal(uint32_t slot_idx, uint32
 
 uint32_t simple_kv_cache::logical_to_physical(uint32_t slot_idx, uint32_t logical_pos) const {
     return logical_to_physical_internal(slot_idx, logical_pos, false);
+}
+
+uint32_t simple_kv_cache::logical_to_physical_for_write(uint32_t slot_idx, uint32_t logical_pos) const {
+    return logical_to_physical_internal(slot_idx, logical_pos, true);
+}
+
+uint32_t simple_kv_cache::physical_row_for_contiguous_write(uint32_t slot_idx, uint32_t logical_pos) const {
+    if (!paged_enabled_) {
+        return slot_idx * n_ctx_max + logical_pos;
+    }
+    if (slot_idx >= n_batch_max || logical_pos >= n_ctx_max) {
+        throw std::runtime_error("simple_kv_cache::physical_row_for_contiguous_write: index out of range");
+    }
+    const std::vector<uint32_t>& table = slot_block_tables_[slot_idx];
+    if (table.empty()) {
+        throw std::runtime_error("simple_kv_cache::physical_row_for_contiguous_write: empty block table");
+    }
+    const uint32_t physical_pos = table[0] * paged_block_size_ + logical_pos;
+    if (physical_pos >= total_token_capacity_) {
+        throw std::runtime_error("simple_kv_cache::physical_row_for_contiguous_write: physical position out of range");
+    }
+    return physical_pos;
 }
 
 bool simple_kv_cache::slot_prefix_is_contiguous(uint32_t slot_idx, uint32_t n_tokens) const {
@@ -299,7 +321,12 @@ void simple_kv_cache::fill_gather_indices(const std::vector<uint32_t>& slots, ui
             // the pending token is written to this logical position earlier in the
             // same graph before gather reads execute.
             } else if (slot < n_batch_max && !slot_block_tables_[slot].empty() && j <= positions[slot]) {
-                mapped = logical_to_physical_internal(slot, j, allow_pending);
+                // Only map materialized logical positions. The pending write at
+                // positions[slot] may not have a block table entry yet when set_pos()
+                // jumped forward without the +1 range fix; unmapped slots read as 0.
+                if (has_materialized_logical_pos(slot, j)) {
+                    mapped = logical_to_physical_internal(slot, j, allow_pending);
+                }
             }
             out[b * n_kv + j] = static_cast<int32_t>(mapped);
         }
@@ -344,7 +371,13 @@ void simple_kv_cache::release_slot_blocks(uint32_t slot_idx) {
     maybe_log_paged_stats("slot-release", slot_idx);
 }
 
-ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uint32_t n_kv, uint32_t slot_idx) {
+ggml_tensor * simple_kv_cache::get_k(
+    ggml_context * ctx_compute,
+    int32_t il,
+    uint32_t n_kv,
+    uint32_t slot_idx,
+    bool relax_paged_prefix_checks
+) {
     if (paged_enabled_) {
         if (slot_idx >= n_batch_max) {
             throw std::runtime_error("simple_kv_cache::get_k: slot_idx out of range");
@@ -352,11 +385,13 @@ ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uin
         if (n_kv > n_ctx_max) {
             throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds n_ctx_max");
         }
-        if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
-            throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds materialized paged prefix");
-        }
-        if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
-            throw std::runtime_error("simple_kv_cache::get_k: non-contiguous paged prefix is not supported");
+        if (!relax_paged_prefix_checks) {
+            if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
+                throw std::runtime_error("simple_kv_cache::get_k: n_kv exceeds materialized paged prefix");
+            }
+            if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
+                throw std::runtime_error("simple_kv_cache::get_k: non-contiguous paged prefix is not supported");
+            }
         }
         const uint32_t first_block = n_kv == 0 ? 0 : slot_block_tables_[slot_idx][0];
         const size_t token_offset = static_cast<size_t>(first_block) * paged_block_size_ * k_cache[il]->nb[1];
@@ -372,7 +407,13 @@ ggml_tensor * simple_kv_cache::get_k(ggml_context * ctx_compute, int32_t il, uin
     );
 }
 
-ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uint32_t n_kv, uint32_t slot_idx) {
+ggml_tensor * simple_kv_cache::get_v(
+    ggml_context * ctx_compute,
+    int32_t il,
+    uint32_t n_kv,
+    uint32_t slot_idx,
+    bool relax_paged_prefix_checks
+) {
     if (paged_enabled_) {
         if (slot_idx >= n_batch_max) {
             throw std::runtime_error("simple_kv_cache::get_v: slot_idx out of range");
@@ -380,11 +421,13 @@ ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uin
         if (n_kv > n_ctx_max) {
             throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds n_ctx_max");
         }
-        if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
-            throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds materialized paged prefix");
-        }
-        if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
-            throw std::runtime_error("simple_kv_cache::get_v: non-contiguous paged prefix is not supported");
+        if (!relax_paged_prefix_checks) {
+            if (n_kv > 0 && !has_materialized_logical_pos(slot_idx, n_kv - 1)) {
+                throw std::runtime_error("simple_kv_cache::get_v: n_kv exceeds materialized paged prefix");
+            }
+            if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
+                throw std::runtime_error("simple_kv_cache::get_v: non-contiguous paged prefix is not supported");
+            }
         }
         const uint32_t first_block = n_kv == 0 ? 0 : slot_block_tables_[slot_idx][0];
         const size_t token_offset = static_cast<size_t>(first_block) * paged_block_size_ * v_cache[il]->nb[1];
@@ -397,6 +440,96 @@ ggml_tensor * simple_kv_cache::get_v(ggml_context * ctx_compute, int32_t il, uin
         n_kv,
         v_cache[il]->nb[1],
         slot_idx * v_cache[il]->nb[2]
+    );
+}
+
+namespace {
+
+ggml_tensor * cpy_kv_at_row(
+    ggml_context * ctx_compute,
+    ggml_tensor * cache_il,
+    int64_t       n_embd_row,
+    ggml_tensor * cur,
+    uint32_t      slot_idx,
+    ggml_tensor * write_row_idx,
+    bool          paged_enabled,
+    uint32_t      n_ctx_max,
+    uint32_t      total_token_capacity
+) {
+    GGML_ASSERT(write_row_idx != nullptr);
+    const uint32_t n_tokens = static_cast<uint32_t>(cur->ne[2]);
+    GGML_ASSERT(n_tokens > 0);
+    GGML_ASSERT(cur->ne[0] * cur->ne[1] == n_embd_row);
+
+    ggml_tensor * src = cur;
+    if (!ggml_is_contiguous_rows(src) || src->type != GGML_TYPE_F32) {
+        src = ggml_cast(ctx_compute, ggml_cont(ctx_compute, src), GGML_TYPE_F32);
+    }
+    src = ggml_reshape_2d(ctx_compute, src, n_embd_row, n_tokens);
+
+    ggml_tensor * dst_base = nullptr;
+    if (paged_enabled) {
+        dst_base = ggml_reshape_2d(ctx_compute, cache_il, n_embd_row, total_token_capacity);
+    } else {
+        dst_base = ggml_view_2d(
+            ctx_compute,
+            cache_il,
+            n_embd_row,
+            n_ctx_max,
+            cache_il->nb[1],
+            slot_idx * cache_il->nb[2]
+        );
+    }
+    return ggml_set_rows(ctx_compute, dst_base, src, write_row_idx);
+}
+
+} // namespace
+
+ggml_tensor * simple_kv_cache::cpy_k(
+    ggml_context * ctx_compute,
+    ggml_tensor * k_cur,
+    int32_t il,
+    uint32_t slot_idx,
+    ggml_tensor * write_row_idx
+) {
+    GGML_ASSERT(slot_idx < n_batch_max);
+    GGML_ASSERT(il >= 0 && static_cast<uint32_t>(il) < n_layers);
+    GGML_ASSERT(write_row_idx != nullptr);
+
+    return cpy_kv_at_row(
+        ctx_compute,
+        k_cache[il],
+        n_embd_k,
+        k_cur,
+        slot_idx,
+        write_row_idx,
+        paged_enabled_,
+        n_ctx_max,
+        total_token_capacity_
+    );
+}
+
+ggml_tensor * simple_kv_cache::cpy_v(
+    ggml_context * ctx_compute,
+    ggml_tensor * v_cur,
+    int32_t il,
+    uint32_t slot_idx,
+    ggml_tensor * write_row_idx
+) {
+    GGML_ASSERT(slot_idx < n_batch_max);
+    GGML_ASSERT(il >= 0 && static_cast<uint32_t>(il) < n_layers);
+    GGML_ASSERT(write_row_idx != nullptr);
+
+    return cpy_kv_at_row(
+        ctx_compute,
+        v_cache[il],
+        n_embd_v,
+        v_cur,
+        slot_idx,
+        write_row_idx,
+        paged_enabled_,
+        n_ctx_max,
+        total_token_capacity_
     );
 }
 
@@ -492,7 +625,12 @@ void simple_kv_cache::set_pos(uint32_t p, uint32_t slot_idx) {
     GGML_ASSERT(p <= n_ctx_max);
     if (paged_enabled_) {
         if (p > positions[slot_idx]) {
-            ensure_slot_for_logical_range(slot_idx, positions[slot_idx], p - positions[slot_idx]);
+            // Include logical position p so batched decode gather at the pending
+            // write index does not hit "invalid block-table access".
+            ensure_slot_for_logical_range(
+                slot_idx,
+                positions[slot_idx],
+                p - positions[slot_idx] + 1);
         } else if (p == 0) {
             release_slot_blocks(slot_idx);
         }
@@ -520,6 +658,26 @@ bool simple_kv_cache::has_materialized_logical_pos(uint32_t slot_idx, uint32_t l
     const uint32_t offset = logical_pos % paged_block_size_;
     const uint32_t physical_pos = physical_block * paged_block_size_ + offset;
     return physical_pos < total_token_capacity_;
+}
+
+void simple_kv_cache::ensure_contiguous_kv_prefix(uint32_t slot_idx, uint32_t n_kv) {
+    if (!paged_enabled_ || n_kv == 0) {
+        return;
+    }
+    if (slot_idx >= n_batch_max) {
+        throw std::runtime_error("simple_kv_cache::ensure_contiguous_kv_prefix: slot_idx out of range");
+    }
+    if (n_kv > n_ctx_max) {
+        throw std::runtime_error("simple_kv_cache::ensure_contiguous_kv_prefix: n_kv exceeds n_ctx_max");
+    }
+    const uint32_t n_blocks = (n_kv + paged_block_size_ - 1) / paged_block_size_;
+    while (slot_block_tables_[slot_idx].size() < n_blocks) {
+        allocate_next_block_for_slot(slot_idx);
+    }
+    if (!slot_prefix_is_contiguous(slot_idx, n_kv)) {
+        throw std::runtime_error(
+            "simple_kv_cache::ensure_contiguous_kv_prefix: non-contiguous paged prefix is not supported");
+    }
 }
 
 bool simple_kv_cache::ensure_materialized_logical_pos(uint32_t slot_idx, uint32_t logical_pos) {

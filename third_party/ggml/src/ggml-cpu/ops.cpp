@@ -664,6 +664,7 @@ void ggml_compute_forward_add(
             {
                 ggml_compute_forward_add_non_quantized(params, dst);
             } break;
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1113,6 +1114,7 @@ void ggml_compute_forward_add1(
                     GGML_ABORT("fatal error");
                 }
             } break;
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1242,6 +1244,7 @@ void ggml_compute_forward_acc(
             } break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -3710,11 +3713,27 @@ void ggml_compute_forward_norm(
 
 // ggml_compute_forward_group_rms_norm
 
+// fusion kinds that can be combined with the rms_norm computation in a single pass.
+// extend this enum when adding new fused variants (e.g. FUSE_ADD, FUSE_MUL_ADD, ...).
+enum ggml_rms_norm_fuse_op {
+    GGML_RMS_NORM_FUSE_OP_NONE,
+    GGML_RMS_NORM_FUSE_OP_MUL,
+};
+
+template <ggml_rms_norm_fuse_op FUSE_OP>
 static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_fused = nullptr) {
 
-    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src0 = dst_rms_norm->src[0];
+    const ggml_tensor * src1 = nullptr;
+    ggml_tensor       * dst  = dst_rms_norm;
+
+    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+        src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
+        dst  = dst_fused;
+    }
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
@@ -3723,11 +3742,10 @@ static void ggml_compute_forward_rms_norm_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    GGML_TENSOR_UNARY_OP_LOCALS
+    GGML_TENSOR_BINARY_OP_LOCALS
 
     float eps;
-    memcpy(&eps, dst->op_params, sizeof(float));
-
+    memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
     // TODO: optimize
@@ -3737,25 +3755,32 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
                 ggml_float sum = 0.0;
+                // worth switching to explicit SIMD?
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
 
-                const float mean = sum/ne00;
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
-
+                const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
 
-                ggml_vec_scale_f32(ne00, y, scale);
+                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+                    const int64_t i11 = i01 % ne11;
+                    const int64_t i12 = i02 % ne12;
+                    const int64_t i13 = i03 % ne13;
+                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        y[i00] = x[i00] * scale * w[i00];
+                    }
+                } else {
+                    memcpy(y, x, ne00 * sizeof(float));
+                    ggml_vec_scale_f32(ne00, y, scale);
+                }
             }
         }
     }
@@ -3770,7 +3795,31 @@ void ggml_compute_forward_rms_norm(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_rms_norm_f32(params, dst);
+                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_NONE>(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// Fused RMS_NORM + MUL: computes dst = rms_norm(src0) * src1 in a single pass.
+// This avoids materializing the intermediate rms_norm result in memory.
+void ggml_compute_forward_rms_norm_mul_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_mul) {
+
+    GGML_ASSERT(dst_mul != nullptr);
+    GGML_ASSERT(dst_mul->src[0] == dst_rms_norm || dst_mul->src[1] == dst_rms_norm);
+
+    const ggml_tensor * src0 = dst_rms_norm->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL>(params, dst_rms_norm, dst_mul);
             } break;
         default:
             {
@@ -4331,6 +4380,7 @@ void ggml_compute_forward_out_prod(
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -4606,6 +4656,7 @@ void ggml_compute_forward_set(
             } break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -9312,6 +9363,148 @@ void ggml_compute_forward_ssm_conv(
     }
 }
 
+// ggml_compute_forward_ssm_conv_step
+
+static void ggml_compute_forward_ssm_conv_step_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * state = dst->src[0];
+    const ggml_tensor * x     = dst->src[1];
+    const ggml_tensor * w     = dst->src[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = (int) w->ne[0];
+    const int nr  = (int) w->ne[1];
+    const int ncs = nc - 1;
+
+    GGML_ASSERT(state->ne[0] == ncs);
+    GGML_ASSERT(state->ne[1] == nr);
+    GGML_ASSERT(x->ne[0] == nr);
+    GGML_ASSERT(dst->ne[0] == (int64_t) nr + (int64_t) ncs * nr);
+    GGML_ASSERT(state->nb[0] == sizeof(float));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(w->nb[0] == sizeof(float));
+    GGML_ASSERT(state->nb[1] == state->ne[0] * sizeof(float));
+
+    const int dr = (nr + nth - 1) / nth;
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    float * out_conv  = (float *) dst->data;
+    float * out_state = out_conv + nr;
+
+    for (int i1 = ir0; i1 < ir1; ++i1) {
+        const float * s = (const float *) ((const char *) state->data + i1 * state->nb[1]);
+        const float * c = (const float *) ((const char *) w->data + i1 * w->nb[1]);
+        const float   xv = ((const float *) x->data)[i1];
+
+        float sumf = 0.0f;
+        for (int i0 = 0; i0 < ncs; ++i0) {
+            sumf += s[i0] * c[i0];
+        }
+        sumf += xv * c[ncs];
+        out_conv[i1] = sumf;
+
+        for (int i0 = 0; i0 < ncs - 1; ++i0) {
+            out_state[i0 + i1 * ncs] = s[i0 + 1];
+        }
+        out_state[(ncs - 1) + i1 * ncs] = xv;
+    }
+}
+
+void ggml_compute_forward_ssm_conv_step(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_step_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+static void ggml_compute_forward_deltanet_decode_proj_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        ggml_tensor * w,
+        ggml_tensor * x) {
+    dst->op     = GGML_OP_MUL_MAT;
+    dst->type   = GGML_TYPE_F32;
+    dst->src[0] = w;
+    dst->src[1] = x;
+    ggml_compute_forward_mul_mat(params, dst);
+}
+
+void ggml_compute_forward_deltanet_decode_proj(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_tensor * x       = dst->src[0];
+    ggml_tensor * w_qkv   = dst->src[1];
+    ggml_tensor * w_gate  = dst->src[2];
+    ggml_tensor * w_beta  = dst->src[3];
+    ggml_tensor * w_alpha = dst->src[4];
+
+    const int64_t n_qkv   = w_qkv->ne[1];
+    const int64_t n_gate  = w_gate->ne[1];
+    const int64_t n_beta  = w_beta->ne[1];
+    const int64_t n_alpha = w_alpha->ne[1];
+
+    struct {
+        int64_t     n;
+        size_t      offset;
+        ggml_tensor * w;
+    } projs[4] = {
+        { n_qkv,   0, w_qkv },
+        { n_gate,  (size_t) n_qkv * sizeof(float), w_gate },
+        { n_beta,  (size_t) (n_qkv + n_gate) * sizeof(float), w_beta },
+        { n_alpha, (size_t) (n_qkv + n_gate + n_beta) * sizeof(float), w_alpha },
+    };
+
+    // Each projection writes a disjoint slice of dst. Parallelize across up to
+    // four threads; run each matmul single-threaded to avoid nested barriers.
+    ggml_compute_params params1 = *params;
+    params1.ith = 0;
+    params1.nth = 1;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (nth >= 4) {
+        if (ith >= 4) {
+            return;
+        }
+
+        ggml_tensor tmp = *dst;
+        tmp.ne[0] = projs[ith].n;
+        tmp.ne[1] = 1;
+        tmp.nb[0] = sizeof(float);
+        tmp.nb[1] = projs[ith].n * sizeof(float);
+        tmp.data  = (char *) dst->data + projs[ith].offset;
+        ggml_compute_forward_deltanet_decode_proj_mul(&params1, &tmp, projs[ith].w, x);
+        return;
+    }
+
+    if (ith != 0) {
+        return;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        ggml_tensor tmp = *dst;
+        tmp.ne[0] = projs[i].n;
+        tmp.ne[1] = 1;
+        tmp.nb[0] = sizeof(float);
+        tmp.nb[1] = projs[i].n * sizeof(float);
+        tmp.data  = (char *) dst->data + projs[i].offset;
+        ggml_compute_forward_deltanet_decode_proj_mul(&params1, &tmp, projs[i].w, x);
+    }
+}
+
 // ggml_compute_forward_ssm_scan
 
 static void ggml_compute_forward_ssm_scan_f32(
@@ -10462,18 +10655,29 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // scratch layout per thread: [delta(S_v)]
-    const int64_t scratch_per_thread = S_v;
+    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
+    const int64_t K = src_state->ne[1];
+    GGML_ASSERT(K >= 1);
+    // per-seq stride in floats (slot 0 of seq s lives at state + s * seq_stride)
+    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
+
+    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
 
-    float * delta = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
+    float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
-    // attn_scores: S_v * H * n_tokens * n_seqs floats
-    // new_states:  S_v * S_v * H * n_seqs floats
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    // attn_scores: S_v * H * n_tokens * n_seqs    floats
+    // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
+    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
+
+    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K only the last
+    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
+    const int64_t shift = n_tokens - K;
 
     const float * state_in_base = (const float *)src_state->data;
 
@@ -10494,10 +10698,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
+        // For K>1, work in scratch and copy out per-token when the slot is in range.
+        float * s_out = (K > 1)
+            ? state_work
+            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
+        // copy input state into the working buffer and operate in-place
+        // state layout (D, K, n_seqs): slot 0 of seq iv3 starts at iv3 * state_seq_stride.
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -10547,6 +10756,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             attn_data += S_v * H; // advance to next token
+
+            if (K > 1) {
+                const int64_t target_slot = t - shift;
+                if (target_slot >= 0 && target_slot < K) {
+                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
+                                     (iv3 * H + iv1) * S_v * S_v;
+                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                }
+            }
         }
     }
 }
@@ -11204,6 +11422,94 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
         default:
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
+            }
+    }
+}
+
+static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n = ne10;
+    GGML_ASSERT((n & (n - 1)) == 0); // must be power of 2
+
+    const int64_t nr = ne11 * ne12 * ne13;
+    const int64_t rows_per_thread = (nr + nth - 1) / nth;
+    const int64_t start_row = ith * rows_per_thread;
+    const int64_t end_row = MIN(start_row + rows_per_thread, nr);
+
+    const float scale = 1.0f / sqrtf((float)n);
+
+#if defined(GGML_SIMD)
+    const GGML_F32_VEC v_minus_one = GGML_F32_VEC_SET1(-1.0f);
+#endif
+
+    for (int64_t r = start_row; r < end_row; r++) {
+        const int64_t i13 = r / (ne11 * ne12);
+        const int64_t i12 = (r - i13 * ne11 * ne12) / ne11;
+        const int64_t i11 = r - i13 * ne11 * ne12 - i12 * ne11;
+
+        const float * src_row = (const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
+        float * dst_row = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+
+        for (int64_t j = 0; j < n; j++) {
+            dst_row[j] = src_row[j] * scale;
+        }
+
+        // Scalar passes
+#if defined(GGML_SIMD)
+        const int step = GGML_F32_EPR;
+#else
+        const int step = n;
+#endif
+        for (int64_t len = 1; len < step && len < n; len <<= 1) {
+            for (int64_t i = 0; i < n; i += 2 * len) {
+                for (int64_t j = 0; j < len; j++) {
+                    float u = dst_row[i + j];
+                    float v = dst_row[i + len + j];
+                    dst_row[i + j] = u + v;
+                    dst_row[i + len + j] = u - v;
+                }
+            }
+        }
+
+        // SIMD passes using GGML_F32_VEC_* macros for multi-architecture support
+#if defined(GGML_SIMD)
+        for (int64_t len = step; len < n; len <<= 1) {
+            for (int64_t i = 0; i < n; i += 2 * len) {
+                for (int64_t j = 0; j < len; j += step) {
+                    GGML_F32_VEC u = GGML_F32_VEC_LOAD(dst_row + i + j);
+                    GGML_F32_VEC v = GGML_F32_VEC_LOAD(dst_row + i + len + j);
+
+                    GGML_F32_VEC_STORE(dst_row + i + j,       GGML_F32_VEC_ADD(u, v));
+                    GGML_F32_VEC_STORE(dst_row + i + len + j, GGML_F32_VEC_FMA(u, v, v_minus_one));
+                }
+            }
+        }
+#endif
+    }
+}
+
+void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src1 = dst->src[1];
+
+    switch (src1->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fwht_f32(params, dst);
+            }
+            break;
+        default:
+            {
+                GGML_ABORT("fatal error - fwht is F32 only");
             }
     }
 }
